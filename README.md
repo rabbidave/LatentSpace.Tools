@@ -11,7 +11,7 @@ Different metrics of non-conformity are more appropriate depending on the situat
 
 In lieu of a requirements.txt I've included a list of packages below that I remember needed when I built the virtual environment.
 
-Also the code outputs pngs and I've also uploaded a [video to youtube](https://youtu.be/sAwZhlePgAc)
+Also the code outputs pngs and I've also uploaded a [video to youtube](https://youtu.be/t9cYCfqrPJw?si=C7jcCI5IslC5vgx5)
 
 ### Dependencies
 
