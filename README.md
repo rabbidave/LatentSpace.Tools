@@ -1,4 +1,5 @@
-# [Visualized Monitoring of Generative AI Model Drift](https://youtu.be/AMo_cN139gs?si=qhRMB2qEfA7VKXNQ) x Conformal Prediction
+# [Visualized Monitoring of Generative AI Model Drift](https://youtu.be/t9cYCfqrPJw?si=C7jcCI5IslC5vgx5
+) x Conformal Prediction
 So this is a companion to introduce the concept from the following [output monitoring project](https://github.com/rabbidave/Squidward-Tentacles-and-Spying-on-Outputs-via-Conformal-Prediction) which does the following:
 
 Summary: [Squidward](https://github.com/rabbidave/Squidward-Tentacles-and-Spying-on-Outputs-via-Conformal-Prediction) takes incoming messages and does stepwise comparison of their log-likelihood to a given baseline, such that we can compute a pseudo-confidence interval, and use that for appending (or not appending) our language model output
