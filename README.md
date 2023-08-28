@@ -1,18 +1,37 @@
-# [Visualized Monitoring of Generative AI Model Drift](https://youtu.be/t9cYCfqrPJw?si=C7jcCI5IslC5vgx5) x Conformal Prediction
-So this is a companion to introduce the concept from the following [output monitoring project](https://github.com/rabbidave/Squidward-Tentacles-and-Spying-on-Outputs-via-Conformal-Prediction) which does the following:
+# [Latent Space Tools: Observability & Security for LLMs x Latent Space Apps](https://youtu.be/sAwZhlePgAc)
+The following Software Suite, Visual Artifacts, and any/all concepts herein (hereafter Latent Space Tools) are made available under the Apache 2 license.
 
-Summary: [Squidward](https://github.com/rabbidave/Squidward-Tentacles-and-Spying-on-Outputs-via-Conformal-Prediction) takes incoming messages and does stepwise comparison of their log-likelihood to a given baseline, such that we can compute a pseudo-confidence interval, and use that for appending (or not appending) our language model output
+[Latent Space Tools](https://www.latentspace.tools) help conceptualize, visualize, and subsequently operationalize the necessary architecture and software components for secure LLM Deployment & Monitoring.
 
-It's predicated on the concept of [conformal prediction](https://github.com/valeman/awesome-conformal-prediction)
+## Key Components: 
 
-## Note:
+### Input Pre-Processing
 
-Different metrics of non-conformity are more appropriate depending on the situation; for the moment I intend to use [Mahalanobis distance](https://en.wikipedia.org/wiki/Mahalanobis_distance) as derived from [log-likelihood](https://www.statisticshowto.com/log-likelihood-function/) thereby allowing the system to effectively monitor data drift and/or eventually detect the emergence of new clusters in a vector space (forthcoming project)
+[1) Prompt Injection Detection & Mitigation](https://github.com/rabbidave/Denzel-Crocker-Hunting-For-Fairly-Odd-Prompts)
 
-In lieu of a requirements.txt I've included a list of packages below that I remember needed when I built the virtual environment.
+[2) Service Denial & Performance Monitoring](https://github.com/rabbidave/StoopKid-Event-Driven-Input-Monitoring-for-Language-Models)
 
-Also the code outputs pngs and I've also uploaded a [video to youtube](https://youtu.be/t9cYCfqrPJw?si=C7jcCI5IslC5vgx5)
+### Data Enrichment, Monitoring & Clustering
+[3) Topic/Sentiment Modeling x Vector Comparisions & Cluster Defitntion](https://github.com/rabbidave/Jimmy-Neutron-and-Serverless-Stepwise-Latent-Space-Monitoring)
 
-### Dependencies
+### Output Post-Processing
+[4) Attack Mitigation, Appending (Un)Certainty & Response Non-Conformity](https://github.com/rabbidave/Squidward-Tentacles-and-Spying-on-Outputs-via-Conformal-Prediction)
 
-pip install numpy matplotlib umap-learn        
+### Output Forecasting
+[5) Heatmaps x Dimensionality Drift via Conformal Prediction Intervals](https://github.com/rabbidave/Eliza-Thornberry-and-the-conformal-prediction-of-LLM-Behavior)
+
+## Architecture:
+
+Detailed Breakdown Forthcoming
+
+## Core Concepts:
+### N-Dimensional Drift:
+Given a [latent space](https://en.wikipedia.org/wiki/Latent_space) generally represents a reduced dimensionality from the feature space, we expect the 'aggregate' dimensions to be noisier than their components.
+
+That said, the chosen dimensions should represent meaningful metrics worth monitoring; hence the value in conceptualizing, monitoring, and forecasting changes to those values
+
+### Conformal Prediction
+
+Latent Space Tools extensively leverage the concept of [conformal prediction](https://github.com/valeman/awesome-conformal-prediction); whereby previous outputs better predict future outputs than do Bayesian priors or assumptions
+
+     
