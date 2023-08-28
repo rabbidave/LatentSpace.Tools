@@ -7,7 +7,7 @@ The following Software Suite, Visual Artifacts, and any/all concepts herein (her
 
 ## Architectureal Overview:
 
-<img src="https://github.com/rabbidave/Latent-Space-Tools/blob/main/a16zSummary.png" alt="Overview" title="Overview" width="50%">[High-Level Overview](https://github.com/rabbidave/Latent-Space-Tools/blob/main/a16zSummary.png)
+<img src="https://github.com/rabbidave/Latent-Space-Tools/blob/main/a16zSummary.png" alt="Overview" title="Overview" width="70%">
 
 [Click here for Detailed Annotations](https://github.com/rabbidave/Latent-Space-Tools/blob/main/a16zDetailAnnotated.pdf)
 
