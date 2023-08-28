@@ -1,7 +1,18 @@
-# [Latent Space Tools: Observability & Security for LLMs x Latent Space Apps](https://youtu.be/sAwZhlePgAc)
+# [Latent Space Tools](https://youtu.be/t9cYCfqrPJw)
+Observability & Security for LLMs x Latent Space Apps
+
 The following Software Suite, Visual Artifacts, and any/all concepts herein (hereafter Latent Space Tools) are made available under the Apache 2 license.
 
 [Latent Space Tools](https://www.latentspace.tools) help conceptualize, visualize, and subsequently operationalize the necessary architecture and software components for secure LLM Deployment & Monitoring.
+
+<object width="425" height="350">
+  <param name="movie" value="https://youtu.be/t9cYCfqrPJw" />
+  <param name="wmode" value="transparent" />
+  <embed src="https://youtu.be/t9cYCfqrPJw"
+         type="application/x-shockwave-flash"
+         wmode="transparent" width="425" height="350" />
+</object>
+
 
 ## Key Components: 
 
