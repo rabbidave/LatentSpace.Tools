@@ -19,8 +19,8 @@ The following Software Suite, Visual Artifacts, and any/all concepts herein (her
 
 [2) Service Denial & Performance Monitoring](https://github.com/rabbidave/StoopKid-Event-Driven-Input-Monitoring-for-Language-Models)
 
-### Data Enrichment, Monitoring & Clustering
-[3) Topic/Sentiment Modeling x Vector Comparisions & Cluster Defitntion](https://github.com/rabbidave/Jimmy-Neutron-and-Serverless-Stepwise-Latent-Space-Monitoring)
+### Data Enrichment, Event-Driven Monitoring & Alerting
+[3) Topic/Sentiment Modeling x Centroid Vector Comparisions](https://github.com/rabbidave/Serverless-Latent-Space-Monitoring)
 
 ### Output Post-Processing
 [4) Attack Mitigation, Appending (Un)Certainty & Response Non-Conformity](https://github.com/rabbidave/Squidward-Tentacles-and-Spying-on-Outputs-via-Conformal-Prediction)
