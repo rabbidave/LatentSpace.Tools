@@ -121,10 +121,10 @@ Remember: The RUN-CODE marker is essential for code execution."""
             
             # Test API connection with code generation prompt
             logger.info("Testing API connection with code generation prompt...")
-            test_prompt = "Generate a simple Python code to print numbers 1 to 5."
+            test_prompt = "print hello world in python"
             try:
                 test_response = self.llama_api.chat.completions.create(
-                    model="exaone-3.5-32b-instruct@q5_k_m",
+                    model="exaone-3.5-32b-instruct@q4_k_m",
                     messages=[
                         self.system_message,
                         {"role": "user", "content": test_prompt}
@@ -562,7 +562,7 @@ def main():
         interface.launch(
             share=False,
             server_name="0.0.0.0",
-            server_port=7860,
+            server_port=1337,
             debug=True
         )
         
