@@ -13,6 +13,7 @@ from pathlib import Path
 from datetime import datetime
 from git import Repo, InvalidGitRepositoryError
 import html
+import json
 
 try:
     from openai import OpenAI
@@ -89,44 +90,11 @@ class ExecutionManager:
 
     def capture_file_state(self):
         """Capture the current state of .py files."""
-        file_state = {}
-        for filepath in Path(".").glob("**/*.py"):
-            try:
-                with open(filepath, "r", encoding="utf-8") as f:
-                    file_state[str(filepath)] = f.read()
-            except Exception as e:
-                logger.error(f"Error reading file {filepath}: {e}")
-        return file_state
+        return {}
 
     def generate_diff(self, old_state, new_state):
-        """Generate diff between two file states."""
-        diff_output = ""
-
-        all_files = set(old_state.keys()) | set(new_state.keys())
-
-        for filepath in sorted(all_files):
-            old_content = old_state.get(filepath, "")
-            new_content = new_state.get(filepath, "")
-
-            if old_content != new_content:
-                diff = ""
-                if self.repo:
-                    # If in a Git repo, use git diff
-                    try:
-                        old_blob = self.repo.git.hash_object(old_content, '-w')
-                        new_blob = self.repo.git.hash_object(new_content, '-w')
-                        diff = self.repo.git.diff(old_blob, new_blob, unified=3)
-                    except Exception as e:
-                        logger.error(f"Error generating Git diff for {filepath}: {e}")
-
-                if not diff:
-                    # Fallback to basic diff if not in a Git repo or Git diff fails
-                    diff = f"--- a/{filepath}\n+++ b/{filepath}\n"
-                    diff += "".join(f"-{line}" if i < len(old_lines) and (j >= len(new_lines) or old_lines[i] != new_lines[j]) else f"+{line}" if j < len(new_lines) else "" for i, j, old_lines, new_lines in [(i, j, old_content.splitlines(keepends=True), new_content.splitlines(keepends=True)) for i in range(len(old_lines)) for j in range(len(new_lines))])
-
-                diff_output += diff + "\n"
-
-        return diff_output
+       """Generate diff between two file states."""
+       return ""
 
     def update_last_code_and_output(self, code, output):
         """Updates the last executed code and output."""
@@ -164,7 +132,7 @@ class LLMManager:
             self.passed_tests_count = 0
             self.max_passed_tests = 4  # Increase if needed
 
-            # Enhanced system message (no changes here)
+            # Enhanced system message
             self.system_message = {
                 "role": "system",
                 "content": """You are an AI assistant with Python code execution capabilities.
@@ -173,14 +141,13 @@ class LLMManager:
 RUN-CODE
 ```python
 your_code_here
-Use code with caution.
-Python
+
+
 For tests, use:
 TEST-ASSERT
-
+```python
 assert condition, "Test message"
-Use code with caution.
-Python
+
 Important rules:
 
 Each block must start with its marker on its own line
@@ -200,8 +167,7 @@ def add(a, b):
     return a + b
 result = add(5, 7)
 print(f'Result: {result}')
-Use code with caution.
-Python
+
 TEST-ASSERT
 
 assert result == 12, "Addition should work"
@@ -219,11 +185,8 @@ assert add(-1, 1) == 0, "Should handle negatives"
 
     def run_code(self, code):
         """Execute code with safety checks and diff tracking."""
-        logger.info("Preparing to execute code block with diff tracking")
+        logger.info("Preparing to execute code block")
         logger.debug(f"Code to execute:\n{code}")
-
-        # Capture file state before execution
-        old_state = self.execution_manager.capture_file_state()
 
         # Basic safety checks
         dangerous_patterns = [
@@ -267,15 +230,6 @@ assert add(-1, 1) == 0, "Should handle negatives"
             exec(code, safe_globals, self.last_execution_locals)
             output = captured_output.getvalue()
             logger.info("Code execution successful")
-
-            # Capture file state after execution
-            new_state = self.execution_manager.capture_file_state()
-
-            # Generate diff
-            diff = self.execution_manager.generate_diff(old_state, new_state)
-            if diff:
-                logger.info("Diff generated")
-                logger.debug(f"Generated diff:\n{diff}")
 
             # Append the copy/paste footer to the output
             output += "\n\n---\nHave fun y'all! 🤠🪄🤖\n"
@@ -408,33 +362,38 @@ assert add(-1, 1) == 0, "Should handle negatives"
             self.conversation.append({"role": "assistant", "name": self.model_a_id, "content": response_a})
 
             # --- Process code and test blocks from Model A ---
-            code_blocks = re.findall(r'RUN-CODE\n```(?:python)?\n(.*?)\n```', response_a, re.DOTALL)
-            test_blocks = re.findall(r'TEST-ASSERT\n```python\n(.*?)\n```', response_a, re.DOTALL)
+            code_blocks = re.findall(r'RUN-CODE\n\s*```(?:python)?\n(.*?)\n\s*```', response_a, re.DOTALL)
+            test_blocks = re.findall(r'TEST-ASSERT\n\s*```(?:python)?\n(.*?)\n\s*```', response_a, re.DOTALL)
 
-            print(f"Model A Code Blocks: {code_blocks}")  # Debugging
-            print(f"Model A Test Blocks: {test_blocks}")  # Debugging
+            logger.debug(f"Model A Code Blocks: {code_blocks}")
+            logger.debug(f"Model A Test Blocks: {test_blocks}")
+
 
             # If there are code blocks or test blocks
             if code_blocks or test_blocks:
                 # Iterate over code and test blocks
                 for i, code in enumerate(code_blocks):
-                    # Execute the code block
+                     # Execute the code block
                     if code:
                         logger.info(f"Executing code block {i+1} from Model A")
+                        logger.debug(f"Code to execute (Model A block {i+1}):\n{code.strip()}")
                         output = self.run_code(code.strip())
+                        logger.debug(f"Output from code block {i+1}:\n{output}")
                         print(f"Output from code block {i+1}:\n{output}")  # Debugging
 
                         # Append the output to the conversation
                         code_response = f"Code block {i+1} output:\n{output}"
                         self.conversation.append({"role": "assistant", "name": self.model_a_id, "content": code_response})
                         yield self.get_conversation_history(), f"Executed code block {i+1} from Model A", self.execution_manager.get_last_code_html(), self.execution_manager.get_last_output_html()
-                        time.sleep(0.05) # Added delay to allow UI to catch up
+                        time.sleep(0.05)
 
                         # Run associated tests if they exist
                         if i < len(test_blocks):
                             test = test_blocks[i]
                             logger.info(f"Executing test block {i+1} from Model A")
+                            logger.debug(f"Test to execute (Model A block {i+1}):\n{test.strip()}")
                             test_result = self.run_tests(test.strip())
+                            logger.debug(f"Result from test block {i+1}:\n{test_result}")
                             print(f"Result from test block {i+1}:\n{test_result}")  # Debugging
                             
                             yield self.get_conversation_history(), f"Executed test block {i+1} from Model A", self.execution_manager.get_last_code_html(), self.execution_manager.get_last_output_html()
@@ -470,11 +429,12 @@ assert add(-1, 1) == 0, "Should handle negatives"
                 self.conversation.append({"role": "assistant", "name": self.model_b_id, "content": response_b})
 
                 # --- Process code and test blocks from Model B ---
-                code_blocks = re.findall(r'RUN-CODE\n```(?:python)?\n(.*?)\n```', response_b, re.DOTALL)
-                test_blocks = re.findall(r'TEST-ASSERT\n```python\n(.*?)\n```', response_b, re.DOTALL)
+                code_blocks = re.findall(r'RUN-CODE\n\s*```(?:python)?\n(.*?)\n\s*```', response_b, re.DOTALL)
+                test_blocks = re.findall(r'TEST-ASSERT\n\s*```(?:python)?\n(.*?)\n\s*```', response_b, re.DOTALL)
 
-                print(f"Model B Code Blocks: {code_blocks}")  # Debugging
-                print(f"Model B Test Blocks: {test_blocks}")  # Debugging
+                logger.debug(f"Model B Code Blocks: {code_blocks}")
+                logger.debug(f"Model B Test Blocks: {test_blocks}")
+
 
                 # If there are code blocks or test blocks
                 if code_blocks or test_blocks:
@@ -483,7 +443,9 @@ assert add(-1, 1) == 0, "Should handle negatives"
                         # Execute the code block
                         if code:
                             logger.info(f"Executing code block {i+1} from Model B")
+                            logger.debug(f"Code to execute (Model B block {i+1}):\n{code.strip()}")
                             output = self.run_code(code.strip())
+                            logger.debug(f"Output from code block {i+1}:\n{output}")
                             print(f"Output from code block {i+1}:\n{output}") # Debugging
 
                             # Append the output to the conversation
@@ -496,7 +458,9 @@ assert add(-1, 1) == 0, "Should handle negatives"
                             if i < len(test_blocks):
                                 test = test_blocks[i]
                                 logger.info(f"Executing test block {i+1} from Model B")
+                                logger.debug(f"Test to execute (Model B block {i+1}):\n{test.strip()}")
                                 test_result = self.run_tests(test.strip())
+                                logger.debug(f"Result from test block {i+1}:\n{test_result}")
                                 print(f"Result from test block {i+1}:\n{test_result}")  # Debugging
                                 
                                 yield self.get_conversation_history(), f"Executed test block {i+1} from Model B", self.execution_manager.get_last_code_html(), self.execution_manager.get_last_output_html()
@@ -694,7 +658,7 @@ def main():
         interface.launch(
             share=False,
             server_name="0.0.0.0",
-            server_port=1337,
+            server_port=31337,
             debug=True
         )
 
