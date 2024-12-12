@@ -1,162 +1,212 @@
-# LLM Interface with Code Execution and Testing
+# 🚂🤖🪄[Conductor](https://github.com/rabbidave/conductor)
 
-An interactive interface for running multiple local LLMs with Python code execution and test assertion capabilities.
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-## Setup
+Conductor is an interactive interface that (locally) orchestrates multiple (remote or local) Language Models with Python code execution and test assertion capabilities.
 
-### Prerequisites
-- Python 3.7+
-- LMStudio or similar local LLM server
-- Required packages: `gradio`, `openai`
 
-### Installation
-1. Clone repository
-2. Install dependencies:
-```bash
-python -m venv .venv
-source .venv/bin/activate  # On Windows: .venv\Scripts\activate
-pip install gradio openai
-```
+## Features
 
-### Model Configuration
-1. Start LMStudio
-   - Launch LMStudio
-   - Load your models
-   - Start server (default: http://localhost:1234)
-2. Edit model settings in `LLMManager.__init__`:
-```python
-self.model_a_id = "your-model-name@q4_k_m"  # First model
-self.model_b_id = "your-second-model"       # Second model
-```
+*   **Multi LM Interaction:** Engage with multiple LMs sequentially for mob-style programming.
+*   **Safe Code Execution:** Run Python Code within a sandboxed environment via allowed/restricted operations. Code execution is restricted by a regex check for potentially unsafe operations, and this can be customized in the main python file.
+*   **Automated Test Assertions:** Define test cases using `TEST-ASSERT` blocks; Conductor will automatically run them against the executed code.
+*   **Test-Driven Generation:** Generation stops after a configurable number of successful test passes, encouraging test-driven development.
+*   **Customizable System Message:** Tailor the behavior of the LMs by modifying the system message.
+*   **Configurable Model IDs:** Easily switch between different local LLMs by updating the model IDs.
+*  **Configurable API/Model**: You can use an `.env` file in order to specify the local API url and the local model id to use. This file will be automatically created with default values the first time you run the project.
 
-## Code Execution and Testing
 
-The interface supports Python code execution and test assertions:
+## Prerequisites
 
-### Code Blocks
+*   **Python 3.7+:** Ensure you have Python 3.7 or a newer version installed.
+*   **LM Studio (or similar):** A local LLM server like LM Studio is required. You can download it from [LM Studio's website](https://lmstudio.ai/).
 
-Use the RUN-CODE marker for executable code:
-```python
-RUN-CODE
-```python
-def add_numbers(a, b):
-    return a + b
-result = add_numbers(5, 7)
-print(f'Result: {result}')
-```
-```
+## Installation
 
-### Test Assertions
+1. **Clone the Repository:**
 
-Use the TEST-ASSERT marker for test blocks:
-```python
-TEST-ASSERT
-```python
-assert result == 12, "Addition should work"
-assert add_numbers(-1, 1) == 0, "Should handle negatives"
-```
-```
+    ```bash
+    git clone https://github.com/rabbidave/conductor
+    cd conductor
+    ```
 
-### Test-Driven Features
+2. **Create and Activate a Virtual Environment:**
 
-- Tests have access to variables from previous code execution
-- Generation stops after 2 successful test passes
-- Failed tests don't count toward pass total
-- Test results appear in status display
+    ```bash
+    python3 -m venv .venv
+    source .venv/bin/activate  # On Linux/macOS
+    .venv\Scripts\activate  # On Windows
+    ```
 
-### Allowed Operations
-- File operations (os, Path)
-- Basic Python functions
-- Console output
-- File reading/writing
-- Test assertions
+3.  **Create the requirements.txt file:**
+     * Create a file named `requirements.txt` and add the following to the file:
 
-### Blocked Operations
-- Network requests
-- System commands
-- Input operations
-- Unsafe imports
-- Code evaluation (eval/exec)
+    ```
+    gradio
+    openai
+    ```
+4. **Install Dependencies:**
+
+    ```bash
+    pip install -r requirements.txt
+    ```
+
+    This will install `gradio`, and `openai`.
+
+## Configuration
+
+1.  **LM Studio Setup:**
+
+    *   Launch LM Studio.
+    *   Download and load the models you want to use (e.g., `exaone-3.5-32b-instruct@q4_k_m` and `qwq-32b-preview`).
+    *   Start the local server in LM Studio (default: `http://localhost:1234`).
+
+2.  **Model IDs:**
+    * On the first use of the project, the system will automatically create an `.env` file with the default values. You can modify this file to change the local server url and model ids.
+    *   Locate the `.env` file in the project root folder.
+    *   Update the model ids `MODEL_A_ID` and `MODEL_B_ID` variables with the correct model IDs from LM Studio.
+
+    ```
+    MODEL_A_ID="your-model-a-id"  # e.g., "exaone-3.5-32b-instruct@q4_k_m"
+    MODEL_B_ID="your-model-b-id"  # e.g., "qwq-32b-preview"
+     LOCAL_API_URL="http://localhost:1234/v1/"
+    ```
+3.  **System Message (Optional):**
+
+    *   In `LLMManager.__init__`, you can customize the `self.system_message` to modify the behavior of the LLMs. This message sets the context for the conversation and defines the `RUN-CODE` and `TEST-ASSERT` block formats.
+
+    ```python
+    self.system_message = {
+        "role": "system",
+        "content": """You are an AI assistant with Python code execution capabilities.
+
+    1. For code execution, use:
+    RUN-CODE
+    ```python
+    your_code_here
+    ```
+
+    2. For tests, use:
+    TEST-ASSERT
+    ```python
+    assert condition, "Test message"
+    ```
+
+    3. Important rules:
+    - Each block must start with its marker on its own line
+    - Code must be within triple backticks with 'python' specified
+    - Tests have access to variables from code execution
+    - Generation stops after 2 successful test passes
+
+        ... (rest of the system message)
+        """
+        }
+        ```
+    *  You might add examples of how to modity the message to tailor the response to your specific needs.
+4.  **Test Pass Count:**
+
+    *   To change the number of successful test passes required to stop generation, modify `self.max_passed_tests` in `LLMManager.__init__` in the main python file.
+
+5.  **Logging:**
+
+    *   Logs are stored in the `logs/` directory.
+    *   Adjust the logging level in `gradio-llm-interface.py` using:
+
+    ```python
+    logging.basicConfig(level=logging.DEBUG)  # For verbose logging
+    # or
+    logging.basicConfig(level=logging.INFO)   # For less verbose logging
+    ```
+    *   Debug level logging can be enabled to provide very detailed output on the behaviour of the code.
+
+6. **Security Note**
+ * Always use caution with code generated by an LLM and do not execute code from untrusted sources.
 
 ## Usage
 
-1. Start the interface:
-```bash
-python gradio-llm-interface.py
-```
+1. **Start the Interface:**
 
-2. Access web UI at `http://localhost:1337`
+    ```bash
+    python app.py
+    ```
 
-3. Features:
-- Real-time streaming responses
-- Stop generation button
-- Code execution with safety controls
-- Test assertion verification
-- Pass count-based stopping
-- Dual model interaction
+2. **Access the UI:**
+
+    *   Open your web browser and go to `http://localhost:31337` (or the address indicated in the terminal).
+
+3. **Interact with the LMs:**
+
+    *   Enter your prompt in the "Input Message" textbox.
+    *   Click "Submit" to send the message to Model A.
+    *   The conversation and results will appear in the "Conversation & Results" textbox.
+    *   Code execution and test results will also be displayed.
+    *   If the required number of tests pass, generation will stop. Otherwise, Model B will be engaged.
+    *   Click "Stop Generation" to manually stop the generation process.
+    *   Click "Clear Conversation" to start a new conversation.
+
 
 ## Example Workflow
 
-1. Send a request:
-```
-Write a function to calculate the factorial of a number and test it with both positive and negative inputs
-```
+1. **Prompt:**
 
-2. The LLM might respond with:
-```python
-RUN-CODE
-```python
-def factorial(n):
-    if n < 0:
-        raise ValueError("Factorial not defined for negative numbers")
-    if n == 0:
-        return 1
-    return n * factorial(n - 1)
+    ```
+    Write a Python function to calculate the nth term of the Fibonacci sequence using recursion. Include tests to validate the results for n=0, n=1, n=5, and n=10.
+    ```
 
-# Try some examples
-print(f"factorial(5) = {factorial(5)}")
-```
-```
+2. **Model A's Response (may vary):**
 
-TEST-ASSERT
-```python
-assert factorial(0) == 1, "Factorial of 0 should be 1"
-assert factorial(5) == 120, "Factorial of 5 should be 120"
-try:
-    factorial(-1)
-    assert False, "Should raise error for negative numbers"
-except ValueError:
-    pass
-```
-```
+    ```
+    RUN-CODE
+    ```python
+    def fibonacci_recursive(n):
+        if n <= 0:
+            return 0
+        elif n == 1:
+            return 1
+        else:
+            return fibonacci_recursive(n-1) + fibonacci_recursive(n-2)
+    ```
 
-The system will:
-1. Execute the code block
-2. Run the tests
-3. Track test passes
-4. Stop after required passes
-5. Show all outputs in the interface
+    TEST-ASSERT
+    ```python
+    assert fibonacci_recursive(0) == 0, "fibonacci_recursive(0) should be 0"
+    assert fibonacci_recursive(1) == 1, "fibonacci_recursive(1) should be 1"
+    assert fibonacci_recursive(5) == 5, "fibonacci_recursive(5) should be 5"
+    assert fibonacci_recursive(10) == 55, "fibonacci_recursive(10) should be 55"
+    ```
+    ```
 
-## Logging
+3. **Execution and Testing:**
 
-Logs are stored in `logs/` directory. Set logging level in script:
-```python
-logging.basicConfig(level=logging.DEBUG)  # More verbose
-# or
-logging.basicConfig(level=logging.INFO)   # Less verbose
-```
+    *   Conductor will execute the `RUN-CODE` block.
+    *   It will then run the `TEST-ASSERT` block.
+    *   The results (output and test outcomes) will be displayed.
+    *   The output in the UI will include the footer:
 
-## Error Handling
+        ```
+        Code block 1 output:
 
-- Failed tests show error messages
-- Unsafe code patterns are blocked
-- Execution errors are logged
-- Test errors don't crash the system
+        ---
+        Have fun y'all! 🤠🪄🤖
+        ```
 
-## Custom Configuration
+## Troubleshooting
 
-Edit `system_message` in `LLMManager.__init__` to customize:
-- Test pass requirements
-- Code execution rules
-- Test assertion format
-- Generation behavior
+*   **Package Installation Errors:** If you encounter errors during package installation, ensure your virtual environment is activated, and you have the necessary permissions to install packages.
+*   **LM Studio Connection Issues:** Verify that LM Studio is running and the local server is started. Check the port number (default: 1234) and make sure it matches the `base_url` in `LLMManager.__init__` or in the `.env` file.
+*   **Model Not Found:** Double-check that the model IDs you've configured in  the `.env` file are correct and that the models are loaded in LM Studio.
+*   **Git Errors:** If you get errors related to Git, make sure Git is installed and that the project is inside a Git repository. If you don't want to use Git, the code will fall back to skipping diff generation.
+
+## License
+
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+
+## Contributing
+
+Contributions are welcome!  Please adhere to the following guidelines:
+
+*   **Bug Reports:** Submit detailed bug reports including the steps to reproduce and any relevant error messages.
+*   **Feature Requests:** Suggest new features, enhancements, or improvements in an issue.
+*   **Pull Requests:** When submitting pull requests, make sure that your code aligns with the project's style and standards. Add tests where necessary and make sure all tests pass before submitting.
+
+Please feel free to open issues or submit pull requests on the project's repository page.
