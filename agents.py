@@ -7,9 +7,18 @@ import logging
 import subprocess
 import traceback
 import time
+from itertools import zip_longest
 from io import StringIO
 from pathlib import Path
 from datetime import datetime
+from git import Repo, InvalidGitRepositoryError
+import html
+
+try:
+    from openai import OpenAI
+    import gradio as gr
+except ImportError as e:
+    logger.error(f"Required package not found: {e}. Will be installed in venv setup.")
 
 # Setup logging
 log_dir = Path("logs")
@@ -30,12 +39,12 @@ logger = logging.getLogger("LLMInterface")
 def setup_venv():
     """Create and activate virtual environment."""
     logger.info("Setting up virtual environment...")
-    
+
     venv_dir = Path(".venv")
     if not venv_dir.exists():
         logger.info("Creating new virtual environment...")
         venv.create(venv_dir, with_pip=True)
-    
+
     if sys.platform == "win32":
         python_path = venv_dir / "Scripts" / "python.exe"
         pip_path = venv_dir / "Scripts" / "pip.exe"
@@ -46,7 +55,7 @@ def setup_venv():
     # Install required packages
     try:
         logger.info("Installing required packages...")
-        subprocess.check_call([str(pip_path), "install", "gradio", "openai"])
+        subprocess.check_call([str(pip_path), "install", "gradio", "openai", "GitPython"])
         logger.info("Package installation successful")
     except subprocess.CalledProcessError as e:
         logger.error(f"Failed to install packages: {e}")
@@ -61,27 +70,101 @@ def restart_in_venv():
         python_path = setup_venv()
         os.execv(python_path, [python_path] + sys.argv)
 
-try:
-    from openai import OpenAI
-    import gradio as gr
-except ImportError as e:
-    logger.error(f"Required package not found: {e}. Will be installed in venv setup.")
+class ExecutionManager:
+    """Manages code execution and diffs."""
+
+    def __init__(self):
+        self.repo = self.get_git_repo()
+        self.last_code = None  # Store the last executed code
+        self.last_output = None  # Store the last execution output
+
+    def get_git_repo(self):
+        """Get the Git repository or None if not a Git repo."""
+        try:
+            repo = Repo(search_parent_directories=True)
+            return repo
+        except InvalidGitRepositoryError:
+            logger.info("Not a Git repository.")
+            return None
+
+    def capture_file_state(self):
+        """Capture the current state of .py files."""
+        file_state = {}
+        for filepath in Path(".").glob("**/*.py"):
+            try:
+                with open(filepath, "r", encoding="utf-8") as f:
+                    file_state[str(filepath)] = f.read()
+            except Exception as e:
+                logger.error(f"Error reading file {filepath}: {e}")
+        return file_state
+
+    def generate_diff(self, old_state, new_state):
+        """Generate diff between two file states."""
+        diff_output = ""
+
+        all_files = set(old_state.keys()) | set(new_state.keys())
+
+        for filepath in sorted(all_files):
+            old_content = old_state.get(filepath, "")
+            new_content = new_state.get(filepath, "")
+
+            if old_content != new_content:
+                diff = ""
+                if self.repo:
+                    # If in a Git repo, use git diff
+                    try:
+                        old_blob = self.repo.git.hash_object(old_content, '-w')
+                        new_blob = self.repo.git.hash_object(new_content, '-w')
+                        diff = self.repo.git.diff(old_blob, new_blob, unified=3)
+                    except Exception as e:
+                        logger.error(f"Error generating Git diff for {filepath}: {e}")
+
+                if not diff:
+                    # Fallback to basic diff if not in a Git repo or Git diff fails
+                    diff = f"--- a/{filepath}\n+++ b/{filepath}\n"
+                    diff += "".join(f"-{line}" if i < len(old_lines) and (j >= len(new_lines) or old_lines[i] != new_lines[j]) else f"+{line}" if j < len(new_lines) else "" for i, j, old_lines, new_lines in [(i, j, old_content.splitlines(keepends=True), new_content.splitlines(keepends=True)) for i in range(len(old_lines)) for j in range(len(new_lines))])
+
+                diff_output += diff + "\n"
+
+        return diff_output
+
+    def update_last_code_and_output(self, code, output):
+        """Updates the last executed code and output."""
+        self.last_code = code
+        self.last_output = output
+
+    def get_last_code_html(self):
+        """Returns the last executed code as HTML."""
+        if self.last_code:
+            escaped_code = html.escape(self.last_code)
+            return f"<pre><code>{escaped_code}</code></pre>"
+        else:
+            return "<p>No code executed yet.</p>"
+
+    def get_last_output_html(self):
+        """Returns the last output as HTML."""
+        if self.last_output:
+            escaped_output = html.escape(self.last_output)
+            return f"<pre>{escaped_output}</pre>"
+        else:
+            return "<p>No output yet.</p>"
 
 class LLMManager:
-    def __init__(self):
+    def __init__(self, execution_manager):
         logger.info("Initializing LLMManager...")
+        self.execution_manager = execution_manager
         try:
             self.llama_api = OpenAI(
                 api_key="api_key",
-                base_url="http://127.0.0.1:1234/v1/"
+                base_url="http://127.0.0.1:1234/v1/"  # Your local LLM base URL
             )
-            
+
             # Track execution context and test passes
             self.last_execution_locals = {}
             self.passed_tests_count = 0
-            self.max_passed_tests = 2
-            
-            # Enhanced system message with code and test instructions
+            self.max_passed_tests = 4  # Increase if needed
+
+            # Enhanced system message (no changes here)
             self.system_message = {
                 "role": "system",
                 "content": """You are an AI assistant with Python code execution capabilities.
@@ -90,97 +173,58 @@ class LLMManager:
 RUN-CODE
 ```python
 your_code_here
-```
-
-2. For tests, use:
+Use code with caution.
+Python
+For tests, use:
 TEST-ASSERT
-```python
-assert condition, "Test message"
-```
 
-3. Important rules:
-- Each block must start with its marker on its own line
-- Code must be within triple backticks with 'python' specified
-- Tests have access to variables from code execution
-- Generation stops after 2 successful test passes
+assert condition, "Test message"
+Use code with caution.
+Python
+Important rules:
+
+Each block must start with its marker on its own line
+
+Code must be within triple backticks with 'python' specified
+
+Tests have access to variables from code execution
+
+Generation stops after 2 successful test passes
 
 Example:
 I'll create a function and test it.
 
 RUN-CODE
-```python
+
 def add(a, b):
     return a + b
 result = add(5, 7)
 print(f'Result: {result}')
-```
-
+Use code with caution.
+Python
 TEST-ASSERT
-```python
+
 assert result == 12, "Addition should work"
 assert add(-1, 1) == 0, "Should handle negatives"
 ```"""
             }
-            
-            self.model_a_id = "exaone-3.5-32b-instruct@q4_k_m"
-            self.model_b_id = "qwq-32b-preview"
+
+            self.model_a_id = "qwen2.5-coder-7b-instruct"
+            self.model_b_id = "qwen2.5-coder-14b-instruct"
             self.conversation = [self.system_message]
-            
+
         except Exception as e:
             logger.error(f"Failed to initialize LLMManager: {e}")
             raise
 
-    def query_llama(self, model, messages, stream=False):
-        """Query the LLM model with streaming support."""
-        logger.info(f"Querying model: {model}")
-        
-        try:
-            chat_completion = self.llama_api.chat.completions.create(
-                model=model,
-                messages=messages,
-                temperature=0.7,
-                max_tokens=2000,
-                stream=stream,
-                top_p=0.95,
-                presence_penalty=0,
-                frequency_penalty=0
-            )
-            
-            if stream:
-                try:
-                    for chunk in chat_completion:
-                        content = None
-                        
-                        if hasattr(chunk.choices[0], 'delta'):
-                            content = getattr(chunk.choices[0].delta, 'content', None)
-                        elif hasattr(chunk.choices[0], 'text'):
-                            content = chunk.choices[0].text
-                        elif hasattr(chunk.choices[0], 'message'):
-                            content = chunk.choices[0].message.content
-                            
-                        if content:
-                            yield content
-                            
-                except Exception as e:
-                    error_msg = f"Error in stream: {str(e)}"
-                    logger.error(error_msg)
-                    yield f"Error: {error_msg}"
-            else:
-                return chat_completion.choices[0].message.content.strip()
-                    
-        except Exception as e:
-            error_msg = f"Error querying model {model}: {str(e)}"
-            logger.error(error_msg)
-            if stream:
-                yield f"Error: {error_msg}"
-            else:
-                return f"Error: {error_msg}"
-
     def run_code(self, code):
-        """Execute code with safety checks."""
-        logger.info("Preparing to execute code block")
+        """Execute code with safety checks and diff tracking."""
+        logger.info("Preparing to execute code block with diff tracking")
         logger.debug(f"Code to execute:\n{code}")
-        
+
+        # Capture file state before execution
+        old_state = self.execution_manager.capture_file_state()
+
         # Basic safety checks
         dangerous_patterns = [
             "rm -rf",
@@ -190,17 +234,17 @@ assert add(-1, 1) == 0, "Should handle negatives"
             "input(",
             "requests.",
         ]
-        
+
         for pattern in dangerous_patterns:
             if pattern in code:
                 error_msg = f"Potentially unsafe code detected: {pattern}"
                 logger.warning(error_msg)
                 return error_msg
-        
+
         old_stdout = sys.stdout
         captured_output = StringIO()
         sys.stdout = captured_output
-        
+
         try:
             # Set up safe execution environment
             safe_globals = {
@@ -217,12 +261,28 @@ assert add(-1, 1) == 0, "Should handle negatives"
                 'os': os,
                 'Path': Path
             }
-            
+
             # Execute code and save locals for test access
             self.last_execution_locals = {}
             exec(code, safe_globals, self.last_execution_locals)
             output = captured_output.getvalue()
             logger.info("Code execution successful")
+
+            # Capture file state after execution
+            new_state = self.execution_manager.capture_file_state()
+
+            # Generate diff
+            diff = self.execution_manager.generate_diff(old_state, new_state)
+            if diff:
+                logger.info("Diff generated")
+                logger.debug(f"Generated diff:\n{diff}")
+
+            # Append the copy/paste footer to the output
+            output += "\n\n---\nHave fun y'all! 🤠🪄🤖\n"
+
+            # Update last executed code and output
+            self.execution_manager.update_last_code_and_output(code, output)
+
             return output
         except Exception as e:
             error_trace = traceback.format_exc()
@@ -235,11 +295,11 @@ assert add(-1, 1) == 0, "Should handle negatives"
         """Execute test assertions with access to previous code context."""
         logger.info("Running test assertions")
         logger.debug(f"Test code:\n{test_code}")
-        
+
         old_stdout = sys.stdout
         captured_output = StringIO()
         sys.stdout = captured_output
-        
+
         try:
             # Include previous execution context in test environment
             test_globals = {
@@ -247,12 +307,16 @@ assert add(-1, 1) == 0, "Should handle negatives"
                 'assert': assert_,
                 **self.last_execution_locals
             }
-            
+
             exec(test_code, test_globals, {})
             output = captured_output.getvalue()
             self.passed_tests_count += 1
             logger.info(f"Tests passed. Count: {self.passed_tests_count}")
-            return "unit tests passed"
+
+            # Update last executed code and output
+            self.execution_manager.update_last_code_and_output(test_code, output)
+
+            return f"Unit tests passed: {output}"  # Include captured output
         except AssertionError as e:
             logger.info(f"Test failed: {str(e)}")
             return f"Test failed: {str(e)}"
@@ -264,124 +328,191 @@ assert add(-1, 1) == 0, "Should handle negatives"
 
     def should_stop_generation(self):
         """Check if enough tests have passed to stop generation."""
-        return self.passed_tests_count >= self.max_passed_tests
+        # More flexible stopping condition:
+        # Stop if we've processed all blocks at least once AND met the passed test count
+        return self.passed_tests_count >= self.max_passed_tests or self.all_blocks_processed_once
+
+    def query_llama(self, model, messages, stream=False):
+        """Query the LLM model with streaming support."""
+        logger.info(f"Querying model: {model}")
+
+        try:
+            chat_completion = self.llama_api.chat.completions.create(
+                model=model,
+                messages=messages,
+                temperature=0.7,
+                max_tokens=2000,
+                stream=stream,
+                top_p=0.95,
+                presence_penalty=0,
+                frequency_penalty=0
+            )
+
+            if stream:
+                for chunk in chat_completion:
+                    if hasattr(chunk, 'choices') and chunk.choices:
+                        if hasattr(chunk.choices[0], 'delta') and chunk.choices[0].delta and hasattr(chunk.choices[0].delta, 'content'):
+                            content = chunk.choices[0].delta.content
+                        elif hasattr(chunk.choices[0], 'text'):
+                            content = chunk.choices[0].text
+                        else:
+                            # If there's no content, yield an empty string to maintain streaming
+                            content = ""
+                    else:
+                        # If there's no choices, yield an empty string to maintain streaming
+                        content = ""
+
+                    if content is not None:
+                        yield content
+            else:
+                return chat_completion.choices[0].message.content.strip()
+
+        except Exception as e:
+            error_msg = f"Error querying model {model}: {str(e)}"
+            logger.error(error_msg)
+            if stream:
+                yield f"Error: {error_msg}"
+            else:
+                return f"Error: {error_msg}"
 
     def process_message(self, message):
         """Process a user message with code execution and testing."""
         logger.info("Processing new user message")
         self.passed_tests_count = 0  # Reset test counter
-        
+        self.all_blocks_processed_once = False # Reset block processing flag
+
         if not message.strip():
             logger.warning("Empty message received")
-            yield "Please enter a message", "Empty message received"
+            yield "Please enter a message", "Empty message received", self.execution_manager.get_last_code_html(), self.execution_manager.get_last_output_html()
             return
 
         try:
             self.conversation.append({"role": "user", "content": message})
-            
-            # Process Model A
+
+            # --- Process Model A ---
             logger.info("Getting Model A response")
             response_a = ""
-            
+
             try:
-                async_response = self.query_llama(self.model_a_id, self.conversation, stream=True)
-                for chunk in async_response:
-                    if isinstance(chunk, str) and chunk.startswith("Error"):
-                        yield chunk, "Error occurred with Model A"
-                        return
+                for chunk in self.query_llama(self.model_a_id, self.conversation, stream=True):
                     response_a += chunk
-                    yield f"Model A Response:\n{response_a}\n\nModel B Response: Waiting...", "Processing Model A response..."
+                    temp_conversation = self.get_conversation_history() + f"\n{self.model_a_id}: {response_a}\n\n"
+                    yield temp_conversation, "Processing Model A response...", self.execution_manager.get_last_code_html(), self.execution_manager.get_last_output_html()
                     
-                    if self.should_stop_generation():
-                        logger.info("Stopping generation - required test passes achieved")
-                        yield f"Model A Response:\n{response_a}\n\nGeneration stopped: Required test passes achieved", "Complete"
-                        return
-                
             except Exception as e:
                 error_msg = f"Error getting Model A response: {str(e)}"
                 logger.error(error_msg)
-                yield error_msg, "Error with Model A"
+                yield self.get_conversation_history(), "Error with Model A", self.execution_manager.get_last_code_html(), self.execution_manager.get_last_output_html()
                 return
 
             self.conversation.append({"role": "assistant", "name": self.model_a_id, "content": response_a})
-            
-            # Process code and test blocks from Model A
+
+            # --- Process code and test blocks from Model A ---
             code_blocks = re.findall(r'RUN-CODE\n```(?:python)?\n(.*?)\n```', response_a, re.DOTALL)
             test_blocks = re.findall(r'TEST-ASSERT\n```python\n(.*?)\n```', response_a, re.DOTALL)
-            
-            if code_blocks:
-                logger.info(f"Found {len(code_blocks)} code block(s) in Model A response")
-                for i, code in enumerate(code_blocks, 1):
-                    logger.info(f"Executing code block {i}")
-                    output = self.run_code(code.strip())
-                    
-                    # Run associated tests if they exist
-                    if i <= len(test_blocks):
-                        test_result = self.run_tests(test_blocks[i-1].strip())
-                        output += f"\n{test_result}"
-                    
-                    code_response = f"Code block {i} output:\n{output}"
-                    self.conversation.append({"role": "assistant", "name": self.model_a_id, "content": code_response})
-                    yield f"Model A Response:\n{response_a}\n\nCode Output:\n{output}\n\nModel B Response: Waiting...", f"Executed code block {i} from Model A"
-                    
-                    if self.should_stop_generation():
-                        logger.info("Stopping generation - required test passes achieved")
-                        yield f"Model A Response:\n{response_a}\n\nGeneration stopped: Required test passes achieved", "Complete"
-                        return
-            
-            # Process Model B if needed
+
+            print(f"Model A Code Blocks: {code_blocks}")  # Debugging
+            print(f"Model A Test Blocks: {test_blocks}")  # Debugging
+
+            # If there are code blocks or test blocks
+            if code_blocks or test_blocks:
+                # Iterate over code and test blocks
+                for i, code in enumerate(code_blocks):
+                    # Execute the code block
+                    if code:
+                        logger.info(f"Executing code block {i+1} from Model A")
+                        output = self.run_code(code.strip())
+                        print(f"Output from code block {i+1}:\n{output}")  # Debugging
+
+                        # Append the output to the conversation
+                        code_response = f"Code block {i+1} output:\n{output}"
+                        self.conversation.append({"role": "assistant", "name": self.model_a_id, "content": code_response})
+                        yield self.get_conversation_history(), f"Executed code block {i+1} from Model A", self.execution_manager.get_last_code_html(), self.execution_manager.get_last_output_html()
+                        time.sleep(0.05) # Added delay to allow UI to catch up
+
+                        # Run associated tests if they exist
+                        if i < len(test_blocks):
+                            test = test_blocks[i]
+                            logger.info(f"Executing test block {i+1} from Model A")
+                            test_result = self.run_tests(test.strip())
+                            print(f"Result from test block {i+1}:\n{test_result}")  # Debugging
+                            
+                            yield self.get_conversation_history(), f"Executed test block {i+1} from Model A", self.execution_manager.get_last_code_html(), self.execution_manager.get_last_output_html()
+                            time.sleep(0.05)
+
+                        if self.should_stop_generation():
+                            logger.info("Stopping generation - required test passes achieved")
+                            yield self.get_conversation_history(), "Complete", self.execution_manager.get_last_code_html(), self.execution_manager.get_last_output_html()
+                            return
+                
+                self.all_blocks_processed_once = True
+
+            # --- Handoff to Model B ---
+            print("\n--- Handoff to Model B ---")
+            print(f"Conversation so far:\n{self.get_conversation_history()}")
+
+            # --- Process Model B if needed ---
             if not self.should_stop_generation():
                 logger.info("Getting Model B response")
                 response_b = ""
                 try:
-                    async_response = self.query_llama(self.model_b_id, self.conversation, stream=True)
-                    for chunk in async_response:
-                        if isinstance(chunk, str) and chunk.startswith("Error"):
-                            yield f"Model A Response:\n{response_a}\n\nModel B Response: Error occurred", "Error occurred with Model B"
-                            return
+                    for chunk in self.query_llama(self.model_b_id, self.conversation, stream=True):
                         response_b += chunk
-                        yield f"Model A Response:\n{response_a}\n\nModel B Response:\n{response_b}", "Processing Model B response..."
-                        
-                        if self.should_stop_generation():
-                            logger.info("Stopping generation - required test passes achieved")
-                            yield f"Model A Response:\n{response_a}\n\nModel B Response:\n{response_b}\n\nGeneration stopped: Required test passes achieved", "Complete"
-                            return
+                        temp_conversation = self.get_conversation_history() + f"\n{self.model_b_id}: {response_b}\n\n"
+                        yield temp_conversation, "Processing Model B response...", self.execution_manager.get_last_code_html(), self.execution_manager.get_last_output_html()
 
                 except Exception as e:
                     error_msg = f"Error getting Model B response: {str(e)}"
                     logger.error(error_msg)
-                    yield f"Model A Response:\n{response_a}\n\nModel B Response: Error: {error_msg}", "Error with Model B"
+                    yield self.get_conversation_history(), "Error with Model B", self.execution_manager.get_last_code_html(), self.execution_manager.get_last_output_html()
                     return
 
                 self.conversation.append({"role": "assistant", "name": self.model_b_id, "content": response_b})
-                
-                # Process code and test blocks from Model B
+
+                # --- Process code and test blocks from Model B ---
                 code_blocks = re.findall(r'RUN-CODE\n```(?:python)?\n(.*?)\n```', response_b, re.DOTALL)
                 test_blocks = re.findall(r'TEST-ASSERT\n```python\n(.*?)\n```', response_b, re.DOTALL)
-                
-                if code_blocks:
-                    for i, code in enumerate(code_blocks, 1):
-                        output = self.run_code(code.strip())
-                        
-                        if i <= len(test_blocks):
-                            test_result = self.run_tests(test_blocks[i-1].strip())
-                            output += f"\n{test_result}"
-                        
-                        code_response = f"Code block {i} output:\n{output}"
-                        self.conversation.append({"role": "assistant", "name": self.model_b_id, "content": code_response})
-                        yield f"Model A Response:\n{response_a}\n\nModel B Response:\n{response_b}\n\nCode Output:\n{output}", f"Executed code block {i} from Model B"
-                        
-                        if self.should_stop_generation():
-                            logger.info("Stopping generation - required test passes achieved")
-                            yield f"Model A Response:\n{response_a}\n\nModel B Response:\n{response_b}\n\nGeneration stopped: Required test passes achieved", "Complete"
-                            return
 
-                yield f"Model A Response:\n{response_a}\n\nModel B Response:\n{response_b}", "Completed"
-                
+                print(f"Model B Code Blocks: {code_blocks}")  # Debugging
+                print(f"Model B Test Blocks: {test_blocks}")  # Debugging
+
+                # If there are code blocks or test blocks
+                if code_blocks or test_blocks:
+                    # Iterate over code and test blocks
+                    for i, code in enumerate(code_blocks):
+                        # Execute the code block
+                        if code:
+                            logger.info(f"Executing code block {i+1} from Model B")
+                            output = self.run_code(code.strip())
+                            print(f"Output from code block {i+1}:\n{output}") # Debugging
+
+                            # Append the output to the conversation
+                            code_response = f"Code block {i+1} output:\n{output}"
+                            self.conversation.append({"role": "assistant", "name": self.model_b_id, "content": code_response})
+                            yield self.get_conversation_history(), f"Executed code block {i+1} from Model B", self.execution_manager.get_last_code_html(), self.execution_manager.get_last_output_html()
+                            time.sleep(0.05)
+
+                            # Run associated tests if they exist
+                            if i < len(test_blocks):
+                                test = test_blocks[i]
+                                logger.info(f"Executing test block {i+1} from Model B")
+                                test_result = self.run_tests(test.strip())
+                                print(f"Result from test block {i+1}:\n{test_result}")  # Debugging
+                                
+                                yield self.get_conversation_history(), f"Executed test block {i+1} from Model B", self.execution_manager.get_last_code_html(), self.execution_manager.get_last_output_html()
+                                time.sleep(0.05)
+
+                            if self.should_stop_generation():
+                                logger.info("Stopping generation - required test passes achieved")
+                                yield self.get_conversation_history(), "Complete", self.execution_manager.get_last_code_html(), self.execution_manager.get_last_output_html()
+                                return
+
+                yield self.get_conversation_history(), "Completed", self.execution_manager.get_last_code_html(), self.execution_manager.get_last_output_html()
+
         except Exception as e:
             error_msg = f"Error processing message: {str(e)}"
             logger.error(error_msg)
-            yield error_msg
+            yield self.get_conversation_history(), "Error occurred", self.execution_manager.get_last_code_html(), self.execution_manager.get_last_output_html()
 
     def get_conversation_history(self):
         """Get formatted conversation history."""
@@ -413,15 +544,15 @@ assert add(-1, 1) == 0, "Should handle negatives"
 def create_ui():
     """Create and configure the Gradio interface."""
     logger.info("Creating Gradio interface")
-    
+
     try:
-        manager = LLMManager()
-        manager.should_stop = False
-        
+        execution_manager = ExecutionManager()
+        manager = LLMManager(execution_manager)
+
         with gr.Blocks(title="LLM Pattern Interface") as interface:
             gr.Markdown("# LLM Pattern Interface")
             gr.Markdown("Enter your message to interact with the AI models. Code will be executed and tested until pass criteria are met.")
-            
+
             with gr.Row():
                 with gr.Column(scale=2):
                     input_message = gr.Textbox(
@@ -429,108 +560,121 @@ def create_ui():
                         label="Input Message",
                         lines=3
                     )
-                    
+
                     with gr.Row():
                         submit_btn = gr.Button("Submit", variant="primary")
                         stop_btn = gr.Button("Stop Generation", variant="secondary")
                         clear_btn = gr.Button("Clear Conversation")
-                        
+
                 with gr.Column(scale=3):
                     conversation_display = gr.Textbox(
                         label="Conversation & Results",
                         lines=20,
                         interactive=False
                     )
-                    
+
+            last_code_display = gr.HTML(
+                label="Last Executed Code"
+            )
+
+            last_output_display = gr.HTML(
+                label="Last Output"
+            )
+
+            with gr.Row():
+                show_last_code_btn = gr.Button("Show Last Code")
+                show_last_output_btn = gr.Button("Show Last Output")
+
             status_display = gr.Textbox(
                 label="Status/Tests",
                 lines=2,
                 interactive=False,
                 visible=True
             )
-            
+
             def handle_submit(message):
                 """Handle message submission with streaming."""
                 if not message:
-                    return "", "Please enter a message"
-                
+                    return "", "Please enter a message", "", ""
+
                 try:
                     logger.info(f"Handling new message: {message[:50]}...")
-                    manager.should_stop = False
-                    
-                    message_generator = manager.process_message(message)
-                    
-                    while True:
-                        try:
-                            if manager.should_stop:
-                                logger.info("Generation stopped by user")
-                                yield "Generation stopped by user.", "Stopped"
-                                break
-                                
-                            result = next(message_generator)
-                            if isinstance(result, tuple):
-                                yield result[0], result[1]  # conversation, status
-                            else:
-                                yield result, "Processing..."
-                                
-                        except StopIteration:
-                            break
-                        except Exception as e:
-                            error_msg = f"Error in message stream: {str(e)}"
-                            logger.error(error_msg)
-                            yield "", error_msg
-                            break
-                            
+
+                    result = manager.process_message(message)
+
+                    for response in result:
+                        yield response # No need for time.sleep here, it's handled in process_message
+
                 except Exception as e:
-                    error_msg = f"Error processing message: {str(e)}"
-                    logger.error(error_msg)
-                    yield "", error_msg
-                    
+                    logger.error(f"Error processing message: {e}")
+                    yield "", f"Error: {e}", execution_manager.get_last_code_html(), execution_manager.get_last_output_html()
+
             def handle_stop():
                 """Handle stop button click."""
-                manager.should_stop = True
+                # The stopping mechanism is handled in should_stop_generation
                 return "Stopping generation...", "Stopping..."
-            
+
             def handle_clear():
                 """Handle conversation clearing."""
                 try:
                     result = manager.clear_conversation()
-                    return "", result
+                    return "", result, "<p>No code executed yet.</p>", "<p>No output yet.</p>"
                 except Exception as e:
                     error_msg = f"Error clearing conversation: {str(e)}"
                     logger.error(error_msg)
-                    return "", error_msg
-            
+                    return "", error_msg, execution_manager.get_last_code_html(), execution_manager.get_last_output_html()
+
+            def handle_show_last_code():
+                """Handle show last code button click."""
+                return execution_manager.get_last_code_html()
+
+            def handle_show_last_output():
+                """Handle show last output button click."""
+                return execution_manager.get_last_output_html()
+
             # Wire up the interface events
             submit_btn.click(
                 fn=handle_submit,
                 inputs=input_message,
-                outputs=[conversation_display, status_display],
+                outputs=[conversation_display, status_display, last_code_display, last_output_display],
                 show_progress=True
             )
-            
+
             stop_btn.click(
                 fn=handle_stop,
                 inputs=None,
                 outputs=[conversation_display, status_display]
             )
-            
+
             clear_btn.click(
                 fn=handle_clear,
                 inputs=None,
-                outputs=[conversation_display, status_display]
+                outputs=[conversation_display, status_display, last_code_display, last_output_display]
             )
-            
+
+            # Wire up the last code and output-related events
+            show_last_code_btn.click(
+                fn=handle_show_last_code,
+                inputs=None,
+                outputs=last_code_display
+            )
+
+            show_last_output_btn.click(
+                fn=handle_show_last_output,
+                inputs=None,
+                outputs=last_output_display
+            )
+
             # Show conversation history on load
             interface.load(
                 fn=manager.get_conversation_history,
                 inputs=None,
                 outputs=conversation_display
             )
-        
+
         interface.queue()
         return interface
-    
+
     except Exception as e:
         error_msg = f"Error creating UI: {str(e)}\n{traceback.format_exc()}"
         logger.error(error_msg)
@@ -539,11 +683,11 @@ def create_ui():
 def main():
     """Main entry point."""
     logger.info("Starting LLM Interface application")
-    
+
     try:
         # Ensure we're running in a virtual environment
         restart_in_venv()
-        
+
         # Create and launch the interface
         interface = create_ui()
         logger.info("Launching Gradio interface")
@@ -553,7 +697,7 @@ def main():
             server_port=1337,
             debug=True
         )
-        
+
     except Exception as e:
         logger.error(f"Application failed to start: {str(e)}\n{traceback.format_exc()}")
         raise
