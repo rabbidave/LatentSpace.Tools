@@ -2,18 +2,22 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-Conductor is an interactive interface that (locally) orchestrates multiple (remote or local) Language Models with Python code execution and test assertion capabilities.
+* Deployable interface (GUI/API) that (locally) orchestrates multiple (remote and/or local) Language Models.
+
+* Python code is executed and tested against assertions; via configurable allow/block list of operations (regex).
+
+![](https://media0.giphy.com/media/v1.Y2lkPTc5MGI3NjExdGZxeno0ZHhzZnZudjd2dmwxNG5uNHVlMHY4a24zNGMxeHVqcmIxMSZlcD12MV9pbnRlcm5hbF9naWZfYnlfaWQmY3Q9Zw/GPnHHTkd386URrEwYb/giphy.webp)
 
 
 ## Features
 
 *   **Multi LM Interaction:** Engage with multiple LMs sequentially for mob-style programming.
-*   **Safe Code Execution:** Run Python Code within a sandboxed environment via allowed/restricted operations. Code execution is restricted by a regex check for potentially unsafe operations, and this can be customized in the main python file.
-*   **Automated Test Assertions:** Define test cases using `TEST-ASSERT` blocks; Conductor will automatically run them against the executed code.
+*   **Safe Code Execution:** Run Python Code within a sandboxed environment via allowed/restricted operations.
+*   **Automated Test Assertions:** Define test cases using `TEST-ASSERT` blocks; Conductor runs them automatically.
 *   **Test-Driven Generation:** Generation stops after a configurable number of successful test passes, encouraging test-driven development.
 *   **Customizable System Message:** Tailor the behavior of the LMs by modifying the system message.
 *   **Configurable Model IDs:** Easily switch between different local LLMs by updating the model IDs.
-*  **Configurable API/Model**: You can use an `.env` file in order to specify the local API url and the local model id to use. This file will be automatically created with default values the first time you run the project.
+*  **Configurable API/Model**: You can use an `.env` file in order to specify the API url and the model id to use.
 
 
 ## Prerequisites
@@ -30,22 +34,7 @@ Conductor is an interactive interface that (locally) orchestrates multiple (remo
     cd conductor
     ```
 
-2. **Create and Activate a Virtual Environment:**
-
-    ```bash
-    python3 -m venv .venv
-    source .venv/bin/activate  # On Linux/macOS
-    .venv\Scripts\activate  # On Windows
-    ```
-
-3.  **Create the requirements.txt file:**
-     * Create a file named `requirements.txt` and add the following to the file:
-
-    ```
-    gradio
-    openai
-    ```
-4. **Install Dependencies:**
+2. **Install Dependencies:**
 
     ```bash
     pip install -r requirements.txt
@@ -102,7 +91,7 @@ Conductor is an interactive interface that (locally) orchestrates multiple (remo
         """
         }
         ```
-    *  You might add examples of how to modity the message to tailor the response to your specific needs.
+    
 4.  **Test Pass Count:**
 
     *   To change the number of successful test passes required to stop generation, modify `self.max_passed_tests` in `LLMManager.__init__` in the main python file.
