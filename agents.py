@@ -124,7 +124,7 @@ class LLMManager:
         try:
             self.llama_api = OpenAI(
                 api_key="api_key",
-                base_url="http://127.0.0.1:1234/v1/"  # Your local LLM base URL
+                base_url="http://127.0.0.1:1234/v1/"  # Your local/remote LLM base URL
             )
 
             # Track execution context and test passes
@@ -150,11 +150,28 @@ assert condition, "Test message"
 
 Important rules:
 
-Each block must start with its marker on its own line
+Each block must start with its marker on its own line (e.g. \n)
 
-Code must be within triple backticks with 'python' specified
+Run-Code Code must be within triple backticks with 'python' specified
 
-Tests have access to variables from code execution
+        try:
+            # Set up safe execution environment
+            safe_globals = {
+                'print': print,
+                'len': len,
+                'range': range,
+                'str': str,
+                'int': int,
+                'float': float,
+                'bool': bool,
+                'list': list,
+                'dict': dict,
+                'set': set,
+                'os': os,
+                'Path': Path
+            }
+
+Test-Assert Tests have access to variables from code execution
 
 Generation stops after 2 successful test passes
 
@@ -513,8 +530,8 @@ def create_ui():
         execution_manager = ExecutionManager()
         manager = LLMManager(execution_manager)
 
-        with gr.Blocks(title="LLM Pattern Interface") as interface:
-            gr.Markdown("# LLM Pattern Interface")
+        with gr.Blocks(title="🚂🤖🪄 Conductor") as interface:
+            gr.Markdown("# 🚂🤖🪄 Conductor")
             gr.Markdown("Enter your message to interact with the AI models. Code will be executed and tested until pass criteria are met.")
 
             with gr.Row():
@@ -646,7 +663,7 @@ def create_ui():
 
 def main():
     """Main entry point."""
-    logger.info("Starting LLM Interface application")
+    logger.info("🚂🤖🪄 Initializing Conductor ")
 
     try:
         # Ensure we're running in a virtual environment
