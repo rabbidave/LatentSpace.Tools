@@ -1,0 +1,353 @@
+{
+  "openapi": "3.0.0",
+  "info": {
+    "title": "AI Control Plane API",
+    "version": "v1",
+    "description": "API for managing AI model configurations with schema evolution support. Maintains audit trail of changes across enterprise infrastructure, LOB IT, and application teams."
+  },
+  "servers": [
+    {
+      "url": "/api/v1"
+    }
+  ],
+  "paths": {
+    "/config/schema": {
+      "post": {
+        "summary": "Update enterprise schema",
+        "description": "Enterprise infrastructure endpoint for schema updates. Maintains audit trail.",
+        "tags": ["Infrastructure"],
+        "security": [{"bearerAuth": []}],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/EnterpriseConfig"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Schema successfully updated",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SchemaUpdateResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid schema update request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "detail": {"type": "string"}
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "detail": {"type": "string"}
+                  }
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Forbidden - incorrect role",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "detail": {"type": "string"}
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/runtime/schema": {
+      "post": {
+        "summary": "Update runtime schema",
+        "description": "LOB IT endpoint for runtime configuration updates",
+        "tags": ["Runtime"],
+        "security": [{"bearerAuth": []}],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RuntimeConfig"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Schema successfully updated",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SchemaUpdateResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid schema update request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "detail": {"type": "string"}
+                  }
+                }
+              }
+            }
+          },
+          "401": {"$ref": "#/components/responses/UnauthorizedError"},
+          "403": {"$ref": "#/components/responses/ForbiddenError"}
+        }
+      }
+    },
+    "/integrations/schema": {
+      "post": {
+        "summary": "Update integration schema",
+        "description": "Application team endpoint for integration updates",
+        "tags": ["Integration"],
+        "security": [{"bearerAuth": []}],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/IntegrationConfig"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Schema successfully updated",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SchemaUpdateResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid schema update request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "detail": {"type": "string"}
+                  }
+                }
+              }
+            }
+          },
+          "401": {"$ref": "#/components/responses/UnauthorizedError"},
+          "403": {"$ref": "#/components/responses/ForbiddenError"}
+        }
+      }
+    },
+    "/audit/{schema_type}": {
+      "get": {
+        "summary": "Get audit log",
+        "description": "Retrieve audit trail of schema changes",
+        "tags": ["Audit"],
+        "security": [{"bearerAuth": []}],
+        "parameters": [
+          {
+            "name": "schema_type",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "enum": ["enterprise", "runtime", "integration"]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Audit log retrieved",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "changes": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/AuditEntry"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {"$ref": "#/components/responses/UnauthorizedError"},
+          "403": {"$ref": "#/components/responses/ForbiddenError"}
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "DataClassification": {
+        "type": "string",
+        "enum": ["Public", "Internal", "Confidential", "Restricted"],
+        "description": "PICR data classification levels"
+      },
+      "EnterpriseConfig": {
+        "type": "object",
+        "required": ["name", "targetMetric", "dataClassification", "quickAlertHeuristic", "reason"],
+        "properties": {
+          "name": {"type": "string"},
+          "targetMetric": {"type": "string"},
+          "dataClassification": {
+            "$ref": "#/components/schemas/DataClassification"
+          },
+          "quickAlertHeuristic": {
+            "type": "object",
+            "required": ["threshold", "window"],
+            "properties": {
+              "threshold": {"type": "number"},
+              "window": {"type": "string"}
+            }
+          },
+          "reason": {"type": "string"},
+          "author": {"type": "string"},
+          "timestamp": {"type": "string", "format": "date-time"}
+        },
+        "additionalProperties": true
+      },
+      "RuntimeConfig": {
+        "type": "object",
+        "required": ["modelVersion", "validationParameters", "reason"],
+        "properties": {
+          "modelVersion": {"type": "string"},
+          "validationParameters": {
+            "type": "object",
+            "additionalProperties": true
+          },
+          "reason": {"type": "string"},
+          "author": {"type": "string"},
+          "timestamp": {"type": "string", "format": "date-time"}
+        },
+        "additionalProperties": true
+      },
+      "IntegrationConfig": {
+        "type": "object",
+        "required": ["customThresholds", "businessMetric", "reason"],
+        "properties": {
+          "customThresholds": {
+            "type": "object",
+            "additionalProperties": {"type": "number"}
+          },
+          "businessMetric": {"type": "string"},
+          "reason": {"type": "string"},
+          "author": {"type": "string"},
+          "timestamp": {"type": "string", "format": "date-time"}
+        },
+        "additionalProperties": true
+      },
+      "SchemaUpdateResponse": {
+        "type": "object",
+        "required": ["status", "message", "updated_schema"],
+        "properties": {
+          "status": {
+            "type": "string",
+            "enum": ["success", "error"]
+          },
+          "message": {"type": "string"},
+          "updated_schema": {"type": "object"}
+        }
+      },
+      "AuditEntry": {
+        "type": "object",
+        "required": ["timestamp", "schema_type", "author", "change"],
+        "properties": {
+          "timestamp": {"type": "string", "format": "date-time"},
+          "schema_type": {"type": "string"},
+          "author": {"type": "string"},
+          "change": {"type": "object"}
+        }
+      }
+    },
+    "responses": {
+      "UnauthorizedError": {
+        "description": "Authentication information is missing or invalid",
+        "content": {
+          "application/json": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "detail": {"type": "string"}
+              }
+            }
+          }
+        }
+      },
+      "ForbiddenError": {
+        "description": "Insufficient permissions for requested operation",
+        "content": {
+          "application/json": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "detail": {"type": "string"}
+              }
+            }
+          }
+        }
+      }
+    },
+    "securitySchemes": {
+      "bearerAuth": {
+        "type": "http",
+        "scheme": "bearer",
+        "bearerFormat": "JWT",
+        "description": "JWT token for role-based authentication"
+      }
+    }
+  },
+  "tags": [
+    {
+      "name": "Infrastructure",
+      "description": "Enterprise infrastructure configuration endpoints"
+    },
+    {
+      "name": "Runtime",
+      "description": "LOB IT and cluster operation endpoints"
+    },
+    {
+      "name": "Integration",
+      "description": "Application team integration endpoints"
+    },
+    {
+      "name": "Audit",
+      "description": "Audit trail and change history endpoints"
+    }
+  ]
+}
