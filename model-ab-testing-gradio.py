@@ -69,6 +69,65 @@ class EvaluationResult:
     reasoning: str
 
 
+# Global preprocessing settings (can be updated through UI)
+PREPROCESS_ENABLED = True
+MAX_LENGTH = 8000
+REMOVE_SPECIAL_CHARS = True
+NORMALIZE_WHITESPACE = True
+
+# New CSV preprocessing settings
+DETECT_DELIMITER = True
+FIX_QUOTES = True
+REMOVE_CONTROL_CHARS = True
+NORMALIZE_NEWLINES = True
+SKIP_BAD_LINES = True
+SHOW_SAMPLE = True
+
+def preprocess_text(text, max_length=None, remove_special_chars=None, normalize_whitespace=None):
+    """
+    Preprocess text to make it more suitable for model prompts:
+    - Truncate to prevent token limits
+    - Remove problematic characters
+    - Normalize whitespace
+    - Handle potential HTML/XML
+    """
+    # Use global settings if not specified
+    if max_length is None:
+        max_length = MAX_LENGTH
+    if remove_special_chars is None:
+        remove_special_chars = REMOVE_SPECIAL_CHARS
+    if normalize_whitespace is None:
+        normalize_whitespace = NORMALIZE_WHITESPACE
+    
+    # Skip preprocessing if disabled
+    if not PREPROCESS_ENABLED:
+        return text
+    
+    if text is None:
+        return ""
+    
+    text = str(text)
+    
+    # Truncate to prevent excessive token usage
+    if len(text) > max_length:
+        text = text[:max_length] + "... [truncated]"
+    
+    if remove_special_chars:
+        # Remove control characters and other potentially problematic characters
+        text = re.sub(r'[\x00-\x1F\x7F-\x9F]', '', text)
+        # Remove any XML/HTML-like tags that might interfere with prompts
+        text = re.sub(r'<[^>]+>', '', text)
+    
+    if normalize_whitespace:
+        # Normalize whitespace (convert multiple spaces, tabs, newlines to single space)
+        text = re.sub(r'\s+', ' ', text)
+        # But preserve paragraph breaks for readability
+        text = re.sub(r'\n\s*\n', '\n\n', text)
+        text = text.strip()
+    
+    return text
+
+
 class ModelRunner:
     """Handles model API calls."""
     
@@ -84,8 +143,24 @@ class ModelRunner:
         """Call the model API with the test case."""
         start_time = time.time()
         
-        # Format prompt using the key
-        prompt = self.prompt_template.format(key=test_case.key)
+        # Preprocess the input key
+        preprocessed_key = preprocess_text(test_case.key)
+        
+        # Format prompt using the preprocessed key
+        # Handle potential formatting issues by escaping curly braces
+        try:
+            # Use a try-except block for string formatting
+            prompt = self.prompt_template.replace("{key}", preprocessed_key)
+        except Exception as e:
+            # Fallback for other formatting issues
+            logger.warning(f"Error formatting prompt template with replace: {str(e)}")
+            try:
+                # Try with string formatting if replacement fails
+                prompt = self.prompt_template.format(key=preprocessed_key)
+            except Exception as e2:
+                # Second fallback - just concatenate the template and input
+                logger.warning(f"Error formatting prompt template: {str(e2)}")
+                prompt = f"{self.prompt_template}\n\nINPUT: {preprocessed_key}"
         
         # Determine API type and make appropriate call
         if "openai" in self.endpoint.api_url.lower():
@@ -246,11 +321,17 @@ class LMJudge:
         challenger_response: ModelResponse
     ) -> EvaluationResult:
         """Evaluate champion vs challenger outputs against the true value."""
+        # Preprocess all inputs to ensure they're clean and properly formatted
+        preprocessed_key = preprocess_text(test_case.key)
+        preprocessed_value = preprocess_text(test_case.value)
+        preprocessed_champion = preprocess_text(champion_response.output)
+        preprocessed_challenger = preprocess_text(challenger_response.output)
+        
         evaluation_prompt = self.evaluation_prompt_template.format(
-            key=test_case.key,
-            value=test_case.value,
-            champion_output=champion_response.output,
-            challenger_output=challenger_response.output,
+            key=preprocessed_key,
+            value=preprocessed_value,
+            champion_output=preprocessed_champion,
+            challenger_output=preprocessed_challenger,
         )
         
         # Get judge's response
@@ -492,111 +573,389 @@ def save_results_to_csv(results: Dict[str, Any], file_path: str):
     Save evaluation results to a CSV file for Excel processing.
     Uses the standardized verdict format for easier sorting and filtering.
     """
-    with open(file_path, 'w', newline='', encoding='utf-8') as f:
-        writer = csv.writer(f)
-        
-        # Write header
-        writer.writerow([
-            "test_id", 
-            "query", 
-            "champion_model",
-            "challenger_model",
-            "verdict",  # Automatically extracted from judge response
-            "confidence",  # Automatically extracted from judge response
-            "explanation",
-            "champion_output", 
-            "challenger_output", 
-            "full_judge_response"
-        ])
-        
-        # Write data rows
-        for eval_item in results.get("evaluations", []):
-            # Extract verdict and confidence using regex
-            verdict = "UNKNOWN"
-            confidence = "0"
-            judge_response = eval_item.get("reasoning", "")
+    try:
+        with open(file_path, 'w', newline='', encoding='utf-8-sig') as f:  # Use utf-8-sig for Excel compatibility
+            writer = csv.writer(f, quoting=csv.QUOTE_ALL)  # Quote all fields for better compatibility
             
-            # Extract verdict
-            verdict_match = re.search(r"VERDICT:\s*(MODEL_A_WINS|MODEL_B_WINS|TIE)", judge_response)
-            if verdict_match:
-                verdict = verdict_match.group(1)
-            
-            # Extract confidence
-            confidence_match = re.search(r"CONFIDENCE:\s*(\d+)/5", judge_response)
-            if confidence_match:
-                confidence = confidence_match.group(1)
-            
-            # Extract explanation (everything after the confidence line)
-            explanation = ""
-            lines = judge_response.split('\n')
-            capture = False
-            for line in lines:
-                if capture:
-                    explanation += line + " "
-                if "CONFIDENCE:" in line:
-                    capture = True
-            
+            # Write header
             writer.writerow([
-                eval_item.get("test_id", ""),
-                "",  # query column - to be filled manually if needed
-                results.get("summary", {}).get("champion_name", ""),
-                results.get("summary", {}).get("challenger_name", ""),
-                verdict,
-                confidence,
-                explanation.strip(),
-                eval_item.get("champion_output", "")[:300],  # Truncate long outputs
-                eval_item.get("challenger_output", "")[:300],  # Truncate long outputs
-                judge_response
+                "test_id", 
+                "query", 
+                "reference",
+                "champion_model",
+                "challenger_model",
+                "verdict",  # Automatically extracted from judge response
+                "confidence",  # Automatically extracted from judge response
+                "explanation",
+                "champion_output", 
+                "challenger_output", 
+                "full_judge_response"
             ])
+            
+            # Write data rows
+            for eval_item in results.get("evaluations", []):
+                # Extract test case data if available
+                test_id = eval_item.get("test_id", "")
+                
+                # Try to find the original test case
+                query = ""
+                reference = ""
+                for test_case in results.get("metadata", {}).get("test_cases", []):
+                    if test_case.get("id") == test_id:
+                        query = test_case.get("key", "")
+                        reference = test_case.get("value", "")
+                        break
+                
+                # Extract verdict and confidence using regex
+                verdict = "UNKNOWN"
+                confidence = "0"
+                judge_response = eval_item.get("reasoning", "")
+                
+                # Extract verdict
+                verdict_match = re.search(r"VERDICT:\s*(MODEL_A_WINS|MODEL_B_WINS|TIE)", judge_response)
+                if verdict_match:
+                    verdict = verdict_match.group(1)
+                
+                # Extract confidence
+                confidence_match = re.search(r"CONFIDENCE:\s*(\d+)/5", judge_response)
+                if confidence_match:
+                    confidence = confidence_match.group(1)
+                
+                # Extract explanation (everything after the confidence line)
+                explanation = ""
+                lines = judge_response.split('\n')
+                capture = False
+                for line in lines:
+                    if capture:
+                        explanation += line + " "
+                    if "CONFIDENCE:" in line:
+                        capture = True
+                
+                # Clean output for CSV - remove line breaks that might break the CSV format
+                champion_output = eval_item.get("champion_output", "").replace("\n", " ")
+                challenger_output = eval_item.get("challenger_output", "").replace("\n", " ")
+                judge_response_clean = judge_response.replace("\n", " ")
+                
+                # Truncate long text fields to prevent Excel issues
+                max_cell_length = 32700  # Excel's limit is ~32,767 characters
+                
+                writer.writerow([
+                    test_id,
+                    query[:max_cell_length] if query else "",
+                    reference[:max_cell_length] if reference else "",
+                    results.get("summary", {}).get("champion_name", ""),
+                    results.get("summary", {}).get("challenger_name", ""),
+                    verdict,
+                    confidence,
+                    explanation.strip()[:max_cell_length],
+                    champion_output[:max_cell_length],
+                    challenger_output[:max_cell_length],
+                    judge_response_clean[:max_cell_length]
+                ])
+        
+        logger.info(f"Successfully saved results to CSV: {file_path}")
+    except Exception as e:
+        logger.error(f"Error saving results to CSV: {str(e)}")
+        # If saving to CSV fails, try with a more robust approach
+        try:
+            logger.info("Attempting to save CSV with a more robust approach...")
+            with open(file_path, 'w', newline='', encoding='utf-8-sig') as f:
+                writer = csv.writer(f, quoting=csv.QUOTE_ALL, escapechar='\\', 
+                                  doublequote=True, lineterminator='\n')
+                
+                # Write just the critical data if the full save failed
+                writer.writerow(["test_id", "verdict", "confidence", "champion_model", "challenger_model"])
+                
+                for eval_item in results.get("evaluations", []):
+                    test_id = eval_item.get("test_id", "")
+                    judge_response = eval_item.get("reasoning", "")
+                    
+                    # Extract verdict
+                    verdict = "UNKNOWN"
+                    verdict_match = re.search(r"VERDICT:\s*(MODEL_A_WINS|MODEL_B_WINS|TIE)", judge_response)
+                    if verdict_match:
+                        verdict = verdict_match.group(1)
+                    
+                    # Extract confidence
+                    confidence = "0"
+                    confidence_match = re.search(r"CONFIDENCE:\s*(\d+)/5", judge_response)
+                    if confidence_match:
+                        confidence = confidence_match.group(1)
+                    
+                    writer.writerow([
+                        test_id,
+                        verdict,
+                        confidence,
+                        results.get("summary", {}).get("champion_name", ""),
+                        results.get("summary", {}).get("challenger_name", "")
+                    ])
+                
+                logger.info(f"Saved simplified results to CSV: {file_path}")
+        except Exception as inner_e:
+            logger.error(f"Failed to save even simplified CSV: {str(inner_e)}")
 
 
 def load_test_cases_from_csv_url(csv_url: str, key_column: str = "text", value_column: str = "label", 
                               limit: int = None) -> List[TestCase]:
-    """Load test cases from a CSV URL."""
+    """Load test cases from a CSV URL with robust preprocessing and error handling."""
     try:
+        # Convert GitHub URL to raw format if needed
+        if "github.com" in csv_url and "/blob/" in csv_url and not "raw.githubusercontent.com" in csv_url:
+            csv_url = csv_url.replace("github.com", "raw.githubusercontent.com").replace("/blob/", "/")
+            logger.info(f"Converted GitHub URL to raw format: {csv_url}")
+        
         # Download the CSV file
+        logger.info(f"Downloading CSV from: {csv_url}")
         response = requests.get(csv_url)
         response.raise_for_status()
         
-        # Parse CSV content
-        csv_content = response.content.decode('utf-8')
-        df = pd.read_csv(io.StringIO(csv_content))
+        # Get raw content
+        csv_content = response.content.decode('utf-8', errors='replace')
         
-        # Validate columns
+        # Log first few lines for debugging
+        lines = csv_content.split('\n')
+        logger.info(f"CSV first few lines (raw):")
+        for i, line in enumerate(lines[:3]):
+            if i == 0:
+                logger.info(f"Header: {line}")
+            else:
+                logger.info(f"Data row {i}: {line[:100]}...")
+        
+        # --- PREPROCESSING SECTION START ---
+        if REMOVE_CONTROL_CHARS:
+            # Remove control characters except for legitimate newlines and tabs
+            csv_content = re.sub(r'[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]', '', csv_content)
+        
+        if FIX_QUOTES:
+            # Handle unescaped quotes within fields
+            lines = csv_content.split('\n')
+            processed_lines = []
+            
+            in_quoted_field = False
+            for line in lines:
+                if in_quoted_field:
+                    # This line continues a quoted field from previous line
+                    processed_lines[-1] += "\\n" + line  # Add escaped newline
+                    if line.count('"') % 2 == 1:  # Odd number of quotes means end of quoted field
+                        in_quoted_field = False
+                else:
+                    # Count quotes to see if we have an open quoted field
+                    if line.count('"') % 2 == 1:
+                        in_quoted_field = True
+                    processed_lines.append(line)
+            
+            csv_content = '\n'.join(processed_lines)
+        
+        if NORMALIZE_NEWLINES:
+            # Normalize newlines within quoted fields
+            def replace_newlines_in_quotes(match):
+                return match.group(0).replace('\n', '\\n').replace('\r', '')
+                
+            csv_content = re.sub(r'"[^"]*"', replace_newlines_in_quotes, csv_content)
+        
+        detected_delimiter = ','  # Default
+        
+        if DETECT_DELIMITER:
+            # Try to detect the delimiter by sampling first few lines
+            sample_lines = csv_content.split('\n')[:5]
+            candidate_delimiters = [',', '\t', ';', '|']
+            delimiter_counts = {}
+            
+            for delimiter in candidate_delimiters:
+                delimiter_counts[delimiter] = 0
+                for line in sample_lines:
+                    # Count delimiters in unquoted text
+                    in_quotes = False
+                    unquoted_delimiter_count = 0
+                    for char in line:
+                        if char == '"':
+                            in_quotes = not in_quotes
+                        elif char == delimiter and not in_quotes:
+                            unquoted_delimiter_count += 1
+                    delimiter_counts[delimiter] += unquoted_delimiter_count
+            
+            # Choose the delimiter with the most consistent count
+            max_count = 0
+            for delimiter, count in delimiter_counts.items():
+                if count > max_count:
+                    max_count = count
+                    detected_delimiter = delimiter
+                
+            logger.info(f"Detected delimiter: '{detected_delimiter}'")
+        # --- PREPROCESSING SECTION END ---
+        
+        # Try multiple parsing approaches with the preprocessed content
+        parsing_methods = [
+            # Method 1: Using detected delimiter
+            lambda: pd.read_csv(io.StringIO(csv_content), 
+                               sep=detected_delimiter,
+                               quoting=csv.QUOTE_MINIMAL,
+                               escapechar='\\',
+                               on_bad_lines='warn'),
+            
+            # Method 2: Standard CSV parsing
+            lambda: pd.read_csv(io.StringIO(csv_content)),
+            
+            # Method 3: Try with different quoting options
+            lambda: pd.read_csv(io.StringIO(csv_content), 
+                               quoting=csv.QUOTE_NONE, 
+                               escapechar='\\'),
+            
+            # Method 4: Skip bad lines if enabled
+            lambda: pd.read_csv(io.StringIO(csv_content), 
+                               on_bad_lines='skip'),
+            
+            # Method 5: Try with Python's csv module directly
+            lambda: pd.DataFrame(list(csv.reader(io.StringIO(csv_content))))
+        ]
+        
+        df = None
+        parsing_error = None
+        successful_method = None
+        
+        for i, method in enumerate(parsing_methods):
+            try:
+                df = method()
+                if len(df) > 0:  # Check if we got valid data
+                    # If we got here, parsing succeeded
+                    successful_method = i + 1
+                    break
+            except Exception as e:
+                parsing_error = e
+                # Skip to next method if SKIP_BAD_LINES is enabled
+                if SKIP_BAD_LINES:
+                    logger.warning(f"Method {i+1} failed: {str(e)}. Trying next method.")
+                    continue
+                else:
+                    # If SKIP_BAD_LINES is disabled and this was the first method,
+                    # we'll continue to try other methods
+                    if i == 0:
+                        logger.warning(f"Method {i+1} failed: {str(e)}. Trying next method even though SKIP_BAD_LINES is disabled.")
+                        continue
+                    else:
+                        # For other methods, respect the SKIP_BAD_LINES setting
+                        raise
+        
+        if df is None:
+            # All methods failed
+            raise ValueError(f"Failed to parse CSV after preprocessing. Last error: {str(parsing_error)}")
+        
+        logger.info(f"Successfully parsed CSV using method {successful_method}")
+        logger.info(f"DataFrame columns: {list(df.columns)}")
+        
+        # If dataframe has no column names (from method 5), use first row as header
+        if all(isinstance(col, int) for col in df.columns):
+            df.columns = df.iloc[0]
+            df = df[1:]
+        
+        # More robust column selection - try to match case-insensitive
+        # and strip whitespace from column names
+        clean_columns = {col: col.strip() for col in df.columns}
+        df.columns = [col.strip() for col in df.columns]
+        
+        # Try to infer column names if they don't exist
         if key_column not in df.columns:
-            raise ValueError(f"Key column '{key_column}' not found in CSV. Available columns: {', '.join(df.columns)}")
+            # Try case-insensitive match
+            key_match = next((col for col in df.columns if col.lower() == key_column.lower()), None)
+            if key_match:
+                key_column = key_match
+                logger.info(f"Using case-insensitive match for key column: '{key_column}'")
+            # If we have at least two columns, use the first one as key
+            elif len(df.columns) >= 2:
+                key_column = df.columns[0]
+                logger.warning(f"Key column '{key_column}' not found, using first column: {key_column}")
+            else:
+                raise ValueError(f"Key column '{key_column}' not found and couldn't infer a suitable column")
         
         if value_column not in df.columns:
-            raise ValueError(f"Value column '{value_column}' not found in CSV. Available columns: {', '.join(df.columns)}")
+            # Try case-insensitive match
+            value_match = next((col for col in df.columns if col.lower() == value_column.lower()), None)
+            if value_match:
+                value_column = value_match
+                logger.info(f"Using case-insensitive match for value column: '{value_column}'")
+            # If we have at least two columns, use the second one as value
+            elif len(df.columns) >= 2:
+                value_column = df.columns[1]
+                logger.warning(f"Value column '{value_column}' not found, using second column: {value_column}")
+            else:
+                # If only one column exists, use it for both key and value
+                value_column = key_column
+                logger.warning(f"Value column '{value_column}' not found, using key column for both")
         
         # Create test cases
         test_cases = []
         for i, row in df.iterrows():
             if limit is not None and i >= limit:
                 break
-                
+            
+            # Handle missing values
+            key_value = row[key_column] if pd.notna(row[key_column]) else ""
+            val_value = row[value_column] if pd.notna(row[value_column]) else ""
+            
+            # Convert to string and ensure they don't contain problematic formatting characters
+            key_str = str(key_value).replace("{", "{{").replace("}", "}}")
+            val_str = str(val_value).replace("{", "{{").replace("}", "}}")
+            
             test_cases.append(TestCase(
-                key=str(row[key_column]),
-                value=str(row[value_column]),
+                key=key_str,
+                value=val_str,
                 id=f"case_{i}",
             ))
         
+        if not test_cases:
+            raise ValueError("No valid test cases found in CSV")
+            
+        logger.info(f"Successfully loaded {len(test_cases)} test cases from CSV")
+        
+        # Print sample of preprocessed data
+        if SHOW_SAMPLE and test_cases:
+            logger.info("----- Sample Test Case After Preprocessing -----")
+            sample_case = test_cases[0]
+            logger.info(f"ID: {sample_case.id}")
+            logger.info(f"Key (truncated): {sample_case.key[:100]}...")
+            logger.info(f"Value (truncated): {sample_case.value[:100]}...")
+            logger.info("-------------------------------------------")
+            
         return test_cases
     
     except Exception as e:
         logger.error(f"Error loading CSV from URL {csv_url}: {str(e)}")
-        raise
-
-
+        raise ValueError(f"CSV parsing error: {str(e)}")
+        
 def create_model_endpoint(model_type, model_name, api_url, api_key, model_id, max_tokens, temperature):
     """Create a model endpoint configuration based on provided parameters."""
+    # Default URL for common models if not specified
+    if not api_url:
+        if model_type == "OpenAI":
+            api_url = "https://api.openai.com/v1/chat/completions"
+        elif model_type == "Anthropic":
+            api_url = "https://api.anthropic.com/v1/messages"
+        elif model_type == "Gemini":
+            api_url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateContent"
+        elif model_type == "Ollama":
+            api_url = "http://localhost:11434/api/generate"
+    
+    # Sanitize inputs
+    try:
+        max_tokens = int(max_tokens)
+    except (ValueError, TypeError):
+        logger.warning(f"Invalid max_tokens value: {max_tokens}, using default 1024")
+        max_tokens = 1024
+    
+    try:
+        temperature = float(temperature)
+    except (ValueError, TypeError):
+        logger.warning(f"Invalid temperature value: {temperature}, using default 0.0")
+        temperature = 0.0
+    
+    # Create and return the endpoint
     return ModelEndpoint(
         name=model_name,
         api_url=api_url,
         api_key=api_key,
         model_id=model_id,
-        max_tokens=int(max_tokens),
-        temperature=float(temperature)
+        max_tokens=max_tokens,
+        temperature=temperature
     )
 
 
@@ -611,6 +970,15 @@ def run_model_test(
     try:
         # Create output directory if it doesn't exist
         os.makedirs(output_dir, exist_ok=True)
+        
+        # Log current preprocessing settings
+        logger.info("CSV Preprocessing settings:")
+        logger.info(f"- Detect Delimiter: {DETECT_DELIMITER}")
+        logger.info(f"- Fix Unescaped Quotes: {FIX_QUOTES}")
+        logger.info(f"- Remove Control Chars: {REMOVE_CONTROL_CHARS}")
+        logger.info(f"- Normalize Newlines: {NORMALIZE_NEWLINES}")
+        logger.info(f"- Skip Bad Lines: {SKIP_BAD_LINES}")
+        logger.info(f"- Show Sample: {SHOW_SAMPLE}")
         
         # Create model endpoints
         champion_endpoint = create_model_endpoint(
@@ -629,13 +997,48 @@ def run_model_test(
         )
         
         # Load test cases
-        progress(0.1, "Loading test cases from CSV")
-        test_cases = load_test_cases_from_csv_url(
-            csv_url, 
-            key_column, 
-            value_column, 
-            int(limit) if limit else None
-        )
+        progress(0.1, "Loading and preprocessing test cases from CSV")
+        try:
+            test_cases = load_test_cases_from_csv_url(
+                csv_url, 
+                key_column, 
+                value_column, 
+                int(limit) if limit and int(limit) > 0 else None
+            )
+        except Exception as e:
+            logger.error(f"Error loading CSV: {str(e)}")
+            return f"""
+## Error Loading CSV
+
+**Error Message:**
+```
+{str(e)}
+```
+
+**Troubleshooting Tips:**
+1. Verify the CSV URL is accessible and properly formatted
+2. Check that column names exist in the file
+3. Try enabling more preprocessing options
+4. Set a small limit to test with a subset of data first
+""", None, None
+        
+        # Log preprocessing settings being used
+        logger.info(f"Model Input Preprocessing: Enabled={PREPROCESS_ENABLED}, MaxLength={MAX_LENGTH}, " +
+                    f"RemoveSpecialChars={REMOVE_SPECIAL_CHARS}, NormalizeWhitespace={NORMALIZE_WHITESPACE}")
+        
+        # Preview sample test cases after preprocessing
+        if test_cases and SHOW_SAMPLE:
+            preview_case = test_cases[0]
+            logger.info("----- Sample Test Case -----")
+            logger.info(f"ID: {preview_case.id}")
+            logger.info(f"Original Key: {preview_case.key[:200]}...")
+            logger.info(f"Original Value: {preview_case.value[:200]}...")
+            
+            processed_key = preprocess_text(preview_case.key)
+            processed_value = preprocess_text(preview_case.value)
+            logger.info(f"Processed Key: {processed_key[:200]}...")
+            logger.info(f"Processed Value: {processed_value[:200]}...")
+            logger.info("--------------------------")
         
         # Set up the model tester
         tester = ModelTester(
@@ -654,6 +1057,34 @@ def run_model_test(
         timestamp = time.strftime("%Y%m%d-%H%M%S")
         json_path = os.path.join(output_dir, f"results-{timestamp}.json")
         csv_path = os.path.join(output_dir, f"results-{timestamp}.csv")
+        
+        # Add processing settings to results metadata
+        results["metadata"] = {
+            "timestamp": timestamp,
+            "preprocessing": {
+                "enabled": PREPROCESS_ENABLED,
+                "max_length": MAX_LENGTH,
+                "remove_special_chars": REMOVE_SPECIAL_CHARS,
+                "normalize_whitespace": NORMALIZE_WHITESPACE,
+                "csv_preprocessing": {
+                    "detect_delimiter": DETECT_DELIMITER,
+                    "fix_quotes": FIX_QUOTES,
+                    "remove_control_chars": REMOVE_CONTROL_CHARS,
+                    "normalize_newlines": NORMALIZE_NEWLINES,
+                    "skip_bad_lines": SKIP_BAD_LINES,
+                }
+            },
+            "csv_source": {
+                "url": csv_url,
+                "key_column": key_column,
+                "value_column": value_column,
+                "limit": limit
+            },
+            "test_cases": [
+                {"id": case.id, "key": case.key, "value": case.value}
+                for case in test_cases
+            ]
+        }
         
         save_results_to_json(results, json_path)
         save_results_to_csv(results, csv_path)
@@ -685,6 +1116,10 @@ def run_model_test(
 - Challenger Avg Latency: {summary['challenger_metrics']['avg_latency']:.2f}s
 - Judge Avg Latency: {summary['judge_metrics']['avg_latency']:.2f}s
 
+**Preprocessing Settings:**
+- Model Inputs: Enabled={PREPROCESS_ENABLED}, MaxLength={MAX_LENGTH}
+- CSV: DetectDelimiter={DETECT_DELIMITER}, FixQuotes={FIX_QUOTES}, SkipBadLines={SKIP_BAD_LINES}
+
 **Files Saved:**
 - JSON: {json_path}
 - CSV: {csv_path}
@@ -694,7 +1129,22 @@ def run_model_test(
     
     except Exception as e:
         logger.exception("Error running model test")
-        return f"Error: {str(e)}", None, None
+        error_message = f"""
+## Error Running Test
+
+**Error Message:**
+```
+{str(e)}
+```
+
+**Troubleshooting Tips:**
+1. Check that the CSV URL is accessible and properly formatted
+2. Verify that the column names are correct
+3. Ensure API keys and endpoints are valid
+4. Try adjusting CSV preprocessing options to handle special characters, quotes, and delimiters
+5. Set a small limit (e.g., 5) to test with a subset of data first
+"""
+        return error_message, None, None
 
 
 # Default templates
@@ -737,7 +1187,7 @@ Then on a new line, add:
 After these two required lines, explain your reasoning briefly.
 """
 
-# Gradio interface
+# Create Gradio interface
 def create_gradio_interface():
     """Create a Gradio interface for the model tester."""
     # CSS for better layout
@@ -752,6 +1202,107 @@ def create_gradio_interface():
         gr.Markdown("Compare two models against a reference value using a judge model")
         
         with gr.Tab("Test Configuration"):
+            with gr.Group(elem_classes="model-group"):
+                gr.Markdown("### Data Source & Test Settings")
+                with gr.Row():
+                    csv_url = gr.Textbox(
+                        label="CSV URL", 
+                        value="https://example.com/data.csv", 
+                        info="URL to CSV file with test cases"
+                    )
+                
+                with gr.Row():
+                    key_column = gr.Textbox(
+                        label="Key Column", 
+                        value="text", 
+                        info="Column name for input data (queries)"
+                    )
+                    value_column = gr.Textbox(
+                        label="Value Column", 
+                        value="label", 
+                        info="Column name for reference/ground truth"
+                    )
+                    limit = gr.Number(
+                        label="Limit", 
+                        value=10, 
+                        info="Maximum number of test cases to use (0 for all)"
+                    )
+                
+                with gr.Group():
+                    gr.Markdown("#### Preprocessing Options")
+                    with gr.Row():
+                        preprocess_inputs = gr.Checkbox(
+                            label="Preprocess Inputs", 
+                            value=True,
+                            info="Clean and format inputs before sending to models"
+                        )
+                        max_length = gr.Slider(
+                            label="Max Input Length", 
+                            minimum=1000, 
+                            maximum=50000, 
+                            value=8000, 
+                            step=1000,
+                            info="Maximum length of inputs before truncation"
+                        )
+                    
+                    with gr.Row():
+                        remove_special_chars = gr.Checkbox(
+                            label="Remove Special Characters", 
+                            value=True,
+                            info="Remove control characters and HTML/XML tags"
+                        )
+                        normalize_whitespace = gr.Checkbox(
+                            label="Normalize Whitespace", 
+                            value=True,
+                            info="Standardize spaces, tabs, and newlines"
+                        )
+                
+                # Add CSV Preprocessing options
+                with gr.Group():
+                    gr.Markdown("#### CSV Preprocessing Options")
+                    with gr.Row():
+                        detect_delimiter = gr.Checkbox(
+                            label="Auto-detect Delimiter", 
+                            value=True,
+                            info="Try to detect the most likely delimiter (comma, tab, semicolon, etc.)"
+                        )
+                        fix_quotes = gr.Checkbox(
+                            label="Fix Unescaped Quotes", 
+                            value=True,
+                            info="Attempt to fix unescaped quotes within text fields that might break parsing"
+                        )
+                    
+                    with gr.Row():
+                        remove_control_chars = gr.Checkbox(
+                            label="Remove Control Characters", 
+                            value=True,
+                            info="Remove special control characters that can break CSV parsing"
+                        )
+                        normalize_newlines = gr.Checkbox(
+                            label="Normalize Newlines in Fields", 
+                            value=True,
+                            info="Convert newlines within fields to escaped newlines (\\n)"
+                        )
+                    
+                    with gr.Row():
+                        skip_bad_lines = gr.Checkbox(
+                            label="Skip Bad Lines", 
+                            value=True,
+                            info="Skip lines that can't be parsed correctly instead of failing"
+                        )
+                        show_sample = gr.Checkbox(
+                            label="Show Sample After Preprocessing", 
+                            value=True,
+                            info="Display a sample of the preprocessed data in the results"
+                        )
+                
+                with gr.Row():
+                    output_dir = gr.Textbox(
+                        label="Output Directory", 
+                        value="./results", 
+                        info="Directory to save results"
+                    )
+            
             with gr.Group(elem_classes="model-group"):
                 gr.Markdown("### Champion Model (A)")
                 with gr.Row():
@@ -849,39 +1400,6 @@ def create_gradio_interface():
                     )
             
             with gr.Group(elem_classes="model-group"):
-                gr.Markdown("### Data Source & Test Settings")
-                with gr.Row():
-                    csv_url = gr.Textbox(
-                        label="CSV URL", 
-                        value="https://example.com/data.csv", 
-                        info="URL to CSV file with test cases"
-                    )
-                
-                with gr.Row():
-                    key_column = gr.Textbox(
-                        label="Key Column", 
-                        value="text", 
-                        info="Column name for input data (queries)"
-                    )
-                    value_column = gr.Textbox(
-                        label="Value Column", 
-                        value="label", 
-                        info="Column name for reference/ground truth"
-                    )
-                    limit = gr.Number(
-                        label="Limit", 
-                        value=10, 
-                        info="Maximum number of test cases to use (0 for all)"
-                    )
-                
-                with gr.Row():
-                    output_dir = gr.Textbox(
-                        label="Output Directory", 
-                        value="./results", 
-                        info="Directory to save results"
-                    )
-            
-            with gr.Group(elem_classes="model-group"):
                 gr.Markdown("### Prompt Templates")
                 with gr.Tabs():
                     with gr.TabItem("Model Prompt"):
@@ -911,13 +1429,50 @@ def create_gradio_interface():
                     csv_file = gr.File(label="CSV Results", interactive=False)
         
         # Define the function to run when the button is clicked
+        def run_test_with_preprocessing(
+            champion_type, champion_name, champion_api_url, champion_api_key, champion_model_id, champion_max_tokens, champion_temperature,
+            challenger_type, challenger_name, challenger_api_url, challenger_api_key, challenger_model_id, challenger_max_tokens, challenger_temperature,
+            judge_type, judge_name, judge_api_url, judge_api_key, judge_model_id, judge_max_tokens, judge_temperature,
+            csv_url, key_column, value_column, limit, output_dir, prompt_template, evaluation_template,
+            preprocess_inputs, max_length, remove_special_chars, normalize_whitespace,
+            detect_delimiter, fix_quotes, remove_control_chars, normalize_newlines, skip_bad_lines, show_sample,
+            progress=gr.Progress()
+        ):
+            # Set preprocessing globals based on user selections
+            global PREPROCESS_ENABLED, MAX_LENGTH, REMOVE_SPECIAL_CHARS, NORMALIZE_WHITESPACE
+            global DETECT_DELIMITER, FIX_QUOTES, REMOVE_CONTROL_CHARS, NORMALIZE_NEWLINES, SKIP_BAD_LINES, SHOW_SAMPLE
+            
+            PREPROCESS_ENABLED = preprocess_inputs
+            MAX_LENGTH = max_length
+            REMOVE_SPECIAL_CHARS = remove_special_chars
+            NORMALIZE_WHITESPACE = normalize_whitespace
+            
+            # Set CSV preprocessing globals
+            DETECT_DELIMITER = detect_delimiter
+            FIX_QUOTES = fix_quotes
+            REMOVE_CONTROL_CHARS = remove_control_chars
+            NORMALIZE_NEWLINES = normalize_newlines
+            SKIP_BAD_LINES = skip_bad_lines
+            SHOW_SAMPLE = show_sample
+            
+            return run_model_test(
+                champion_type, champion_name, champion_api_url, champion_api_key, champion_model_id, champion_max_tokens, champion_temperature,
+                challenger_type, challenger_name, challenger_api_url, challenger_api_key, challenger_model_id, challenger_max_tokens, challenger_temperature,
+                judge_type, judge_name, judge_api_url, judge_api_key, judge_model_id, judge_max_tokens, judge_temperature,
+                csv_url, key_column, value_column, limit, output_dir, prompt_template, evaluation_template,
+                progress
+            )
+        
+        # Connect function to run button
         run_button.click(
-            fn=run_model_test,
+            fn=run_test_with_preprocessing,
             inputs=[
                 champion_type, champion_name, champion_api_url, champion_api_key, champion_model_id, champion_max_tokens, champion_temperature,
                 challenger_type, challenger_name, challenger_api_url, challenger_api_key, challenger_model_id, challenger_max_tokens, challenger_temperature,
                 judge_type, judge_name, judge_api_url, judge_api_key, judge_model_id, judge_max_tokens, judge_temperature,
-                csv_url, key_column, value_column, limit, output_dir, prompt_template, evaluation_template
+                csv_url, key_column, value_column, limit, output_dir, prompt_template, evaluation_template,
+                preprocess_inputs, max_length, remove_special_chars, normalize_whitespace,
+                detect_delimiter, fix_quotes, remove_control_chars, normalize_newlines, skip_bad_lines, show_sample
             ],
             outputs=[results_markdown, json_file, csv_file]
         )
@@ -947,5 +1502,12 @@ def create_gradio_interface():
 
 # Run the Gradio app
 if __name__ == "__main__":
-    app = create_gradio_interface()
-    app.launch()
+    try:
+        print("Starting Model A/B Testing Tool...")
+        app = create_gradio_interface()
+        print("Launching Gradio interface at http://127.0.0.1:7860")
+        print("If your browser doesn't open automatically, please visit that URL manually.")
+        app.launch(inbrowser=True)  # Try to force browser to open
+    except Exception as e:
+        print(f"Error launching Gradio interface: {str(e)}")
+        print("Check that gradio is installed: pip install gradio")
