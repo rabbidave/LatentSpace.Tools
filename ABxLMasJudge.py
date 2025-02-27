@@ -176,12 +176,22 @@ class ModelRunner:
                     response = self._call_openai_api(prompt)
                 elif "anthropic" in api_url_lower:
                     response = self._call_anthropic_api(prompt)
-                elif "ollama" in api_url_lower or ":11434" in api_url_lower:
+                elif "ollama" in api_url_lower and "/api/generate" in api_url_lower:
                     response = self._call_ollama_api(prompt)
+                elif "lmstudio.ai" in api_url_lower or ":1234" in api_url_lower or ":5000" in api_url_lower:
+                    response = self._call_lmstudio_api(prompt)
                 elif "generativelanguage.googleapis.com" in api_url_lower:
                     response = self._call_gemini_api(prompt)
+                elif "openrouter.ai" in api_url_lower:
+                    response = self._call_openrouter_api(prompt)
                 else:
-                    response = self._call_generic_api(prompt)
+                    # Try to determine what type of API the URL might be
+                    if "/v1/chat/completions" in api_url_lower:
+                        response = self._call_openai_api(prompt)
+                    elif "/v1/messages" in api_url_lower:
+                        response = self._call_anthropic_api(prompt)
+                    else:
+                        response = self._call_generic_api(prompt)
             except AttributeError as ae:
                 logger.error(f"AttributeError when trying to call API method: {str(ae)}")
                 # Try the generic API as fallback
@@ -205,128 +215,109 @@ class ModelRunner:
             # Re-raise to trigger retry
             raise
     
-    def _call_openai_api(self, prompt: str) -> str:
-        """Call OpenAI API."""
-        headers = {
-            "Authorization": f"Bearer {self.endpoint.api_key}",
-            "Content-Type": "application/json",
-        }
+    def _call_lmstudio_api(self, prompt: str) -> str:
+        """Call LM Studio API (which uses OpenAI-compatible format)."""
+        logger.info(f"Calling LM Studio API at: {self.endpoint.api_url}")
         
-        data = {
-            "model": self.endpoint.model_id,
-            "messages": [{"role": "user", "content": prompt}],
-            "max_tokens": self.endpoint.max_tokens,
-            "temperature": self.endpoint.temperature,
-        }
-        
-        response = requests.post(
-            self.endpoint.api_url, 
-            headers=headers, 
-            json=data
-        )
-        response.raise_for_status()
-        
-        result = response.json()
-        return result["choices"][0]["message"]["content"]
-    
-    def _call_anthropic_api(self, prompt: str) -> str:
-        """Call Anthropic API."""
-        headers = {
-            "x-api-key": self.endpoint.api_key,
-            "Content-Type": "application/json",
-            "anthropic-version": "2023-06-01"  # Added required version header
-        }
-        
-        data = {
-            "model": self.endpoint.model_id,
-            "messages": [{"role": "user", "content": prompt}],
-            "max_tokens": self.endpoint.max_tokens,
-            "temperature": self.endpoint.temperature,
-        }
-        
-        response = requests.post(
-            self.endpoint.api_url, 
-            headers=headers, 
-            json=data
-        )
-        response.raise_for_status()
-        
-        result = response.json()
-        return result["content"][0]["text"]
-    
-    def _call_ollama_api(self, prompt: str) -> str:
-        """Call Ollama API."""
-        data = {
-            "model": self.endpoint.model_id,
-            "prompt": prompt,
-            "stream": False,
-            "options": {
-                "temperature": self.endpoint.temperature,
-                "num_predict": self.endpoint.max_tokens
-            }
-        }
-        
-        response = requests.post(
-            self.endpoint.api_url, 
-            json=data
-        )
-        response.raise_for_status()
-        
-        result = response.json()
-        return result.get("response", "")
-    
-    def _call_gemini_api(self, prompt: str) -> str:
-        """Call Gemini API."""
+        # LM Studio uses OpenAI-compatible format
         headers = {
             "Content-Type": "application/json"
         }
         
-        if self.endpoint.api_key:
-            url = f"{self.endpoint.api_url}?key={self.endpoint.api_key}"
-        else:
-            url = self.endpoint.api_url
+        # Add API key if provided (not usually needed for local LM Studio)
+        if self.endpoint.api_key and self.endpoint.api_key.strip():
+            headers["Authorization"] = f"Bearer {self.endpoint.api_key}"
         
+        # Format the request based on endpoint path
+        api_path = self.endpoint.api_url.split("/")[-1] if "/" in self.endpoint.api_url else ""
+        
+        # Default to chat completions format
         data = {
-            "contents": [{"parts": [{"text": prompt}]}],
-            "generationConfig": {
-                "maxOutputTokens": self.endpoint.max_tokens,
-                "temperature": self.endpoint.temperature
-            }
+            "model": self.endpoint.model_id,
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": self.endpoint.max_tokens,
+            "temperature": self.endpoint.temperature,
         }
         
-        response = requests.post(url, headers=headers, json=data)
-        response.raise_for_status()
-        
-        result = response.json()
-        return result["candidates"][0]["content"]["parts"][0]["text"]
-    
-    def _call_generic_api(self, prompt: str) -> str:
-        """Call a generic API endpoint."""
-        try:
-            headers = {
-                "Authorization": f"Bearer {self.endpoint.api_key}",
-                "Content-Type": "application/json",
-            }
-            
+        # Adjust for completions endpoint if needed
+        if api_path == "completions":
             data = {
-                "prompt": prompt,
                 "model": self.endpoint.model_id,
+                "prompt": prompt,
                 "max_tokens": self.endpoint.max_tokens,
                 "temperature": self.endpoint.temperature,
             }
-            
+        
+        try:
             response = requests.post(
                 self.endpoint.api_url, 
                 headers=headers, 
-                json=data
+                json=data,
+                timeout=120  # Longer timeout for local models
             )
+            
+            # Log response status for debugging
+            logger.info(f"LM Studio API response status: {response.status_code}")
+            if response.status_code != 200:
+                logger.error(f"LM Studio API error: {response.text}")
+            
             response.raise_for_status()
             
             result = response.json()
-            return result.get("output", str(result))
-        except Exception as e:
-            logger.error(f"Error in generic API call: {str(e)}")
-            return f"API Error: {str(e)}"
+            
+            # Extract content based on endpoint type
+            if "chat" in api_path or "messages" in data:
+                return result["choices"][0]["message"]["content"]
+            else:
+                return result["choices"][0]["text"]
+                
+        except requests.exceptions.RequestException as e:
+            logger.error(f"LM Studio request failed: {str(e)}")
+            if hasattr(e, 'response') and e.response is not None:
+                logger.error(f"Response content: {e.response.text}")
+            raise
+        except (KeyError, IndexError) as e:
+            logger.error(f"Failed to parse LM Studio response: {str(e)}")
+            raise
+    
+    def _call_openrouter_api(self, prompt: str) -> str:
+        """Call OpenRouter API."""
+        headers = {
+            "Authorization": f"Bearer {self.endpoint.api_key}",
+            "Content-Type": "application/json",
+            "HTTP-Referer": "https://model-ab-testing-tool",  # OpenRouter requires this
+            "X-Title": "Model A/B Testing Tool"  # Optional but helpful for tracking
+        }
+        
+        # OpenRouter uses the OpenAI-compatible format
+        data = {
+            "model": self.endpoint.model_id,
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": self.endpoint.max_tokens,
+            "temperature": self.endpoint.temperature,
+        }
+        
+        try:
+            response = requests.post(
+                self.endpoint.api_url, 
+                headers=headers, 
+                json=data,
+                timeout=60  # Longer timeout for potentially slow models
+            )
+            
+            response.raise_for_status()
+            
+            result = response.json()
+            # Extract content based on OpenRouter's response format (which follows OpenAI format)
+            return result["choices"][0]["message"]["content"]
+        except requests.exceptions.RequestException as e:
+            logger.error(f"OpenRouter request failed: {str(e)}")
+            if hasattr(e, 'response') and e.response is not None:
+                logger.error(f"Response content: {e.response.text}")
+            raise
+        except (KeyError, IndexError) as e:
+            logger.error(f"Failed to parse OpenRouter response: {str(e)}")
+            raise
 
 
 class LMJudge:
@@ -1020,6 +1011,10 @@ def create_model_endpoint(model_type, model_name, api_url, api_key, model_id, ma
             api_url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateContent"
         elif model_type == "Ollama":
             api_url = "http://localhost:11434/api/generate"
+        elif model_type == "LM Studio":
+            api_url = "http://localhost:1234/v1/chat/completions"
+        elif model_type == "OpenRouter":
+            api_url = "https://openrouter.ai/api/v1/chat/completions"
     
     # Sanitize inputs
     try:
@@ -1393,7 +1388,7 @@ def create_gradio_interface():
                 gr.Markdown("### Champion Model (A)")
                 with gr.Row():
                     champion_type = gr.Dropdown(
-                        choices=["OpenAI", "Anthropic", "Gemini", "Ollama", "Generic"], 
+                        choices=["OpenAI", "Anthropic", "Gemini", "Ollama", "LM Studio", "OpenRouter", "Generic"], 
                         value="OpenAI", 
                         label="Provider"
                     )
@@ -1425,7 +1420,7 @@ def create_gradio_interface():
                 gr.Markdown("### Challenger Model (B)")
                 with gr.Row():
                     challenger_type = gr.Dropdown(
-                        choices=["OpenAI", "Anthropic", "Gemini", "Ollama", "Generic"], 
+                        choices=["OpenAI", "Anthropic", "Gemini", "Ollama", "LM Studio", "OpenRouter", "Generic"], 
                         value="Anthropic", 
                         label="Provider"
                     )
@@ -1457,8 +1452,8 @@ def create_gradio_interface():
                 gr.Markdown("### Judge Model (C)")
                 with gr.Row():
                     judge_type = gr.Dropdown(
-                        choices=["OpenAI", "Anthropic", "Gemini", "Ollama", "Generic"], 
-                        value="OpenAI", 
+                        choices=["OpenAI", "Anthropic", "Gemini", "Ollama", "LM Studio", "OpenRouter", "Generic"], 
+                        value="Gemini", 
                         label="Provider"
                     )
                     judge_name = gr.Textbox(label="Model Name", value="Judge-GPT-4")
@@ -1564,16 +1559,25 @@ def create_gradio_interface():
         )
         
         # Add example data
+
         gr.Examples(
             examples=[
                 ["OpenAI", "GPT-3.5", "https://api.openai.com/v1/chat/completions", "YOUR_KEY", "gpt-3.5-turbo", 1024, 0.0,
-                 "Anthropic", "Claude-Haiku", "https://api.anthropic.com/v1/messages", "YOUR_KEY", "claude-3-haiku-20240307", 1024, 0.0,
-                 "OpenAI", "GPT-4", "https://api.openai.com/v1/chat/completions", "YOUR_KEY", "gpt-4", 2048, 0.0,
-                 "https://example.com/data.csv", "text", "label", 10, "./results"],
+                "Anthropic", "Claude-Haiku", "https://api.anthropic.com/v1/messages", "YOUR_KEY", "claude-3-haiku-20240307", 1024, 0.0,
+                "OpenAI", "GPT-4", "https://api.openai.com/v1/chat/completions", "YOUR_KEY", "gpt-4", 2048, 0.0,
+                "https://example.com/data.csv", "text", "label", 10, "./results"],
+                ["LM Studio", "Local Model", "http://localhost:1234/v1/chat/completions", "", "local-model", 1024, 0.7,
+                "OpenRouter", "Claude-3", "https://openrouter.ai/api/v1/chat/completions", "YOUR_KEY", "anthropic/claude-3-opus", 1024, 0.0,
+                "LM Studio", "Local Judge", "http://localhost:1234/v1/chat/completions", "", "local-model", 2048, 0.0,
+                "https://example.com/data.csv", "text", "label", 5, "./results"],
+                ["OpenRouter", "Mixtral", "https://openrouter.ai/api/v1/chat/completions", "YOUR_KEY", "mistralai/mixtral-8x7b-instruct", 1024, 0.0,
+                "OpenRouter", "Claude-3", "https://openrouter.ai/api/v1/chat/completions", "YOUR_KEY", "anthropic/claude-3-opus", 1024, 0.0,
+                "OpenRouter", "Llama3", "https://openrouter.ai/api/v1/chat/completions", "YOUR_KEY", "meta-llama/llama-3-70b-instruct", 2048, 0.0,
+                "https://example.com/data.csv", "text", "label", 5, "./results"],
                 ["Ollama", "Llama3-8B", "http://localhost:11434/api/generate", "", "llama3:8b", 1024, 0.0,
-                 "Gemini", "Gemini-Pro", "https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateContent", "YOUR_KEY", "gemini-pro", 1024, 0.0,
-                 "Anthropic", "Claude-Opus", "https://api.anthropic.com/v1/messages", "YOUR_KEY", "claude-3-opus-20240229", 2048, 0.0,
-                 "https://example.com/data.csv", "text", "label", 5, "./results"]
+                "Gemini", "Gemini-Pro", "https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateContent", "YOUR_KEY", "gemini-pro", 1024, 0.0,
+                "Anthropic", "Claude-Opus", "https://api.anthropic.com/v1/messages", "YOUR_KEY", "claude-3-opus-20240229", 2048, 0.0,
+                "https://example.com/data.csv", "text", "label", 5, "./results"]
             ],
             inputs=[
                 champion_type, champion_name, champion_api_url, champion_api_key, champion_model_id, champion_max_tokens, champion_temperature,
@@ -1593,7 +1597,7 @@ if __name__ == "__main__":
         app = create_gradio_interface()
         print("Launching Gradio interface at http://127.0.0.1:7860")
         print("If your browser doesn't open automatically, please visit that URL manually.")
-        app.launch(inbrowser=True)  # Try to force browser to open
+        app.launch(inbrowser=True, share=True)  # Try to force browser to open
     except Exception as e:
         print(f"Error launching Gradio interface: {str(e)}")
         print("Check that gradio is installed: pip install gradio")
