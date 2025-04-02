@@ -1,6 +1,6 @@
 # AI Security Architecture
 
-##AI Passports
+## AI Passports
 
 AI security is fundamentally about observability with context. We track inputs, outputs, and model behavior patterns, then compare against established baselines to detect anomalies; logged to a per-integration API with per-deploy specifics and end-to-end configuration details (Yay! SR11-7v2!! Go Governance!!).
 
