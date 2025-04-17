@@ -1,0 +1,154 @@
+# Entangled MCP Architecture
+
+A secure integration pattern for connecting AI assistants with sensitive operations through ephemeral, isolated authentication contexts.
+
+## Core Concepts
+
+### 1. Entangled Components
+
+This architecture consists of two primary components that work in tandem:
+
+- **Local MCP Server**: Deployed on the user's device or local environment
+- **Remote MCP Service**: Dormant/hibernated service that awakens on demand
+
+These components are "entangled" in that they maintain a secure relationship while operating independently, with different security contexts.
+
+### 2. Just-in-Time Resource Allocation
+
+Resources are allocated only when needed:
+
+- Remote services remain dormant (hibernated) when not in use
+- New instances can be spawned for each operation, providing isolation
+- Compute resources scale to zero when inactive, reducing costs
+
+### 3. Transaction-Bound Ephemeral Auth
+
+Each interaction receives its own authentication context bound to specific transactions:
+
+- Fresh OAuth tokens generated with unique UUIDs tied to specific operations (e.g., invoice #AB12345)
+- Tokens limited in scope to exactly one business transaction identifier
+- Cryptographically bound to transaction metadata with short expiration periods
+- Tokens destroyed immediately after operation completion with verification receipts
+
+## Architecture Diagram
+
+```
+┌─────────────────┐                   ┌─────────────────────────┐
+│                 │                   │                         │
+│   AI Assistant  │                   │ User Identity Provider  │
+│   (MCP Client)  │                   │                         │
+│                 │                   └───────────┬─────────────┘
+└────────┬────────┘                               │
+         │                                        │
+         ▼                                        │
+┌─────────────────┐                               │
+│                 │                               │
+│   Local MCP     │◄──────Authentication──────────┘
+│   Server        │
+│                 │                   ┌─────────────────────────┐
+└────────┬────────┘                   │                         │
+         │                            │    Secure VPC/Cloud     │
+         │                            │    Environment          │
+         │                            │                         │
+         │                            │  ┌───────────────────┐  │
+         │                            │  │                   │  │
+         └────────Wake Request────────┼─►│  Hibernated MCP   │  │
+                                      │  │  Service Instance │  │
+                                      │  │                   │  │
+                                      │  └─────────┬─────────┘  │
+                                      │            │            │
+                                      │            ▼            │
+                                      │  ┌───────────────────┐  │
+                                      │  │                   │  │
+                                      │  │ Sensitive Service │  │
+                                      │  │ APIs with keys    │  │
+                                      │  │                   │  │
+                                      │  └───────────────────┘  │
+                                      │                         │
+                                      └─────────────────────────┘
+```
+
+## Operational Flow
+
+1. **Initialization**:
+   - User activates the local MCP server
+   - The local server authenticates the user through standard OAuth flows
+   - Local server establishes a secure connection to the remote environment
+
+2. **Transaction Binding**:
+   - AI assistant initiates a transaction with specific business identifier (e.g., Invoice #AB12345)
+   - System generates a UUID for the operation that's cryptographically tied to the transaction ID
+   - Local MCP server validates the request against authorization policies
+
+3. **Remote Activation**:
+   - Local server sends a "wake" signal to the dormant remote service with the transaction UUID
+   - Remote service either awakens from hibernation or a new instance is deployed
+   - Transaction-specific ephemeral tokens are generated with the UUID embedded
+
+4. **Operation Execution**:
+   - Remote service executes the sensitive operation using invoice-bound credentials
+   - Cryptographic receipts generated at each step of the operation
+   - Results are returned through the secure channel with verification proofs
+   - Local server validates the receipt chain before presenting results
+
+5. **Cleanup**:
+   - Transaction-specific tokens are invalidated with cryptographic verification
+   - Operation receipt and audit logs are persisted with the transaction UUID
+   - Remote service returns to hibernation (or instance is terminated)
+   - Secure connection is closed
+
+## Security Benefits
+
+### Zero Standing Privileges
+
+- No long-lived access tokens
+- Credentials only active during specific operations
+- Principle of least privilege strictly enforced
+
+### Isolated Contexts
+
+- Each operation exists in its own security context
+- Compromise of one session doesn't affect others
+- Clear security boundaries between components
+
+### Reduced Attack Surface
+
+- Sensitive components only exposed when needed
+- Minimal network exposure of critical services
+- Defense-in-depth through layered architecture
+
+### Enhanced Audit Trail
+
+- Distinct sessions for each operation
+- Clear tracking of when services are activated
+- Detailed logs of each ephemeral authentication
+
+## Implementation Considerations
+
+### Hibernation Management
+
+- Optimal hibernation policies based on usage patterns
+- Cold start latency mitigation strategies
+- State preservation during hibernation periods
+
+### Transaction-Bound Token Lifecycle
+
+- Tokens cryptographically bound to specific invoice/transaction UUIDs
+- Token scope limited to exactly one business operation (e.g., "process payment for invoice #AB12345")
+- Automated token revocation with cryptographic proof of completion
+- Non-transferable between operations, even for the same user/session
+- Dual invalidation channels to ensure tokens cannot persist
+
+
+
+## Advantages Over Traditional Integrations
+
+1. **Superior Security Isolation**: Complete separation of concerns between user-facing components and sensitive operations
+
+2. **Cost Efficiency**: Resources only consumed during active operations
+
+3. **Compliance Advantages**: Clear demonstration of security controls for auditors
+
+4. **Flexible Provider Integration**: Works with any service supporting OAuth-based authentication
+
+5. **Minimal Persistent Attack Surface**: Critical components only exposed when actively in use
