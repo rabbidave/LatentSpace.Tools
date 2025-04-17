@@ -87,15 +87,34 @@ Each interaction receives its own authentication context bound to specific trans
 
 4. **Operation Execution**:
    - Remote service executes the sensitive operation using invoice-bound credentials
-   - Cryptographic receipts generated at each step of the operation
-   - Results are returned through the secure channel with verification proofs
-   - Local server validates the receipt chain before presenting results
+   - Each step in the transaction generates cryptographic proofs (see Cryptographic Receipts section)
+   - Results and complete proof chain are returned through secure channel
+   - Local server validates the cryptographic receipts before presenting results
 
 5. **Cleanup**:
    - Transaction-specific tokens are invalidated with cryptographic verification
    - Operation receipt and audit logs are persisted with the transaction UUID
    - Remote service returns to hibernation (or instance is terminated)
    - Secure connection is closed
+
+## Cryptographic Receipts and Proofs
+
+The architecture employs several cryptographic techniques to create verifiable, tamper-proof evidence of transactions:
+
+### Non-Repudiation Implementation
+
+- **Digital Signatures**: Transaction-specific digital signatures using the recipient's public key are created for each operation, providing proof of both origin and integrity of data
+- **Cryptographic Hash Chains**: Each step of the transaction creates a hash that includes the previous step's hash, forming an unbreakable chain of evidence
+- **Timestamped Merkle Proofs**: Transaction details are inserted into Merkle trees with trusted timestamps to prove exactly when each action occurred
+- **Transaction Binding**: All proofs are cryptographically bound to the specific invoice/transaction UUID using collision-resistant hashing
+
+### Guarantees Provided
+
+- **Origin Authentication**: Cryptographic proof of which entity initiated the transaction
+- **Receipt Verification**: Proof that the recipient received the specific message or transaction
+- **Sequence Validation**: Cryptographic evidence of the exact order of operations
+- **Integrity Protection**: Tamper-evident seals that make any modification to the transaction data detectable
+- **Temporal Proof**: Cryptographically verifiable evidence of when each step occurred
 
 ## Security Benefits
 
@@ -125,6 +144,20 @@ Each interaction receives its own authentication context bound to specific trans
 
 ## Implementation Considerations
 
+### Sensitivity Policy Management
+
+- Clear definition and secure management of sensitivity tags assigned by the Local MCP
+- Differential cryptographic requirements based on sensitivity level (e.g., "confidential" or higher requiring specific public key signatures)
+- Pre-registration of users with appropriate key material based on access requirements
+- Cryptographic enforcement of sensitivity policies through the entanglement pattern
+
+### Conditional Logic Implementation
+
+- Remote and Local MCP components require logic to conditionally generate and validate proofs based on sensitivity tags
+- Transaction validation rules vary by data classification and operation type
+- Entanglement pattern distributes policy enforcement across components for resilience
+- Complexity management through clear separation of validation responsibilities
+
 ### Hibernation Management
 
 - Optimal hibernation policies based on usage patterns
@@ -138,8 +171,6 @@ Each interaction receives its own authentication context bound to specific trans
 - Automated token revocation with cryptographic proof of completion
 - Non-transferable between operations, even for the same user/session
 - Dual invalidation channels to ensure tokens cannot persist
-
-
 
 ## Advantages Over Traditional Integrations
 
