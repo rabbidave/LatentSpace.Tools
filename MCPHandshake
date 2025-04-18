@@ -26,7 +26,7 @@ Architecture Diagram
 │                 │                   │                         │
 │   AI Assistant  │                   │ User Identity Provider  │
 │  (MCP Client /  │                   │      (Session Auth)     │
-│ Local MCP Server) │                   │                         │
+│ Local MCP Srvr) │                   │                         │
 │                 │                   └───────────┬─────────────┘
 └───────┬─────────┘                               │ Session Token
         │                                         │ (e.g., JWT)
@@ -39,7 +39,7 @@ Architecture Diagram
         │                                  │  (Cloudflare    │
         │ 3. Execute Tool (Tool + Params)  │    Worker)      │
         ├─────────────────────────────────>│                 │
-        │   (Session Token +              │       +         │
+        │   (Session Token +               │       +         │
         │    Ephemeral Tx Token Header)    │   State Store   │
         │                                  │    (e.g., KV)   │
         │ 4. Result + Proof <--------------│                 │
