@@ -161,7 +161,7 @@ The architecture employs several cryptographic techniques to create verifiable, 
 
 ## Implementation Considerations
 
-### Sensitivity Policy Management
+### Metadata-Driven Policy Enforcement e.g. public vs confidential
 - Clear definition and secure management of sensitivity tags assigned by the Local MCP or inferred by the Remote Service based on the target tool.
 - Differential requirements for transaction authorization based on sensitivity (e.g., requiring MFA during session auth, stricter parameter validation).
 - Potential pre-registration of users/keys if digital signatures are incorporated into receipts.
@@ -198,3 +198,54 @@ Complexity managed through clear separation of concerns (session auth vs. transa
 - **Compliance Advantages**: Clear, auditable trail demonstrating explicit, parameter-bound authorization for every sensitive operation via the ephemeral token lifecycle.
 - **Flexible Provider Integration**: Works with standard identity providers (OAuth/JWT) for session management while layering transaction-specific controls.
 - **Minimal Persistent Attack Surface**: Reduces risk by eliminating standing privileges and ensuring execution tokens are single-use and time-limited to seconds.
+
+# Acknowledgements & Per-Integration Implementation Considerations
+
+The Handshake MCP architecture is designed to provide a high degree of security for sensitive operations, particularly when initiated via less trusted environments like AI assistants. It achieves this through core principles like Zero Standing Privileges and Transaction-Bound Ephemeral Authentication.
+
+Users and implementers should acknowledge the following design aspects and considerations:
+
+## 1. Security as a Deliberate Trade-off
+
+### Latency
+The multi-step handshake protocol (Session Auth → Authorize Transaction → Execute with Ephemeral Token) inherently introduces more network roundtrips compared to simpler, single-call API patterns. This potential increase in latency is a deliberate trade-off, accepted to gain the significant security benefits of ephemeral, transaction-specific authorization. For high-risk operations like payments, this added security often outweighs concerns over minor latency increases, aligning with patterns already common in robust financial systems.
+
+### Implementation Overhead
+Implementing the two-phase handshake, state management for ephemeral tokens (e.g., using KV stores), parameter hashing, and atomic token consumption introduces complexity beyond basic API token validation. This overhead is considered proportional to the risks being mitigated, especially in regulated environments or where the cost of compromise is high. The pattern necessitates careful engineering.
+
+## 2. Key Areas Requiring Careful Implementation
+
+### Robust Error Handling
+The architecture pattern defines the successful authorization path. Implementations must build comprehensive error handling for various failure scenarios:
+- Network errors during any phase
+- Failures in the underlying sensitive service (e.g., PayPal API errors after authorization)
+- Ephemeral token expiry before use
+- State store unavailability
+- Validation failures
+
+Compensation logic for failed transactions post-authorization is an application-level responsibility built upon the pattern's foundation.
+
+### Observability & Debuggability
+The ephemeral nature of the transaction tokens can make debugging challenging. Implementations must include comprehensive logging and distributed tracing capabilities. Every step of the handshake (session validation, authorization request, token generation, token validation/consumption, final execution attempt) should be logged with the unique transactionId as a core correlation identifier.
+
+### Key Management
+Secure management of signing keys (e.g., for session JWTs) and potentially keys for signing cryptographic receipts is crucial. While essential, this is a standard requirement for any cryptographically secured system and implementers must follow established best practices.
+
+## 3. Strengths & Alignment with Best Practices
+
+Despite the considerations above, the pattern offers significant advantages, particularly for sensitive domains:
+
+### Reduced Credential Persistence
+The ephemeral, single-use nature of the transaction token dramatically limits the persistence and exposure of sensitive execution credentials, strongly aligning with security standards like PCI-DSS.
+
+### Strong AuthN/AuthZ Separation
+It enforces a clear distinction between authenticating the user (session token) and authorizing a specific action (ephemeral token), a recognized security best practice.
+
+### Enhanced Audit & Non-Repudiation
+The detailed lifecycle tracking of the ephemeral token, tied to the transactionId and user identity, provides a powerful audit trail valuable for reconciliation, dispute resolution, and demonstrating compliance.
+
+---
+
+**In summary**: The Handshake MCP architecture provides a strong foundation for building highly secure integrations. Its security benefits are achieved through specific design choices that require diligent implementation, particularly around error handling, observability, and state management. Implementers should view these not as weaknesses, but as necessary engineering requirements to realize the full security potential of the pattern.
+
+
