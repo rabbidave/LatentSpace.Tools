@@ -84,12 +84,12 @@ Verification receipts confirm the token's lifecycle (issuance, consumption, or e
 ### Initialization:
 1. User activates the local MCP client/server.
 2. User authenticates to the Remote MCP Service via standard OAuth/JWT flows, obtaining a primary Session Token.
-3. Local client prepares for transaction-specific handshakes.
+3. Local client prepares for transaction-specific handshakes. (User may provide public key material during this phase for verification purposes).
 
 ### Transaction Binding & Authorization Request:
-1. AI assistant initiates a transaction (e.g., "Create invoice for X").
-2. Local client identifies the target tool (e.g., createPayPalInvoice) and parameters.
-3. Local client sends an Authorization Request call to a dedicated endpoint on the Remote MCP Service, passing the target tool, parameters, and the user's Session Token.
+1. AI assistant initiates a transaction (e.g., "Create invoice for X"), potentially including a sensitivity/data classification tag.
+2. Local client identifies the target tool (e.g., create[PayPal](https://developer.paypal.com/community/blog/paypal-model-context-protocol/)Invoice) and parameters, determining the required authentication flow based on tool metadata or sensitivity tag.
+3. If the two-phase handshake is required: Local client sends an Authorization Request call to a dedicated endpoint on the Remote MCP Service, passing the target tool, parameters, and the user's Session Token.
 4. Remote service validates the Session Token, generates a unique transactionId, hashes parameters, and checks user permissions for the requested operation.
 
 ### Ephemeral Token Grant (Handshake Phase 1 Complete):
@@ -98,7 +98,7 @@ Verification receipts confirm the token's lifecycle (issuance, consumption, or e
 3. Remote service returns the transactionId and the Ephemeral Transaction Token to the Local client.
 
 ### Operation Execution (Handshake Phase 2):
-1. Local client immediately constructs the actual operation request (e.g., call createPayPalInvoice tool).
+1. Local client immediately constructs the actual operation request (e.g., call create[PayPal](https://developer.paypal.com/community/blog/paypal-model-context-protocol/)Invoice tool).
 2. Local client sends the operation request to the Remote MCP Service, passing:
    - The user's Session Token (e.g., Authorization: Bearer ...).
    - The Ephemeral Transaction Token (e.g., X-Transaction-Authorization: ... header).
@@ -108,10 +108,10 @@ Verification receipts confirm the token's lifecycle (issuance, consumption, or e
 5. Crucially: The service atomically consumes the token (e.g., deletes the state entry) and validates its expiry, user, tool, and parameter hash against the current request.
 
 ### Sensitive Operation & Proof Generation:
-1. If ephemeral token validation succeeds, the Remote MCP Service executes the sensitive operation (e.g., calls PayPal API) using the validated transactionId for idempotency.
-2. Cryptographic proofs are generated, bound to the transactionId.
+1. If ephemeral token validation succeeds, the Remote MCP Service executes the sensitive operation (e.g., calls [PayPal](https://developer.paypal.com/community/blog/paypal-model-context-protocol/) API) using the validated transactionId for idempotency.
+2. Cryptographic proofs (receipts) are generated, bound to the transactionId. Proofs may be digitally signed by the Remote Service.
 3. Results and the complete proof chain are returned securely to the Local client.
-4. Local client validates the cryptographic receipts.
+4. Local client validates the cryptographic receipts (e.g., verifying signatures using pre-registered user public keys or service public keys).
 
 ### Handshake Termination:
 1. The Ephemeral Transaction Token is already invalidated/consumed (Step 4). Timed-out tokens expire naturally via TTL in the state store.
@@ -124,17 +124,17 @@ Verification receipts confirm the token's lifecycle (issuance, consumption, or e
 The architecture employs several cryptographic techniques to create verifiable, tamper-proof evidence of transactions:
 
 ### Non-Repudiation Implementation
-- **Digital Signatures**: Transaction-specific digital signatures using the recipient's public key are created for each operation, providing proof of both origin and integrity of data
-- **Cryptographic Hash Chains**: Each step of the transaction creates a hash that includes the previous step's hash, forming an unbreakable chain of evidence
-- **Timestamped Merkle Proofs**: Transaction details are inserted into Merkle trees with trusted timestamps to prove exactly when each action occurred
-- **Transaction Binding**: All proofs are cryptographically bound to the specific transaction UUID (transactionId) using collision-resistant hashing
+- **Digital Signatures**: Where required by sensitivity policy, transaction-specific digital signatures are created. Receipts signed by the Remote Service can be verified by the Local Client; requests signed by the Local Client (using user-provided keys) can be verified by the Remote Service, proving origin and integrity.
+- **Cryptographic Hash Chains**: Each logical step within the Remote Service's execution may create a hash including the previous step's hash, forming evidence of sequence.
+- **Timestamped Merkle Proofs**: Transaction details can optionally be inserted into Merkle trees with trusted timestamps to prove action timing.
+- **Transaction Binding**: All proofs are cryptographically bound to the specific transaction UUID (transactionId) using collision-resistant hashing.
 
 ### Guarantees Provided
-- **Origin Authentication**: Cryptographic proof of which entity initiated the transaction (via session token and transaction token binding).
-- **Receipt Verification**: Proof that the recipient received the specific message or transaction result.
-- **Sequence Validation**: Cryptographic evidence of the exact order of operations within the transaction context.
-- **Integrity Protection**: Tamper-evident seals that make any modification to the transaction data detectable.
-- **Temporal Proof**: Cryptographically verifiable evidence of when each step occurred.
+- **Origin Authentication**: Cryptographic proof of which user/client initiated the transaction (via session token and potentially client-side signatures). Proof of service execution via service-side signatures.
+- **Receipt Verification**: Proof that the recipient received the specific message or transaction result, verifiable via digital signatures if implemented.
+- **Sequence Validation**: Cryptographic evidence of the order of operations within the transaction context (via hash chains if implemented).
+- **Integrity Protection**: Tamper-evident seals (hashes, signatures) make modification to transaction data detectable.
+- **Temporal Proof**: Cryptographically verifiable evidence of when steps occurred (via signed timestamps or Merkle proofs).
 
 ## Security Benefits
 
@@ -161,20 +161,21 @@ The architecture employs several cryptographic techniques to create verifiable, 
 
 ## Implementation Considerations
 
-### Metadata-Driven Policy Enforcement e.g. public vs confidential
-- Clear definition and secure management of sensitivity tags assigned by the Local MCP or inferred by the Remote Service based on the target tool.
-- Differential requirements for transaction authorization based on sensitivity (e.g., requiring MFA during session auth, stricter parameter validation).
-- Potential pre-registration of users/keys if digital signatures are incorporated into receipts.
-- Cryptographic enforcement (parameter hashing, token consumption) forms part of the policy enforcement.
+### Metadata-Driven Policy Enforcement
+- Sensitivity tags or classifications (provided by the initiating agent or inherent to the tool) guide the required authentication flow and cryptographic rigor. Implementations must parse this metadata to determine if the two-phase handshake and/or specific signature requirements apply.
+- Differential requirements (e.g., stricter validation, mandatory signatures) enforced based on this sensitivity level.
+- User public keys may be pre-registered for workflows demanding client-side signatures or specific receipt verification capabilities.
+- Cryptographic enforcement (parameter hashing, token consumption, signature validation) is integral to policy implementation.
 
 ### Conditional Logic Implementation
 Remote MCP Service requires logic to:
 - Validate session tokens.
+- Determine required auth flow based on tool metadata/sensitivity.
 - Authorize requests based on user permissions and target tool.
-- Generate and store ephemeral token state.
-- Atomically validate and consume ephemeral tokens, including parameter hash checks.
+- Generate and store ephemeral token state (if required).
+- Atomically validate and consume ephemeral tokens, including parameter hash checks (if required).
 - Conditionally execute backend operations.
-- Generate appropriate cryptographic receipts.
+- Generate appropriate cryptographic receipts (potentially signed).
 
 Complexity managed through clear separation of concerns (session auth vs. transaction auth vs. execution).
 
@@ -184,7 +185,7 @@ Complexity managed through clear separation of concerns (session auth vs. transa
 - State (pending ephemeral tokens) preserved reliably in the external state store (e.g., KV).
 
 ### Transaction-Bound Token Lifecycle
-- A two-phase protocol (authorize->execute) manages the lifecycle.
+- A two-phase protocol (authorize->execute) manages the lifecycle when required by policy.
 - Ephemeral Transaction Tokens are typically nonces or opaque strings whose state is managed server-side (e.g., in KV).
 - State must include bindings to transactionId, userId, targetTool, paramsHash, and a short expiry.
 - Atomic Consumption (e.g., KV delete checked against prior existence) upon validation is the primary revocation mechanism, preventing replays. KV TTL handles expiry.
@@ -199,23 +200,23 @@ Complexity managed through clear separation of concerns (session auth vs. transa
 - **Flexible Provider Integration**: Works with standard identity providers (OAuth/JWT) for session management while layering transaction-specific controls.
 - **Minimal Persistent Attack Surface**: Reduces risk by eliminating standing privileges and ensuring execution tokens are single-use and time-limited to seconds.
 
-# Acknowledgements & Per-Integration Implementation Considerations
+## Acknowledgements & Implementation Considerations
 
 The Handshake MCP architecture is designed to provide a high degree of security for sensitive operations, particularly when initiated via less trusted environments like AI assistants. It achieves this through core principles like Zero Standing Privileges and Transaction-Bound Ephemeral Authentication.
 
 Users and implementers should acknowledge the following design aspects and considerations:
 
-## 1. Security as a Deliberate Trade-off
+### 1. Security as a Deliberate Trade-off
 
-### Latency
+#### Latency
 The multi-step handshake protocol (Session Auth → Authorize Transaction → Execute with Ephemeral Token) inherently introduces more network roundtrips compared to simpler, single-call API patterns. This potential increase in latency is a deliberate trade-off, accepted to gain the significant security benefits of ephemeral, transaction-specific authorization. For high-risk operations like payments, this added security often outweighs concerns over minor latency increases, aligning with patterns already common in robust financial systems.
 
-### Implementation Overhead
+#### Implementation Overhead
 Implementing the two-phase handshake, state management for ephemeral tokens (e.g., using KV stores), parameter hashing, and atomic token consumption introduces complexity beyond basic API token validation. This overhead is considered proportional to the risks being mitigated, especially in regulated environments or where the cost of compromise is high. The pattern necessitates careful engineering.
 
-## 2. Key Areas Requiring Careful Implementation
+### 2. Key Areas Requiring Careful Implementation
 
-### Robust Error Handling
+#### Robust Error Handling
 The architecture pattern defines the successful authorization path. Implementations must build comprehensive error handling for various failure scenarios:
 - Network errors during any phase
 - Failures in the underlying sensitive service (e.g., PayPal API errors after authorization)
@@ -225,27 +226,25 @@ The architecture pattern defines the successful authorization path. Implementati
 
 Compensation logic for failed transactions post-authorization is an application-level responsibility built upon the pattern's foundation.
 
-### Observability & Debuggability
+#### Observability & Debuggability
 The ephemeral nature of the transaction tokens can make debugging challenging. Implementations must include comprehensive logging and distributed tracing capabilities. Every step of the handshake (session validation, authorization request, token generation, token validation/consumption, final execution attempt) should be logged with the unique transactionId as a core correlation identifier.
 
-### Key Management
+#### Key Management
 Secure management of signing keys (e.g., for session JWTs) and potentially keys for signing cryptographic receipts is crucial. While essential, this is a standard requirement for any cryptographically secured system and implementers must follow established best practices.
 
-## 3. Strengths & Alignment with Best Practices
+### 3. Strengths & Alignment with Best Practices
 
 Despite the considerations above, the pattern offers significant advantages, particularly for sensitive domains:
 
-### Reduced Credential Persistence
+#### Reduced Credential Persistence
 The ephemeral, single-use nature of the transaction token dramatically limits the persistence and exposure of sensitive execution credentials, strongly aligning with security standards like PCI-DSS.
 
-### Strong AuthN/AuthZ Separation
+#### Strong AuthN/AuthZ Separation
 It enforces a clear distinction between authenticating the user (session token) and authorizing a specific action (ephemeral token), a recognized security best practice.
 
-### Enhanced Audit & Non-Repudiation
+#### Enhanced Audit & Non-Repudiation
 The detailed lifecycle tracking of the ephemeral token, tied to the transactionId and user identity, provides a powerful audit trail valuable for reconciliation, dispute resolution, and demonstrating compliance.
 
 ---
 
 **In summary**: The Handshake MCP architecture provides a strong foundation for building highly secure integrations. Its security benefits are achieved through specific design choices that require diligent implementation, particularly around error handling, observability, and state management. Implementers should view these not as weaknesses, but as necessary engineering requirements to realize the full security potential of the pattern.
-
-
