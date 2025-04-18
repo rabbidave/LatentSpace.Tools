@@ -1,17 +1,17 @@
-# Entangled MCP Architecture
+# Handshake MCP Architecture
 
-A secure integration pattern for connecting AI assistants with sensitive operations through ephemeral, isolated authentication contexts.
+A secure integration pattern for connecting AI assistants with sensitive operations through coordinated, transaction-specific authentication protocols.
 
 ## Core Concepts
 
-### 1. Entangled Components
+### 1. Coordinated Components
 
-This architecture consists of two primary components that work in tandem:
+This architecture consists of two primary components that work through a secure handshake mechanism:
 
 - **Local MCP Server**: Deployed on the user's device or local environment
-- **Remote MCP Service**: Dormant/hibernated service that awakens on demand
+- **Remote MCP Service**: Dormant/hibernated service that awaits handshake signals
 
-These components are "entangled" in that they maintain a secure relationship while operating independently, with different security contexts.
+These components establish trust through a cryptographically verified handshake protocol while maintaining independent security contexts.
 
 ### 2. Just-in-Time Resource Allocation
 
@@ -23,7 +23,7 @@ Resources are allocated only when needed:
 
 ### 3. Transaction-Bound Ephemeral Auth
 
-Each interaction receives its own authentication context bound to specific transactions:
+Each interaction establishes a distinct handshake bound to specific transactions:
 
 - Fresh OAuth tokens generated with unique UUIDs tied to specific operations (e.g., invoice #AB12345)
 - Tokens limited in scope to exactly one business transaction identifier
@@ -52,7 +52,7 @@ Each interaction receives its own authentication context bound to specific trans
          │                            │                         │
          │                            │  ┌───────────────────┐  │
          │                            │  │                   │  │
-         └────────Wake Request────────┼─►│  Hibernated MCP   │  │
+         └────Handshake Request──────►│  │  Hibernated MCP   │  │
                                       │  │  Service Instance │  │
                                       │  │                   │  │
                                       │  └─────────┬─────────┘  │
@@ -73,17 +73,17 @@ Each interaction receives its own authentication context bound to specific trans
 1. **Initialization**:
    - User activates the local MCP server
    - The local server authenticates the user through standard OAuth flows
-   - Local server establishes a secure connection to the remote environment
+   - Local server prepares for handshake with the remote environment
 
 2. **Transaction Binding**:
    - AI assistant initiates a transaction with specific business identifier (e.g., Invoice #AB12345)
    - System generates a UUID for the operation that's cryptographically tied to the transaction ID
    - Local MCP server validates the request against authorization policies
 
-3. **Remote Activation**:
-   - Local server sends a "wake" signal to the dormant remote service with the transaction UUID
+3. **Handshake Protocol**:
+   - Local server initiates handshake with the dormant remote service using the transaction UUID
    - Remote service either awakens from hibernation or a new instance is deployed
-   - Transaction-specific ephemeral tokens are generated with the UUID embedded
+   - Transaction-specific ephemeral tokens are exchanged during the handshake
 
 4. **Operation Execution**:
    - Remote service executes the sensitive operation using invoice-bound credentials
@@ -91,11 +91,11 @@ Each interaction receives its own authentication context bound to specific trans
    - Results and complete proof chain are returned through secure channel
    - Local server validates the cryptographic receipts before presenting results
 
-5. **Cleanup**:
+5. **Handshake Termination**:
    - Transaction-specific tokens are invalidated with cryptographic verification
    - Operation receipt and audit logs are persisted with the transaction UUID
    - Remote service returns to hibernation (or instance is terminated)
-   - Secure connection is closed
+   - Secure connection is closed, completing the handshake lifecycle
 
 ## Cryptographic Receipts and Proofs
 
@@ -126,19 +126,19 @@ The architecture employs several cryptographic techniques to create verifiable, 
 
 ### Isolated Contexts
 
-- Each operation exists in its own security context
+- Each handshake establishes an isolated security context
 - Compromise of one session doesn't affect others
-- Clear security boundaries between components
+- Clear security boundaries between handshake participants
 
 ### Reduced Attack Surface
 
-- Sensitive components only exposed when needed
+- Sensitive components only exposed during active handshakes
 - Minimal network exposure of critical services
 - Defense-in-depth through layered architecture
 
 ### Enhanced Audit Trail
 
-- Distinct sessions for each operation
+- Distinct handshake sessions for each operation
 - Clear tracking of when services are activated
 - Detailed logs of each ephemeral authentication
 
@@ -149,13 +149,13 @@ The architecture employs several cryptographic techniques to create verifiable, 
 - Clear definition and secure management of sensitivity tags assigned by the Local MCP
 - Differential cryptographic requirements based on sensitivity level (e.g., "confidential" or higher requiring specific public key signatures)
 - Pre-registration of users with appropriate key material based on access requirements
-- Cryptographic enforcement of sensitivity policies through the entanglement pattern
+- Cryptographic enforcement of sensitivity policies through the handshake protocol
 
 ### Conditional Logic Implementation
 
 - Remote and Local MCP components require logic to conditionally generate and validate proofs based on sensitivity tags
 - Transaction validation rules vary by data classification and operation type
-- Entanglement pattern distributes policy enforcement across components for resilience
+- Handshake protocol distributes policy enforcement across components for resilience
 - Complexity management through clear separation of validation responsibilities
 
 ### Hibernation Management
@@ -176,10 +176,10 @@ The architecture employs several cryptographic techniques to create verifiable, 
 
 1. **Superior Security Isolation**: Complete separation of concerns between user-facing components and sensitive operations
 
-2. **Cost Efficiency**: Resources only consumed during active operations
+2. **Cost Efficiency**: Resources only consumed during active handshake operations
 
 3. **Compliance Advantages**: Clear demonstration of security controls for auditors
 
 4. **Flexible Provider Integration**: Works with any service supporting OAuth-based authentication
 
-5. **Minimal Persistent Attack Surface**: Critical components only exposed when actively in use
+5. **Minimal Persistent Attack Surface**: Critical components only exposed during active handshake sessions
