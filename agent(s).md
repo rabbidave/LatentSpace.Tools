@@ -1,5 +1,17 @@
 # Agent(s) Architecture
 
+```ascii
+┌─────────────┐      ┌────────────────┐     ┌─────────────────┐
+│ System Data │─────►│ Primary Agent  │────►│ Regex Validator │
+└─────────────┘      │ (LLM)          │     └────────┬────────┘
+                     └────────────────┘              │
+                                                     ▼
+┌─────────────┐      ┌────────────────┐     ┌─────────────────┐
+│ Tool        │◄─────│ Confirmation   │◄────│ Validated Tool  │
+│ Execution   │      │ Agent (LLM)    │     │ Calls           │
+└─────────────┘      └────────────────┘     └─────────────────┘
+```
+
 A secure multi-agent system implementing a two-phase validation pattern for AI-initiated system operations through coordinated primary and confirmation agents.
 
 ## Core Axioms
