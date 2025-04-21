@@ -96,4 +96,4 @@ Code execution occurs in an isolated, precisely controlled environment with:
 
 ---
 
-In essence: The Agent(s) Architecture creates trustworthy AI system operations through defense-in-depth validation layers. By requiring multiple independent approvals, enforcing structural conformity, and isolating execution, it achieves robust security with operational flexibility. Every action undergoes rigorous scrutiny before execution, establishing accountable automation for sensitive operations.
+In essence: The Agent(s) Architecture creates trustworthy AI system operations through validation layers. By requiring multiple independent approvals, enforcing structural conformity, and isolating execution, it achieves robust security with operational flexibility. Every action undergoes rigorous scrutiny before execution, establishing accountable automation for sensitive operations; all logged locally via DuckDB
