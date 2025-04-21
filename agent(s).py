@@ -9,11 +9,16 @@ import re
 import ast
 from io import StringIO
 from pathlib import Path
-import time # Added for potential delays
+import time
+import threading
+import queue
+import gradio as gr
+import pandas as pd
+import duckdb
 
 # --- Configuration ---
 VENV_DIR = Path(".agent_venv_auto_v2") # Using unique name for this version
-DEPENDENCIES = ["psutil", "openai"]
+DEPENDENCIES = ["psutil", "openai", "gradio", "duckdb", "pandas"]
 
 # --- Primary LLM Configuration ---
 # IMPORTANT: Configure these for your PRIMARY agent
@@ -31,6 +36,9 @@ CONFIRMATION_MODEL_NAME = "deepseek/deepseek-chat-v3-0324:free" # Replace with y
 WORKSPACE_DIR = Path("tool_workspace").resolve()
 MAX_OUTPUT_LINES = 100 # Limit captured stdout/stderr lines from execute_code
 
+
+# --- Database Configuration ---
+DB_FILE = Path("agent_actions.db").resolve()
 # --- Safety Regex ---
 # Allows: kill_process(pid=NUMBER) OR execute_code(code="STRING_LITERAL" | 'STRING_LITERAL')
 # This regex attempts to correctly match string literals enclosed in single or double quotes,
@@ -63,7 +71,7 @@ You MUST follow the output format EXACTLY. DO NOT add any explanations, commenta
 
 **Example of BAD Output (Do NOT do this):**
 ```text
-Okay, I see WhatsApp running with PID 5678. I will kill it.
+Okay, I see [application] running with PID 5678. I will kill it.
 kill_process(pid=5678)
 ```
 
@@ -74,12 +82,12 @@ kill_process(pid=5678)
 
 **Few-Shot Examples:**
 
-*Example 1: WhatsApp Found*
+*Example 1: [application] Found*
 Input Process List Snippet:
 ```json
 [
   {{ "pid": 123, "name": "Finder", "username": "user", "cpu_percent": 0.1, "memory_mb": 50.5 }},
-  {{ "pid": 456, "name": "WhatsApp", "username": "user", "cpu_percent": 5.2, "memory_mb": 250.8 }},
+  {{ "pid": 456, "name": "[application]", "username": "user", "cpu_percent": 5.2, "memory_mb": 250.8 }},
   {{ "pid": 789, "name": "kernel_task", "username": "root", "cpu_percent": 1.0, "memory_mb": 1024.0 }}
 ]
 ```
@@ -88,7 +96,7 @@ Expected Output:
 kill_process(pid=456)
 ```
 
-*Example 2: No WhatsApp Found, No Action Needed*
+*Example 2: No [application] Found, No Action Needed*
 Input Process List Snippet:
 ```json
 [
@@ -117,8 +125,9 @@ execute_code(code="print('Checking status...')")
 
 **Instructions:**
 1.  Analyze the COMPLETE process list data provided below.
-2.  Identify any process named "WhatsApp". If found, generate a `kill_process(pid=...)` call for its PID.
-3.  Output ONLY the required tool calls (one per line) or ONLY "NO_ACTIONS_NEEDED" if WhatsApp is not found or no other actions are deemed necessary based on your analysis and the examples provided. Adhere strictly to the output format.
+2.  Identify the process named "WhatsApp". If found, generate a `kill_process(pid=...)` call for its PID.
+3.  Identify the process named "komorebi-bar.exe". If NOT found, return Python which runs the following script as a background process: C:/Users/mcnug/start-elevated-komorebi.ps1
+4.  Output ONLY the required tool calls (one per line) or ONLY "NO_ACTIONS_NEEDED" if "WhatsApp" is not found or no other actions are deemed necessary based on your analysis and the examples provided. Adhere strictly to the output format.
 
 **Process List Data:**
 {process_list_json}
@@ -129,13 +138,13 @@ execute_code(code="print('Checking status...')")
 CONFIRMATION_PROMPT = """
 You are a safety confirmation agent. Review the following proposed tool calls.
 Your goal is to prevent clearly harmful or nonsensical actions.
-Approve actions unless they seem obviously dangerous (e.g., killing critical system processes, executing malicious-looking code).
-Killing a standard user application like 'WhatsApp' based on a request is generally acceptable.
+Approve actions unless they seem obviously dangerous (e.g., killing critical system processes like 'System', 'csrss.exe', 'wininit.exe', executing malicious-looking code like deleting files outside the workspace).
+Killing a standard user application like 'WhatsApp' or 'TikTok' based on a request is generally acceptable. Executing code to start expected helper scripts (like 'start-elevated-komorebi.ps1') is also acceptable.
 
 Proposed Tool Calls:
 {proposed_calls_str}
 
-Do you approve these actions? Respond ONLY with "APPROVE" or "DENY". If denying, add a short reason after DENY (e.g., "DENY - Attempting to kill critical process 'kernel_task'").
+Do you approve these actions? Respond ONLY with "APPROVE" or "DENY". If denying, add a short reason after DENY (e.g., "DENY - Attempting to kill critical process 'csrss.exe'").
 """
 
 
@@ -151,9 +160,10 @@ except ImportError:
     psutil = None # Placeholder until venv setup ensures it's imported
 
 def get_current_processes():
-    """Retrieves current process list as JSON string."""
+    """Retrieves current process list as JSON string. Uses log_queue."""
     processes = []
-    logging.info("Attempting to retrieve process list...")
+    # Use log_queue instead of logging
+    # log_queue.put("Attempting to retrieve process list...") # Already logged in worker thread
     try:
         # Ensure psutil is available after venv setup
         global psutil
@@ -180,23 +190,23 @@ def get_current_processes():
                 continue # Ignore processes that disappeared or are inaccessible
             except Exception as e:
                 # Log warning but continue iterating other processes
-                logging.warning(f"Could not retrieve info for PID {proc.pid if proc else 'N/A'}: {e}")
+                log_queue.put(f"Warning: Could not retrieve info for PID {proc.pid if proc else 'N/A'}: {e}")
                 continue
-        logging.info(f"Successfully retrieved info for {len(processes)} processes.")
+        # log_queue.put(f"Successfully retrieved info for {len(processes)} processes.") # Already logged in worker
         return json.dumps(processes, indent=2) # Return data as formatted JSON string
     except NameError:
          # Handle case where psutil is still not importable
-         logging.error("psutil not imported. Dependencies might be missing or venv setup failed.")
+         log_queue.put("ERROR: psutil not imported. Dependencies might be missing or venv setup failed.")
          return json.dumps({"error": "psutil not available."})
     except Exception as e:
         # Catch broader errors during process iteration
-        logging.error(f"Failed to retrieve process list: {e}", exc_info=True)
+        log_queue.put(f"ERROR: Failed to retrieve process list: {e}")
         return json.dumps({"error": f"Failed to retrieve process list: {str(e)}"})
 
 # --- Tool Implementation: kill_process ---
 def terminate_process_by_pid(pid: int):
-    """Terminates a process by its PID, returning JSON status."""
-    logging.info(f"Attempting to terminate process with PID: {pid}")
+    """Terminates a process by its PID, returning JSON status. Uses log_queue."""
+    # log_queue.put(f"Attempting to terminate process with PID: {pid}") # Logged in worker thread
     try:
         # Ensure psutil is available
         global psutil
@@ -210,36 +220,36 @@ def terminate_process_by_pid(pid: int):
         # Get process and name (useful for logs/messages)
         process = psutil.Process(pid)
         process_name = process.name()
-        logging.warning(f"Terminating process: PID={pid}, Name='{process_name}'")
+        log_queue.put(f"Terminating process: PID={pid}, Name='{process_name}'") # Use queue
         # Terminate gracefully first
         process.terminate()
         try:
             # Wait briefly for termination, then report success
             process.wait(timeout=2)
-            logging.info(f"Process PID={pid}, Name='{process_name}' terminated successfully.")
+            log_queue.put(f"Process PID={pid}, Name='{process_name}' terminated successfully.") # Use queue
             return json.dumps({"status": "success", "pid": pid, "message": f"Process PID {pid} ('{process_name}') terminated."})
         except psutil.TimeoutExpired:
             # Force kill if graceful termination failed
-            logging.warning(f"Process PID={pid}, Name='{process_name}' did not terminate gracefully. Forcing kill.")
+            log_queue.put(f"Process PID={pid}, Name='{process_name}' did not terminate gracefully. Forcing kill.") # Use queue
             process.kill()
             process.wait(timeout=1) # Wait briefly for kill signal to take effect
-            logging.info(f"Process PID={pid}, Name='{process_name}' killed forcefully.")
+            log_queue.put(f"Process PID={pid}, Name='{process_name}' killed forcefully.") # Use queue
             return json.dumps({"status": "success", "pid": pid, "message": f"Process PID {pid} ('{process_name}') forcefully killed."})
     # --- Error Handling for kill_process ---
     except psutil.NoSuchProcess:
-        logging.error(f"Process with PID {pid} not found.")
+        log_queue.put(f"ERROR: Process with PID {pid} not found.") # Use queue
         return json.dumps({"status": "error", "pid": pid, "message": f"Process with PID {pid} not found."})
     except psutil.AccessDenied:
-        logging.error(f"Permission denied to terminate process PID {pid}.")
+        log_queue.put(f"ERROR: Permission denied to terminate process PID {pid}.") # Use queue
         return json.dumps({"status": "error", "pid": pid, "message": f"Permission denied to terminate process PID {pid}. Try running with higher privileges."})
     except ValueError as ve:
-        logging.error(f"Invalid PID provided: {ve}")
+        log_queue.put(f"ERROR: Invalid PID provided: {ve}") # Use queue
         return json.dumps({"status": "error", "pid": pid, "message": f"Invalid PID provided: {str(ve)}"})
     except NameError:
-         logging.error("psutil not imported. Dependencies might be missing or venv setup failed.")
+         log_queue.put("ERROR: psutil not imported. Dependencies might be missing or venv setup failed.") # Use queue
          return json.dumps({"status": "error", "pid": pid, "message": "psutil not available."})
     except Exception as e:
-        logging.error(f"An unexpected error occurred while trying to terminate PID {pid}: {e}", exc_info=True)
+        log_queue.put(f"ERROR: An unexpected error occurred while trying to terminate PID {pid}: {e}") # Use queue
         return json.dumps({"status": "error", "pid": pid, "message": f"An unexpected error occurred: {str(e)}"})
 
 
@@ -274,7 +284,7 @@ ALLOWED_NODE_TYPES = {
     ast.FormattedValue, ast.JoinedStr, # F-strings
     ast.withitem, ast.With, # Context managers (like 'with open(...)')
     ast.Return, # Allow returning values if code was structured in functions
-    ast.NameConstant, # Allow True, False, None literals
+    ast.Constant, # Allow True, False, None literals (NameConstant deprecated in 3.14)
     ast.keyword, # For keyword arguments in function calls
 }
 
@@ -287,21 +297,20 @@ DISALLOWED_NODE_TYPES = {
     # ast.Try, ast.Raise could potentially be allowed if carefully considered
 }
 
-def validate_path(path_str):
-    """Checks if a path is safe (within WORKSPACE_DIR). Raises CodeValidationError if not."""
+def validate_path(path_str, current_workspace_dir: Path):
+    """Checks if a path is safe (within current_workspace_dir). Raises CodeValidationError if not."""
     try:
-        # Resolve path relative to the defined workspace directory
-        resolved_path = (WORKSPACE_DIR / path_str).resolve()
-        # Security check: Ensure the resolved path is actually inside the WORKSPACE_DIR
-        # This prevents path traversal attacks (e.g., using '../')
-        resolved_path.relative_to(WORKSPACE_DIR)
+        # Resolve path relative to the *passed* workspace directory
+        resolved_path = (current_workspace_dir / path_str).resolve()
+        # Security check: Ensure the resolved path is actually inside the current_workspace_dir
+        resolved_path.relative_to(current_workspace_dir)
         return resolved_path # Return the validated, absolute path
     except ValueError: # This exception is raised by relative_to if the path is outside
-        raise CodeValidationError(f"Path traversal detected or path outside designated workspace: '{path_str}'")
+        raise CodeValidationError(f"Path traversal detected or path outside designated workspace '{current_workspace_dir}': '{path_str}'")
     except Exception as e: # Catch other filesystem or resolution errors
-        raise CodeValidationError(f"Invalid or unresolvable path '{path_str}': {e}")
+        raise CodeValidationError(f"Invalid or unresolvable path '{path_str}' relative to '{current_workspace_dir}': {e}")
 
-def validate_code_ast(code_string):
+def validate_code_ast(code_string, current_workspace_dir: Path):
     """Validates Python code using AST analysis. Raises CodeValidationError on violations."""
     try:
         tree = ast.parse(code_string) # Parse code into Abstract Syntax Tree
@@ -321,7 +330,7 @@ def validate_code_ast(code_string):
 
         # Optional strictness: Check if the node type is within the generally allowed set
         # if node_type not in ALLOWED_NODE_TYPES:
-        #     logging.warning(f"AST node type {node_type.__name__} not explicitly allowed, review needed.")
+        #     log_queue.put(f"Warning: AST node type {node_type.__name__} not explicitly allowed, review needed.")
         #     # Depending on security posture, could raise CodeValidationError here too
 
         # --- Specific Node Validations for Added Security ---
@@ -333,9 +342,9 @@ def validate_code_ast(code_string):
             filename_arg = node.args[0]
             if not isinstance(filename_arg, ast.Constant) or not isinstance(filename_arg.value, str):
                 raise CodeValidationError("Filename argument for 'open' must be a literal string.")
-            # Validate the path is within the allowed workspace
-            validated_path = validate_path(filename_arg.value) # Raises error if invalid
-            logging.debug(f"Validated safe path for open call: {validated_path}") # Log success
+            # Validate the path is within the allowed workspace (pass the current workspace)
+            validated_path = validate_path(filename_arg.value, current_workspace_dir) # Raises error if invalid
+            # log_queue.put(f"Debug: Validated safe path for open call: {validated_path}") # Log success via queue if needed
             # Validate mode argument if provided
             if len(node.args) > 1:
                 mode_arg = node.args[1]
@@ -364,9 +373,9 @@ def validate_code_ast(code_string):
             if node.attr.startswith('__') and node.attr.endswith('__') and node.attr not in allowed_dunders:
                  raise CodeValidationError(f"Access to potentially unsafe attribute '{node.attr}' disallowed.")
 
-def run_arbitrary_code_safely(code: str):
-    """Executes AST-validated code in a restricted env, capturing output. Returns JSON status."""
-    logging.info(f"Attempting to execute arbitrary code snippet (first 100 chars): {code[:100]}...")
+def run_arbitrary_code_safely(code: str, workspace_dir: Path, max_output_lines: int):
+    """Executes AST-validated code in a restricted env, capturing output. Returns JSON status. Uses log_queue."""
+    log_queue.put(f"Attempting to execute arbitrary code snippet (first 100 chars): {code[:100]}...")
     # Redirect stdout/stderr to capture output from the executed code
     old_stdout, old_stderr = sys.stdout, sys.stderr
     redirected_output, redirected_error = StringIO(), StringIO()
@@ -374,9 +383,9 @@ def run_arbitrary_code_safely(code: str):
     exit_code, error_message = 0, "" # Track execution status
 
     try:
-        # 1. Validate code via AST *before* attempting execution
-        validate_code_ast(code)
-        logging.info("AST validation passed.")
+        # 1. Validate code via AST *before* attempting execution, passing workspace dir
+        validate_code_ast(code, workspace_dir)
+        log_queue.put("AST validation passed.")
 
         # 2. Prepare restricted environment globals (only safe builtins allowed)
         safe_globals = {'__builtins__': SAFE_BUILTINS}
@@ -385,15 +394,15 @@ def run_arbitrary_code_safely(code: str):
 
         # 3. Execute the validated code using exec in the restricted environment
         exec(code, safe_globals, {}) # Use empty locals dictionary for isolation
-        logging.info("Code execution completed.")
+        log_queue.put("Code execution completed.")
 
     except CodeValidationError as e:
         # Handle validation errors (code structure/content is disallowed)
-        logging.error(f"Code validation failed: {e}")
+        log_queue.put(f"ERROR: Code validation failed: {e}")
         error_message, exit_code = f"Code validation failed: {str(e)}", 1
     except Exception as e:
         # Handle runtime errors *during* the execution of the sandboxed code
-        logging.error(f"Error DURING code snippet execution: {e}", exc_info=False) # Log full trace only internally
+        log_queue.put(f"ERROR: Error DURING code snippet execution: {e}")
         # Format runtime error message concisely for reporting back
         import traceback
         tb_lines = traceback.format_exception_only(type(e), e)
@@ -402,14 +411,14 @@ def run_arbitrary_code_safely(code: str):
         # 4. Restore original stdout/stderr streams
         sys.stdout, sys.stderr = old_stdout, old_stderr
 
-        # 5. Get captured output, limiting lines to prevent excessive data
+        # 5. Get captured output, limiting lines using the passed parameter
         stdout_val = redirected_output.getvalue().splitlines()
         stderr_val = redirected_error.getvalue().splitlines()
-        limited_stdout = "\n".join(stdout_val[:MAX_OUTPUT_LINES])
-        limited_stderr = "\n".join(stderr_val[:MAX_OUTPUT_LINES])
+        limited_stdout = "\n".join(stdout_val[:max_output_lines]) # Use parameter
+        limited_stderr = "\n".join(stderr_val[:max_output_lines]) # Use parameter
         # Add truncation notice if output exceeded the limit
-        if len(stdout_val) > MAX_OUTPUT_LINES: limited_stdout += f"\n... (truncated - {len(stdout_val)} total lines)"
-        if len(stderr_val) > MAX_OUTPUT_LINES: limited_stderr += f"\n... (truncated - {len(stderr_val)} total lines)"
+        if len(stdout_val) > max_output_lines: limited_stdout += f"\n... (truncated - {len(stdout_val)} total lines)"
+        if len(stderr_val) > max_output_lines: limited_stderr += f"\n... (truncated - {len(stderr_val)} total lines)"
 
         # 6. Format result into JSON structure for consistent return value
         result_data = {
@@ -419,7 +428,29 @@ def run_arbitrary_code_safely(code: str):
             "stderr": limited_stderr, # Captured standard error
             "error_message": error_message # Summary of validation or runtime error
         }
-        logging.info(f"Execution Result: Status={result_data['status']}, ExitCode={result_data['exit_code']}")
+
+# --- Database Logging Helper ---
+def log_action_to_db(conn, tool_name: str, arguments: dict, status: str, result_summary: str):
+    """Logs the details of an executed action to the DuckDB database."""
+    if not conn:
+        log_queue.put("Warning: Database connection is not available. Cannot log action.")
+        return
+    try:
+        # Convert arguments dict to string for storage
+        args_str = json.dumps(arguments)
+        # Truncate result_summary if it's too long for the DB column (optional, adjust size if needed)
+        max_summary_len = 500 # Example limit
+        summary = (result_summary[:max_summary_len] + '...') if len(result_summary) > max_summary_len else result_summary
+        
+        conn.execute("""
+            INSERT INTO action_log (tool_name, arguments, status, result_summary)
+            VALUES (?, ?, ?, ?);
+        """, (tool_name, args_str, status, summary))
+        # log_queue.put(f"Action logged to DB: {tool_name}, Status: {status}") # Optional: Log success via queue
+    except Exception as e:
+        log_queue.put(f"ERROR: Failed to log action to database: {e}")
+
+        log_queue.put(f"Execution Result: Status={result_data['status']}, ExitCode={result_data['exit_code']}")
         return json.dumps(result_data, indent=2) # Return result as JSON string
 
 # --- Tool Dispatcher ---
@@ -437,10 +468,11 @@ except ImportError:
     OpenAI = None # Placeholder
 
 def get_llm_response(client: OpenAI, conversation_history: list, model_name: str):
-    """Generic function to query an LLM endpoint, returning the response content or error."""
+    """Generic function to query an LLM endpoint, returning the response content or error. Uses log_queue."""
     if client is None: # Check if client initialization failed earlier
+        log_queue.put("ERROR: LLM client is None in get_llm_response.")
         return "ERROR_LLM_COMMUNICATION: OpenAI client not initialized."
-    logging.info(f"Querying model {model_name} at {client.base_url}...")
+    # log_queue.put(f"Querying model {model_name} at {client.base_url}...") # Logged in worker thread
     try:
         # Make the API call to the chat completions endpoint
         chat_completion = client.chat.completions.create(
@@ -452,23 +484,23 @@ def get_llm_response(client: OpenAI, conversation_history: list, model_name: str
         )
         # Extract the response content
         response_content = chat_completion.choices[0].message.content.strip()
-        logging.info(f"LLM raw response ({model_name}): {response_content[:200]}...") # Log truncated response
+        # log_queue.put(f"LLM raw response ({model_name}): {response_content[:200]}...") # Logged in worker thread
         return response_content
     except Exception as e:
         # Handle errors during the API call
-        logging.error(f"Error querying LLM {model_name} at {client.base_url}: {e}", exc_info=True)
+        log_queue.put(f"ERROR: Error querying LLM {model_name} at {client.base_url}: {e}")
         return f"ERROR_LLM_COMMUNICATION: {e}" # Return error indicator
 
 def parse_tool_calls(response_content: str):
     """Parses tool calls from LLM response based on strict line-by-line format."""
     # Handle the specific "no actions needed" response
     if response_content == "NO_ACTIONS_NEEDED":
-        logging.info("LLM indicated no actions needed.")
+        logging.info("LLM indicated no actions needed.") # Keep logging for this info? Or queue? Let's keep logging for now.
         return [] # Return empty list, signifying no tools to call
 
     parsed_calls = []
     potential_calls = response_content.strip().split('\n') # Split response into lines
-    logging.info(f"Potential tool call lines: {potential_calls}")
+    logging.info(f"Potential tool call lines: {potential_calls}") # Keep logging
 
     # Process each line to see if it matches the expected tool call format
     for line in potential_calls:
@@ -479,7 +511,7 @@ def parse_tool_calls(response_content: str):
         match = TOOL_CALL_REGEX.match(line)
         if not match:
             # Warn if a line doesn't conform to the expected basic structure
-            logging.warning(f"Line does not match expected tool call format: '{line}'")
+            logging.warning(f"Line does not match expected tool call format: '{line}'") # Keep logging
             continue
 
         tool_name = match.group(1) # Extract tool name
@@ -494,7 +526,7 @@ def parse_tool_calls(response_content: str):
                     args_dict['pid'] = int(pid_match.group(1)) # Store integer PID
                 else:
                     # Argument format mismatch for kill_process
-                    logging.warning(f"Could not parse pid=NUMBER from kill_process args: '{args_str}' in line '{line}'")
+                    logging.warning(f"Could not parse pid=NUMBER from kill_process args: '{args_str}' in line '{line}'") # Keep logging
                     continue # Skip this invalidly formatted call
             elif tool_name == "execute_code":
                 code_match = CODE_ARG_REGEX.match(args_str) # Expect 'code="STRING"' or 'code=\'STRING\''
@@ -502,11 +534,11 @@ def parse_tool_calls(response_content: str):
                     args_dict['code'] = code_match.group(2) # Store the code string content
                 else:
                     # Argument format mismatch for execute_code
-                    logging.warning(f"Could not parse code=\"...\" from execute_code args: '{args_str}' in line '{line}'")
+                    logging.warning(f"Could not parse code=\"...\" from execute_code args: '{args_str}' in line '{line}'") # Keep logging
                     continue # Skip this invalidly formatted call
             else:
                 # Handle cases where the LLM hallucinates a tool name not defined
-                logging.warning(f"Unsupported tool name encountered during parsing: '{tool_name}' in line '{line}'")
+                logging.warning(f"Unsupported tool name encountered during parsing: '{tool_name}' in line '{line}'") # Keep logging
                 continue
 
             # If parsing succeeded, store the structured call information
@@ -515,209 +547,610 @@ def parse_tool_calls(response_content: str):
                 "tool_name": tool_name,
                 "arguments": args_dict
             })
-            logging.info(f"Successfully parsed tool call: {line}")
+            logging.info(f"Successfully parsed tool call: {line}") # Keep logging
 
         except Exception as e:
             # Catch errors during argument parsing/conversion (e.g., int conversion)
-            logging.warning(f"Error processing arguments for tool call '{line}': {e}")
+            logging.warning(f"Error processing arguments for tool call '{line}': {e}") # Keep logging
 
     # Return the list of successfully parsed tool calls
     return parsed_calls
 
-def get_confirmation_decision(confirmation_client: OpenAI, validated_calls: list):
-    """Gets approval ('APPROVE'/'DENY') from the confirmation LLM endpoint."""
-    if not validated_calls:
-        # If no calls passed the initial validation, can't seek confirmation
-        logging.info("No validated calls to seek confirmation for.")
-        return False
+# --- Gradio UI and Application Logic ---
 
-    # Format the list of validated calls for the confirmation agent's prompt
-    proposed_calls_str = "\n".join([call['raw_call'] for call in validated_calls])
-    logging.info(f"Seeking confirmation for:\n{proposed_calls_str}")
+# Queue for thread-safe communication between agent thread and Gradio UI
+log_queue = queue.Queue()
+# Global reference to the agent thread
+agent_thread = None
 
-    # Prepare the conversation history for the confirmation agent
-    confirmation_conversation = [
-        {"role": "system", "content": "You are a safety confirmation agent. Respond ONLY with APPROVE or DENY, optionally followed by a short reason for denial."},
-        {"role": "user", "content": CONFIRMATION_PROMPT.format(proposed_calls_str=proposed_calls_str)}
-    ]
+# Function to run the agent loop in a separate thread
+def agent_worker_thread(config_state, agent_running_state, stop_requested_state, user_decision_state, proposed_actions_state):
+    """The main worker loop for the agent, running in a separate thread."""
+    import duckdb
+    db_conn = None # Initialize db connection variable
+    log_queue.put("Agent thread started.")
 
-    # Query the confirmation agent
-    response = get_llm_response(confirmation_client, confirmation_conversation, CONFIRMATION_MODEL_NAME)
-
-    # Process the confirmation response
-    if response.startswith("ERROR_LLM_COMMUNICATION"):
-        # Handle inability to reach the confirmation agent
-        logging.error(f"Failed to get confirmation due to communication error: {response}")
-        print("ERROR: Could not reach confirmation agent. Denying action by default.")
-        return False # Fail safely if confirmation cannot be obtained
-    elif response.startswith("APPROVE"):
-        # Explicit approval received
-        logging.info(f"Confirmation agent approved actions.")
-        print("Confirmation agent approved.")
-        return True
-    else:
-        # Any other response (including "DENY" or unexpected formats) is treated as denial
-        logging.warning(f"Confirmation agent denied actions. Response: {response}")
-        print(f"Confirmation agent DENIED actions. Reason (if provided): {response}")
-        return False
-
-# --- Main Execution Logic ---
-def main():
-    """Main script logic: setup, prompt agent, validate, confirm, execute."""
-    logging.info("Script started in virtual environment.")
-    # Ensure workspace directory exists for execute_code tool's file operations
-    try:
-        WORKSPACE_DIR.mkdir(parents=True, exist_ok=True)
-        logging.info(f"Workspace directory ensured: {WORKSPACE_DIR}")
-    except Exception as e:
-        logging.error(f"Failed to create workspace directory {WORKSPACE_DIR}: {e}. 'execute_code' file operations might fail.")
-        # Allow script to continue, but warn the user or handle more gracefully if needed
-
-    # Initialize LLM Clients (Primary and Confirmation) outside the loop
     primary_client = None
     confirmation_client = None
     primary_client_initialized = False
     confirmation_client_initialized = False
 
+    # --- Initialize LLM Clients ---
+    # This needs to be done *inside* the thread after venv is confirmed
     try:
-        # Ensure openai library is available after venv setup
         global OpenAI
         if OpenAI is None and 'openai' not in sys.modules: from openai import OpenAI
         elif OpenAI is None: raise NameError("OpenAI library could not be imported.")
 
-        # Initialize client for the primary agent
-        primary_client = OpenAI(base_url=API_BASE, api_key=API_KEY)
-        logging.info(f"Primary OpenAI client initialized for: {API_BASE}")
+        # Read config from state
+        current_config = config_state.value # Access the dictionary within the state
+
+        primary_client = OpenAI(base_url=current_config.get("api_base"), api_key=current_config.get("api_key"))
+        log_queue.put(f"Primary OpenAI client initialized for: {current_config.get('api_base')}")
         primary_client_initialized = True
-        # Initialize client for the confirmation agent
-        confirmation_client = OpenAI(base_url=CONFIRMATION_API_BASE, api_key=CONFIRMATION_API_KEY)
-        logging.info(f"Confirmation OpenAI client initialized for: {CONFIRMATION_API_BASE}")
+
+        confirmation_client = OpenAI(base_url=current_config.get("confirmation_api_base"), api_key=current_config.get("confirmation_api_key"))
+        log_queue.put(f"Confirmation OpenAI client initialized for: {current_config.get('confirmation_api_base')}")
         confirmation_client_initialized = True
+
     except NameError:
-         logging.error("OpenAI library not found. Check venv setup.")
-         # Don't exit here, allow loop to potentially retry later if needed
+         log_queue.put("ERROR: OpenAI library not found. Check venv setup.")
     except Exception as e:
-        logging.error(f"Failed to initialize OpenAI client(s): {e}")
-        # Don't exit here, allow loop to potentially retry later if needed
+        log_queue.put(f"ERROR: Failed to initialize OpenAI client(s): {e}")
+        # If clients fail, the loop below will handle it
+
+    # --- Initialize Database ---
+    try:
+        db_path = str(DB_FILE) # Use the defined path
+        log_queue.put(f"Connecting to database: {db_path}")
+        db_conn = duckdb.connect(database=db_path, read_only=False)
+        # Create table if it doesn't exist
+        db_conn.execute("""
+            CREATE TABLE IF NOT EXISTS action_log (
+                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                tool_name VARCHAR,
+                arguments VARCHAR, 
+                status VARCHAR, 
+                result_summary VARCHAR
+            );
+        """)
+        log_queue.put("Database connection established and table ensured.")
+    except Exception as e:
+        log_queue.put(f"ERROR: Failed to connect to or initialize database {DB_FILE}: {e}")
+        db_conn = None # Ensure connection is None if setup failed
+        # Optionally, decide if the agent should stop if DB fails
+        # agent_running_state.value = False 
+        # log_queue.put("Agent stopping due to database initialization failure.")
 
     # --- Main Agent Loop ---
-    while True:
-        print("\n--- Starting New Agent Cycle ---")
-        # Check if clients are initialized before proceeding
+    while agent_running_state.value: # Check the running state flag
+        log_queue.put("\n--- Starting New Agent Cycle ---")
+
+        # Check if clients are initialized
         if not primary_client_initialized or not confirmation_client_initialized:
-            logging.error("LLM clients not initialized. Skipping cycle.")
-            print("ERROR: LLM clients failed to initialize. Check API keys/endpoints. Retrying in 5 seconds...")
+            log_queue.put("ERROR: LLM clients not initialized. Skipping cycle.")
             time.sleep(5)
-            continue # Attempt re-initialization or skip cycle
+            continue
+
+        # Read current config for this cycle (in case it changed)
+        current_config = config_state.value
+        model_name = current_config.get("model_name")
+        confirmation_model_name = current_config.get("confirmation_model_name")
+        workspace_dir = Path(current_config.get("workspace_dir", "tool_workspace")).resolve() # Use default if not set
+        max_output_lines = int(current_config.get("max_output_lines", 100)) # Use default if not set
+        system_prompt_template = current_config.get("system_prompt", SYSTEM_PROMPT) # Get system prompt from config
+        confirmation_prompt_template = current_config.get("confirmation_prompt", CONFIRMATION_PROMPT) # Get confirmation prompt from config
+
+        # Ensure workspace exists (using the potentially updated path)
+        try:
+            workspace_dir.mkdir(parents=True, exist_ok=True)
+        except Exception as e:
+            log_queue.put(f"Warning: Failed to ensure workspace directory {workspace_dir}: {e}")
+
 
         # 1. Get Current Process List Data
-        logging.info("Fetching current process list...")
-        process_list_json = get_current_processes()
+        log_queue.put("Fetching current process list...")
+        process_list_json = get_current_processes() # Assumes psutil is imported
         if '"error":' in process_list_json:
-            logging.error(f"Failed to get process list. Skipping cycle. Error: {process_list_json}")
-            print("ERROR: Failed to get process list. Retrying in 30 seconds...")
-            time.sleep(30)
+            log_queue.put(f"ERROR: Failed to get process list. Skipping cycle. Error: {process_list_json}")
+            time.sleep(10) # Longer sleep on process error
             continue
-        logging.info("Process list fetched successfully.")
+        log_queue.put("Process list fetched.")
 
         # 2. Format Prompt for Primary Agent
-        current_prompt = SYSTEM_PROMPT.format(process_list_json=process_list_json)
-        # Create conversation history for this cycle
+        current_prompt = system_prompt_template.format(process_list_json=process_list_json) # Use template from config
         conversation = [
+            # The system role message might be redundant if the template includes it, but keep for now
             {"role": "system", "content": "You are an AI assistant following instructions precisely and adhering strictly to output format."},
             {"role": "user", "content": current_prompt}
         ]
 
-        # 3. Get Primary Agent's Decision (Proposed Tool Calls)
-        logging.info("Querying primary agent...")
-        agent_response = get_llm_response(primary_client, conversation, MODEL_NAME)
+        # 3. Get Primary Agent's Decision
+        log_queue.put("Querying primary agent...")
+        agent_response = get_llm_response(primary_client, conversation, model_name)
         if agent_response.startswith("ERROR_LLM_COMMUNICATION"):
-            logging.error(f"Primary LLM communication error: {agent_response}. Skipping cycle.")
-            print("ERROR: Failed to communicate with primary LLM. Retrying in 5 seconds...")
+            log_queue.put(f"ERROR: Primary LLM communication error: {agent_response}. Skipping cycle.")
             time.sleep(5)
             continue
-        logging.info("Primary agent responded.")
+        log_queue.put("Primary agent responded.")
 
-        # 4. Parse Tool Calls from the Primary Agent's Response
-        logging.info("Parsing primary agent response...")
+        # 4. Parse Tool Calls
+        log_queue.put("Parsing primary agent response...")
         parsed_calls = parse_tool_calls(agent_response)
 
-        # Handle "NO_ACTIONS_NEEDED" or no valid calls
         if not parsed_calls:
-            logging.info("Primary agent proposed no tool calls or indicated 'NO_ACTIONS_NEEDED'.")
-            print("\nPrimary agent proposed no actions for this cycle.")
+            log_queue.put("Primary agent proposed no tool calls or 'NO_ACTIONS_NEEDED'.")
             if agent_response != "NO_ACTIONS_NEEDED":
-                print(f"(Agent's raw response differed from expected 'NO_ACTIONS_NEEDED': '{agent_response[:100]}...')")
-            # Go to sleep before next cycle
-            print("\n--- Cycle Complete. Sleeping for 5 seconds... ---")
-            time.sleep(5)
-            continue # Start next cycle
+                 log_queue.put(f"(Agent raw response: '{agent_response[:100]}...')")
+            time.sleep(5) # Sleep before next cycle
+            continue
 
-        # 5. Validate Proposed Calls against Safety Regex (Structural Check)
+        # 5. Validate Proposed Calls (Regex)
         validated_calls = []
-        print("\n--- Primary Agent Proposed Actions (Pending Validation & Confirmation) ---")
+        proposed_calls_str_list = []
+        log_queue.put("\n--- Proposed Actions (Pending Validation) ---")
         for call_info in parsed_calls:
             raw_call = call_info["raw_call"]
-            print(f"Proposed: {raw_call}")
-            # Check if the raw call string matches the predefined safety regex
+            proposed_calls_str_list.append(raw_call)
+            log_queue.put(f"Proposed: {raw_call}")
             if re.match(SAFETY_REGEX, raw_call):
-                logging.info(f"Call PASSED safety regex validation: {raw_call}")
-                validated_calls.append(call_info) # Add to list for confirmation step
+                validated_calls.append(call_info)
             else:
-                # Log and report calls failing the regex structure check
-                logging.error(f"Call FAILED safety regex validation: {raw_call}")
-                print(f"Action REJECTED (Failed System Regex): {raw_call}")
+                log_queue.put(f"Action REJECTED (Failed System Regex): {raw_call}")
 
-        # Handle case where no calls passed validation
         if not validated_calls:
-            logging.info("No proposed calls passed safety regex validation.")
-            print("\nNo valid actions proposed by the agent after regex check.")
-            # Go to sleep before next cycle
-            print("\n--- Cycle Complete. Sleeping for 5 seconds... ---")
+            log_queue.put("\nNo valid actions proposed after regex check.")
             time.sleep(5)
-            continue # Start next cycle
+            continue
 
-        # 6. Get Confirmation from Second (Confirmation) Agent
-        print("\n--- Seeking Confirmation from Safety Agent ---")
-        is_approved = get_confirmation_decision(confirmation_client, validated_calls)
+        # Store proposed actions for potential UI display
+        proposed_actions_state.value = validated_calls
+        proposed_calls_display = "\n".join([call['raw_call'] for call in validated_calls])
 
-        # 7. Execute Approved Calls (only if confirmation received)
-        if not is_approved:
-            logging.warning("Execution halted for this cycle due to lack of confirmation from safety agent.")
-            print("\nExecution halted: Actions not approved by confirmation agent.")
-            # Go to sleep before next cycle
-            print("\n--- Cycle Complete. Sleeping for 5 seconds... ---")
-            time.sleep(5)
-            continue # Start next cycle
 
-        # Proceed only if confirmation was received (is_approved is True)
-        print("\n--- Executing Confirmed Actions ---")
-        confirmed_calls = validated_calls # Use the list that passed validation
+        # --- Human-in-the-Loop Check ---
+        if stop_requested_state.value:
+            log_queue.put("\n--- Stop Requested: Waiting for User Input ---")
+            log_queue.put("Proposed Actions:\n" + proposed_calls_display)
+            user_decision_state.value = None # Clear previous decision
+            # The UI should now show the Approve/Deny buttons
+
+            while user_decision_state.value is None and agent_running_state.value:
+                # Wait for the user to click Approve or Deny in the UI
+                time.sleep(0.5)
+
+            if not agent_running_state.value: # Check if user stopped agent while waiting
+                 log_queue.put("Agent stopped by user while waiting for input.")
+                 break # Exit the main while loop
+
+            decision = user_decision_state.value
+            log_queue.put(f"User decision: {decision}")
+            stop_requested_state.value = False # Reset the flag
+            user_decision_state.value = None # Reset decision state
+
+            if decision == "deny":
+                log_queue.put("Execution skipped due to user denial.")
+                time.sleep(5)
+                continue # Skip to the next cycle
+
+            # If approved, fall through to execution
+            log_queue.put("User approved actions. Proceeding with execution.")
+            # Optional: Could skip confirmation agent if user approved, or run it anyway
+            # For now, let's assume user approval bypasses confirmation agent
+
+        else:
+             # Optional: Run confirmation agent if stop wasn't requested
+             log_queue.put("\n--- Seeking Confirmation from Safety Agent ---")
+             # Pass the confirmation prompt template from config
+             is_approved_by_safety = get_confirmation_decision(
+                 confirmation_client,
+                 validated_calls,
+                 confirmation_model_name,
+                 confirmation_prompt_template # Pass the template
+             )
+             if not is_approved_by_safety:
+                 log_queue.put("\nExecution halted: Actions not approved by confirmation agent.")
+                 time.sleep(5)
+                 continue
+
+
+        # 7. Execute Approved Calls
+        log_queue.put("\n--- Executing Actions ---")
+        # Use validated_calls as they passed regex and either user approval or safety agent
+        confirmed_calls = validated_calls
         for call_info in confirmed_calls:
             tool_name = call_info["tool_name"]
-            args = call_info["arguments"] # Arguments are already parsed into dict
-            raw_call = call_info["raw_call"] # For logging/reporting context
-            print(f"\nExecuting: {raw_call}")
+            args = call_info["arguments"]
+            raw_call = call_info["raw_call"]
+            log_queue.put(f"\nExecuting: {raw_call}")
 
-            # Dispatch call to the appropriate tool function from the TOOLS dictionary
             if tool_name in TOOLS:
                 tool_function = TOOLS[tool_name]
+                action_status = "error" # Default status
+                result_summary = "" # Default summary
                 try:
-                    # Execute tool function with unpacked arguments (**args)
-                    result_json = tool_function(**args)
-                    print(f"Result:\n{result_json}") # Print the JSON result from the tool
-                except Exception as e:
-                    # Catch errors during the execution of the tool function itself
-                    logging.error(f"Error executing tool '{tool_name}' with args {args}: {e}", exc_info=True)
-                    print(f"Error executing tool '{tool_name}': {e}")
-            else:
-                # Handle case where tool name is unknown at execution time
-                logging.error(f"Unknown tool name found during execution: {tool_name}")
-                print(f"Error: Unknown tool '{tool_name}'")
+                    # Pass workspace and max_lines to execute_code
+                    if tool_name == "execute_code":
+                        # Add workspace_dir and max_output_lines from current config to the arguments
+                        exec_args = {
+                            **args,
+                            "workspace_dir": workspace_dir,
+                            "max_output_lines": max_output_lines
+                        }
+                        result_json = tool_function(**exec_args)
+                    else:
+                         result_json = tool_function(**args)
 
-        logging.info("Execution actions for this cycle finished.")
-        print("\n--- Cycle Complete. Sleeping for 5 seconds... ---")
+                    # Parse result to get status and summary for DB logging
+                    try:
+                        result_data = json.loads(result_json)
+                        action_status = result_data.get("status", "unknown")
+                        # Create a concise summary from the result JSON
+                        if action_status == "success":
+                            result_summary = result_data.get("message", "Success")
+                        else: # Error status
+                            result_summary = result_data.get("message", result_data.get("error_message", "Error occurred"))
+                            if tool_name == "execute_code": # Add stderr for code errors
+                                stderr = result_data.get("stderr")
+                                if stderr: result_summary += f" | Stderr: {stderr[:100]}..." # Limit length
+
+                    except json.JSONDecodeError:
+                        action_status = "error"
+                        result_summary = f"Tool returned non-JSON result: {result_json[:200]}..." # Log raw result snippet
+                    except Exception as parse_e:
+                         action_status = "error"
+                         result_summary = f"Error parsing tool result JSON: {parse_e}"
+
+                    log_queue.put(f"Result:\n{result_json}") # Still log full result to console queue
+
+                except Exception as e:
+                    # Capture execution error for DB logging
+                    action_status = "error"
+                    result_summary = f"Exception during tool execution: {str(e)}"
+                    log_queue.put(f"ERROR executing tool '{tool_name}' with args {args}: {e}")
+
+                # Log the action to the database using the helper function
+                log_action_to_db(db_conn, tool_name, args, action_status, result_summary)
+            else:
+                log_queue.put(f"ERROR: Unknown tool '{tool_name}'")
+
+        log_queue.put("\n--- Cycle Complete ---")
         time.sleep(5) # Wait before starting the next cycle
+
+    log_queue.put("Agent thread finished.")
+
+    # --- Cleanup --- 
+    if db_conn:
+        try:
+            db_conn.close()
+            log_queue.put("Database connection closed.")
+        except Exception as e:
+            log_queue.put(f"Warning: Error closing database connection: {e}")
+
+
+# --- Database Log Fetching for UI ---
+def get_db_logs_as_dataframe():
+    """Connects to DuckDB, fetches action logs, returns as Pandas DataFrame."""
+    logs_df = pd.DataFrame() # Default empty DataFrame
+    db_conn = None
+    try:
+        db_path = str(DB_FILE)
+        if not DB_FILE.exists():
+            # Log to console queue as UI might not be fully loaded yet
+            log_queue.put(f"Database file {db_path} not found. Cannot fetch logs.")
+            return logs_df # Return empty DataFrame
+
+        db_conn = duckdb.connect(database=db_path, read_only=True) # Read-only connection
+        logs_df = db_conn.execute("SELECT timestamp, tool_name, arguments, status, result_summary FROM action_log ORDER BY timestamp DESC").fetchdf()
+        # Optional: Format timestamp for better readability in UI
+        if not logs_df.empty and 'timestamp' in logs_df.columns:
+             logs_df['timestamp'] = pd.to_datetime(logs_df['timestamp']).dt.strftime('%Y-%m-%d %H:%M:%S')
+
+    except Exception as e:
+        log_queue.put(f"ERROR: Failed to fetch logs from database {DB_FILE}: {e}")
+        # Optionally return a DataFrame with an error message
+        logs_df = pd.DataFrame({"Error": [f"Failed to fetch logs: {e}"]})
+    finally:
+        if db_conn:
+            try:
+                db_conn.close()
+            except Exception as e:
+                 log_queue.put(f"Warning: Error closing read-only DB connection: {e}")
+    return logs_df
+
+
+# --- Gradio UI Definition ---
+def create_gradio_ui():
+    # Default configuration values
+    default_config = {
+        "api_base": API_BASE,
+        "api_key": API_KEY,
+        "model_name": MODEL_NAME,
+        "confirmation_api_base": CONFIRMATION_API_BASE,
+        "confirmation_api_key": CONFIRMATION_API_KEY,
+        "confirmation_model_name": CONFIRMATION_MODEL_NAME,
+        "workspace_dir": str(WORKSPACE_DIR),
+        "max_output_lines": MAX_OUTPUT_LINES,
+        "system_prompt": SYSTEM_PROMPT, # Add default system prompt
+        "confirmation_prompt": CONFIRMATION_PROMPT, # Add default confirmation prompt
+    }
+
+    with gr.Blocks(theme=gr.themes.Soft()) as demo:
+        # --- State Variables ---
+        # Holds the configuration dictionary
+        config_state = gr.State(default_config)
+        # Boolean flag indicating if the agent thread should be running
+        agent_running_state = gr.State(False)
+        # Boolean flag indicating user requested a stop for review
+        stop_requested_state = gr.State(False)
+        # Stores user decision ("approve" or "deny")
+        user_decision_state = gr.State(None)
+        # Stores the list of proposed actions when waiting for user
+        proposed_actions_state = gr.State([])
+
+        # --- UI Layout ---
+        gr.Markdown("# Agent Control Panel")
+        gr.Markdown("""
+```ascii
++-------------------------+      +---------------------+      +--------------------+      +---------------------+
+| 1. Get Process List     | ---> | 2. Primary Agent    | ---> | 3. Parse Tool Calls| ---> | 4. Regex Validation |
+|  (get_current_processes)|      |   (Propose Actions) |      |  (parse_tool_calls)|      |   (SAFETY_REGEX)    |
++-------------------------+      +---------------------+      +--------------------+      +----------+----------+
+                                                                                                      |
+                                                                                                      | (Valid Calls)
+                                                                                                      V
+                                +---------------------------------------------------------------------+-------+
+                                | 5. Confirmation Stage                                               |       |
+                                |                                                                     |       |
+                                |   +-----------------------------+     +-------------------------+   |       |
+                                |   | [IF Stop Requested]         | OR  | [ELSE]                  |   |       |
+                                |   | Human Review (UI Buttons)   | --> | Confirmation Agent      |   |       |
+                                |   |   - Approve? -> Execute     |     | (get_confirmation_decision) |       |       
+                                |   |   - Deny? ----> Skip        |     |   - Approve? -> Execute |   |       |
+                                |   +-----------------------------+     |   - Deny? ----> Skip    |   |       |
+                                |                                       +-------------------------+   |       |
+                                +---------------------------------------------------------------------+-------+
+                                                                                                      |
+                                                                                                      |
+                                                                                                      V
++-------------------------+      +-------------------------+      +-------------------------+      +--------------------+
+| 8. Log Action to DB     | <--- | 7. Parse Result         | <--- | 6. Execute Actions      | <--- |  (Approved Calls)  |
+|   (log_action_to_db)    |      |   (Status/Summary)      |      |   (TOOLS[tool_name])    |      |                    |
++-------------------------+      +-------------------------+      +-------------------------+      +--------------------+
+                                                                                                           |
+                                                                                                           V
+                                                                                                   (Start Next Cycle)
+```
+""")
+
+        with gr.Tabs():
+            with gr.TabItem("Agent Control"):
+                with gr.Row():
+                    start_button = gr.Button("Start Agent")
+                    stop_button = gr.Button("Stop Agent")
+                    request_stop_button = gr.Button("Request Stop for Review")
+                agent_status = gr.Textbox(label="Agent Status", value="Stopped", interactive=False)
+                # output_log removed as it's static without 'every=1'
+
+                with gr.Column(visible=False) as hitl_controls: # Hidden by default
+                    gr.Markdown("## Human Review Requested")
+                    proposed_actions_display = gr.Textbox(label="Proposed Actions", lines=5, interactive=False)
+                    with gr.Row():
+                        approve_button = gr.Button("Approve & Continue")
+                        deny_button = gr.Button("Deny & Continue")
+
+            with gr.TabItem("Configuration"):
+                gr.Markdown("Configure LLM endpoints and other settings.")
+                api_base_input = gr.Textbox(label="Primary API Base URL", value=default_config["api_base"])
+                api_key_input = gr.Textbox(label="Primary API Key", type="password", value=default_config["api_key"])
+                model_name_input = gr.Textbox(label="Primary Model Name", value=default_config["model_name"])
+                conf_api_base_input = gr.Textbox(label="Confirmation API Base URL", value=default_config["confirmation_api_base"])
+                conf_api_key_input = gr.Textbox(label="Confirmation API Key", type="password", value=default_config["confirmation_api_key"])
+                conf_model_name_input = gr.Textbox(label="Confirmation Model Name", value=default_config["confirmation_model_name"])
+                workspace_dir_input = gr.Textbox(label="Workspace Directory", value=default_config["workspace_dir"])
+                max_output_lines_input = gr.Number(label="Max Output Lines (Execute Code)", value=default_config["max_output_lines"], precision=0)
+                primary_prompt_input = gr.TextArea(label="Primary Agent System Prompt", value=default_config["system_prompt"], lines=10)
+                confirmation_prompt_input = gr.TextArea(label="Confirmation Agent Prompt", value=default_config["confirmation_prompt"], lines=5)
+                save_config_button = gr.Button("Save Configuration")
+                config_save_status = gr.Textbox(label="Status", value="", interactive=False)
+
+            with gr.TabItem("Action Log"):
+                gr.Markdown("View recorded agent actions.")
+                refresh_logs_button = gr.Button("Refresh Logs")
+                action_log_display = gr.DataFrame(label="Action History", interactive=False)
+
+
+        # --- UI Update Logic ---
+        def update_log():
+            """Periodically checks the queue and updates the log display."""
+            logs = []
+            while not log_queue.empty():
+                logs.append(log_queue.get())
+
+            # Determine current status based on state and logs
+            current_status = "Unknown"
+            if not agent_running_state.value:
+                current_status = "Stopped"
+            elif stop_requested_state.value and user_decision_state.value is None:
+                 current_status = "Waiting for User Input"
+            elif any("Executing Actions" in log for log in logs):
+                 current_status = "Executing Actions"
+            elif any("Fetching current process list" in log for log in logs):
+                 current_status = "Fetching Processes"
+            elif any("Querying primary agent" in log for log in logs):
+                 current_status = "Querying Primary Agent"
+            elif any("Seeking Confirmation" in log for log in logs):
+                 current_status = "Seeking Confirmation"
+            elif agent_running_state.value:
+                 current_status = "Running" # Default if running but no specific phase detected
+
+            # Update HITL controls visibility
+            show_hitl = stop_requested_state.value and user_decision_state.value is None
+
+            # Format proposed actions for display
+            proposed_text = ""
+            if show_hitl:
+                actions = proposed_actions_state.value
+                if isinstance(actions, list):
+                     proposed_text = "\n".join([call.get('raw_call', str(call)) for call in actions])
+
+
+            # Join new logs with existing log content (optional: limit total log size)
+            new_log_content = "\n".join(logs) if logs else ""
+
+            # Fetch latest logs from DB for the Action Log tab
+            latest_logs_df = get_db_logs_as_dataframe()
+
+            # Return updates for multiple components
+            # output_log update removed
+            return {
+                agent_status: current_status,
+                hitl_controls: gr.update(visible=show_hitl),
+                proposed_actions_display: proposed_text,
+                action_log_display: latest_logs_df # Add DataFrame update
+            }
+
+        # Schedule the log update function to run periodically
+        # Now updates status, HITL controls, proposed actions, AND the action log DataFrame
+        demo.load(
+            update_log,
+            None,
+            [agent_status, hitl_controls, proposed_actions_display, action_log_display], # Add action_log_display here
+            # Removed 'every=2' as it causes TypeError in this Gradio version
+        )
+
+
+        # --- Callback Functions ---
+        def save_config(api_base, api_key, model, conf_base, conf_key, conf_model, ws_dir, max_lines, system_prompt, confirmation_prompt):
+            new_config = {
+                "api_base": api_base, "api_key": api_key, "model_name": model,
+                "confirmation_api_base": conf_base, "confirmation_api_key": conf_key, "confirmation_model_name": conf_model,
+                "workspace_dir": ws_dir, "max_output_lines": max_lines,
+                "system_prompt": system_prompt, # Save system prompt
+                "confirmation_prompt": confirmation_prompt, # Save confirmation prompt
+            }
+            config_state.value = new_config # Update the state object's value
+            log_queue.put("Configuration saved.")
+            return "Configuration saved successfully."
+
+        def start_agent_callback():
+            global agent_thread
+            if agent_thread is None or not agent_thread.is_alive():
+                agent_running_state.value = True
+                stop_requested_state.value = False
+                user_decision_state.value = None
+                # Pass state objects to the thread function
+                agent_thread = threading.Thread(target=agent_worker_thread, args=(
+                    config_state, agent_running_state, stop_requested_state,
+                    user_decision_state, proposed_actions_state
+                ), daemon=True)
+                agent_thread.start()
+                log_queue.put("Agent start requested.")
+                return "Agent starting..."
+            else:
+                return "Agent is already running."
+
+        def stop_agent_callback():
+            if agent_thread and agent_thread.is_alive():
+                agent_running_state.value = False # Signal thread to stop
+                # The thread will check this flag and exit its loop
+                log_queue.put("Agent stop requested. Finishing current cycle...")
+                return "Agent stopping..."
+            else:
+                 return "Agent is not running."
+
+        def request_stop_callback():
+            if agent_running_state.value:
+                stop_requested_state.value = True
+                log_queue.put("Stop for review requested. Will pause after current cycle analysis.")
+                return "Stop requested. Agent will pause for review."
+            else:
+                return "Agent is not running."
+
+        def approve_actions_callback():
+            if stop_requested_state.value:
+                user_decision_state.value = "approve"
+                # Return updates for status and hide the HITL controls
+                return {
+                    agent_status: "Approval registered. Resuming...",
+                    hitl_controls: gr.update(visible=False)
+                }
+            return {agent_status: "", hitl_controls: gr.update()} # No change if not waiting
+
+        def deny_actions_callback():
+             if stop_requested_state.value:
+                user_decision_state.value = "deny"
+                # Return updates for status and hide the HITL controls
+                return {
+                    agent_status: "Denial registered. Skipping actions...",
+                    hitl_controls: gr.update(visible=False)
+                }
+             return {agent_status: "", hitl_controls: gr.update()} # No change if not waiting
+
+
+        # --- Connect Callbacks to UI Components ---
+        save_config_button.click(
+            save_config,
+            inputs=[
+                api_base_input, api_key_input, model_name_input,
+                conf_api_base_input, conf_api_key_input, conf_model_name_input,
+                workspace_dir_input, max_output_lines_input,
+                primary_prompt_input, confirmation_prompt_input # Add new inputs
+            ],
+            outputs=[config_save_status]
+        )
+        start_button.click(start_agent_callback, outputs=[agent_status])
+        stop_button.click(stop_agent_callback, outputs=[agent_status])
+        request_stop_button.click(request_stop_callback, outputs=[agent_status])
+        approve_button.click(approve_actions_callback, outputs=[agent_status, hitl_controls])
+        deny_button.click(deny_actions_callback, outputs=[agent_status, hitl_controls])
+
+        # Modify Refresh Logs button to trigger full UI update, including status and HITL controls
+        refresh_logs_button.click(
+            update_log, # Call the main UI update function
+            inputs=None,
+            # Ensure outputs match what update_log returns
+            outputs=[agent_status, hitl_controls, proposed_actions_display, action_log_display]
+        )
+
+    return demo
+
+
+# --- Modified Tool Implementations (Placeholder for potential changes) ---
+# Need to review/modify terminate_process_by_pid, run_arbitrary_code_safely, get_confirmation_decision
+# to ensure they work correctly with config from state and potentially logging via queue.
+
+# Example modification needed for get_confirmation_decision:
+# Added confirmation_prompt_template parameter
+def get_confirmation_decision(confirmation_client: OpenAI, validated_calls: list, confirmation_model_name: str, confirmation_prompt_template: str):
+    """Gets approval ('APPROVE'/'DENY') from the confirmation LLM endpoint."""
+    if not validated_calls:
+        log_queue.put("No validated calls to seek confirmation for.") # Use queue
+        return False
+
+    proposed_calls_str = "\n".join([call['raw_call'] for call in validated_calls])
+    log_queue.put(f"Seeking confirmation for:\n{proposed_calls_str}") # Use queue
+
+    confirmation_conversation = [
+        # System message might be part of the template now, adjust if needed
+        {"role": "system", "content": "You are a safety confirmation agent. Respond ONLY with APPROVE or DENY, optionally followed by a short reason for denial."},
+        # Use the passed template
+        {"role": "user", "content": confirmation_prompt_template.format(proposed_calls_str=proposed_calls_str)}
+    ]
+
+    # Pass the specific model name for confirmation
+    response = get_llm_response(confirmation_client, confirmation_conversation, confirmation_model_name)
+
+    if response.startswith("ERROR_LLM_COMMUNICATION"):
+        log_queue.put(f"Failed to get confirmation due to communication error: {response}") # Use queue
+        log_queue.put("ERROR: Could not reach confirmation agent. Denying action by default.") # Use queue
+        return False
+    elif response.startswith("APPROVE"):
+        log_queue.put(f"Confirmation agent approved actions.") # Use queue
+        return True
+    else:
+        log_queue.put(f"Confirmation agent denied actions. Response: {response}") # Use queue
+        return False
 
 # --- Venv Setup and Relaunch Logic ---
 def setup_venv():
@@ -779,13 +1212,27 @@ def setup_venv():
     # as the current process is replaced.
     return False
 
+
+# TODO: Modify run_arbitrary_code_safely to accept workspace_dir and max_output_lines
+#       and potentially use log_queue instead of logging directly.
+# TODO: Modify terminate_process_by_pid to potentially use log_queue.
+# TODO: Modify get_current_processes to potentially use log_queue.
+# TODO: Modify get_llm_response to potentially use log_queue.
+
+
 # --- Script Entry Point ---
 if __name__ == "__main__":
     # First, ensure the virtual environment is set up correctly
     if setup_venv():
-        # If setup_venv returns True, we are in the correct venv (or were relaunched into it)
-        # Proceed to run the main application logic
-        main()
+        # If setup_venv returns True, we are in the correct venv
+        # Create and launch the Gradio interface
+        logging.info("Starting Gradio application...")
+        print("Setting up Gradio interface...")
+        app = create_gradio_ui()
+        print("Launching Gradio interface... Access it in your browser.")
+        # Launch Gradio app (blocking call)
+        app.launch() # Add share=True if you need external access
+        logging.info("Gradio application stopped.")
     else:
         # This path should only be reached if setup_venv failed to relaunch correctly
         logging.error("Venv setup failed to complete or relaunch.")
