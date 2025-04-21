@@ -2,7 +2,7 @@
 
 ```ascii
 ┌─────────────┐      ┌────────────────┐     ┌─────────────────┐
-│ System Data │─────►│ Primary Agent  │────►│ Regex Validator │
+│ System Data │─────►│ Primary Agent  │────►│Regex x AST Valid│
 └─────────────┘      │ (LLM)          │     └────────┬────────┘
                      └────────────────┘              │
                                                      ▼
