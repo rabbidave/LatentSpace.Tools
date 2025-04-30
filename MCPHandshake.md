@@ -1,71 +1,104 @@
-# Handshake MCP Architecture
+## Target-State Architecture for Zero-Standing Privileges
 
-A secure integration pattern for connecting AI assistants with sensitive operations through coordinated, transaction-specific authentication protocols.
+A secure integration pattern enabling AI assistants to interact with sensitive business systems through coordinated, transaction-specific authentication protocols with built-in defense-in-depth.
 
 ## Overview
 
-The Handshake MCP Architecture provides a robust security framework for AI assistants to interact with sensitive systems while maintaining strong security boundaries. It implements a two-phase handshake mechanism that ensures transaction-specific authorization without standing privileges, aligned with modern zero trust principles.
+The MCP Handshake Architecture provides an enterprise-grade security framework for AI integrations, implementing a defense-in-depth strategy with clear separation of concerns. It uses a two-phase handshake mechanism ensuring transaction-specific authorization with zero standing privileges, aligning with modern zero trust principles and data classification requirements.
 
-## Core Concepts
+### Key Components and Terminology
 
-### 1. Coordinated Components
+- **AI Assistant** implements the **Local MCP Client** - initiates requests but cannot directly access sensitive APIs
+- **Confirmation Agent** implements the **Remote MCP Service** - acts as a secure gateway validating all operations
+- **State Store** - provides atomic token management (typically Redis, DynamoDB, or similar with TTL support)
+- **User Identity Provider** - external system for user authentication and session token issuance
+- **Target Enterprise APIs** - back-end systems containing sensitive data or operations
 
-This architecture consists of two primary components that work through a secure handshake mechanism:
+## Core Architecture Principles
 
-- **Local MCP Server**: Deployed on the user's device or local environment; responsible for initiating transaction requests.
-- **Remote MCP Service**: Serverless function or hibernated service that awaits handshake signals to execute sensitive operations.
+### 1. Dual-Agent Authority with Coordinated Components
 
-These components establish trust through a cryptographically verified handshake protocol while maintaining independent security contexts. User authentication (establishing user identity to the Remote Service) may precede the transaction-specific handshake.
+The architecture implements separation of powers through a dual-validation pattern:
 
-### 2. Just-in-Time Resource Allocation
+- **Local MCP Client (implemented by AI Assistant)**: Initiates transaction requests and manages client-side workflow, but cannot directly access sensitive systems.
 
-Resources are allocated only when needed for a specific transaction:
+- **Remote MCP Service (implemented by Confirmation Agent)**: Acts as a secure gateway that independently validates operations, manages token lifecycle, and is the only component with access to sensitive API credentials. This separation ensures that even if the AI Assistant is compromised, it cannot directly access target systems.
 
-- Remote services remain dormant or scale to zero when inactive.
-- New, isolated instances can be spawned for each operation or handshake phase.
-- Compute resources are consumed ephemerally, aligning cost with activity.
+- **Secure State Store**: Tracks ephemeral token states and ensures atomic consumption, typically implemented using Redis, DynamoDB, or a similar system with TTL support and atomic operations to prevent race conditions during token validation.
 
-### 3. Transaction-Bound Ephemeral Auth
+Each component maintains isolated security contexts connected through cryptographically verified handshakes, with initial trust bootstrapped through TLS, certificate validation, and secure secret management.
 
-Each sensitive operation requires a distinct, two-phase handshake explicitly bound to that specific transaction instance:
+### 2. Ephemeral Action Authorization with Replay Protection
 
-- **Phase 1: Authorization Request**: The authenticated user requests authorization for a specific target operation with defined parameters.
-- **Phase 2: Ephemeral Token Grant & Consumption**: Upon successful authorization, a unique, single-use Ephemeral Transaction Token is generated and returned. This token is:
-  - Tied cryptographically to the specific transaction UUID, authorized user, target operation, and parameters.
-  - Limited in scope strictly to the single authorized business operation instance.
-  - Given a very short expiration period (e.g., seconds), sufficient only to be immediately used.
-  - Managed via a secure state store where its validity is tracked.
+Every sensitive operation requires explicit, time-bound authorization with built-in replay protection:
+- **Phase 1: Request Authorization**: Authenticated user requests a specific operation with parameters
+- **Phase 2: Nonce Generation & Parameter Binding**: A unique nonce (ephemeral token) is generated and cryptographically bound to the parameter hash
+- **Phase 3: Atomic Execution & Token Consumption**: Operation proceeds only after validation succeeds, and the token is atomically consumed
 
-**Token Consumption**: The Ephemeral Transaction Token is presented alongside the operation request and is atomically consumed upon validation before the sensitive operation executes, preventing replay attacks.
+This approach provides two-factor replay protection:
+1. The ephemeral token acts as a nonce (number used once) that is invalidated after use
+2. The parameter hash binds this nonce to the exact operation parameters
 
-## Architecture Diagram
+For example, if calling a function `transferFunds({fromAccount: "12345", toAccount: "67890", amount: 500})`, the `parameter_hash` would be `SHA256(JSON.stringify({fromAccount: "12345", toAccount: "67890", amount: 500}))`. This ensures that the exact same parameters must be provided in Phase 2, preventing an attacker from changing parameters (e.g., changing the amount or destination account) between authorization and execution.
+
+### 3. Tiered Access Control
+
+The architecture implements a tiered approach to API security based on data classification:
+
+1. **Public (Tier 1)**: 
+   - Basic input validation and sanitization
+   - Available with minimal authentication
+   - Lowest sensitivity level
+   - *Examples*: Public reference data, open documentation, non-personalized information
+
+2. **Internal (Tier 2)**:
+   - Public key verification for request authenticity
+   - Parameter sanitization and schema validation
+   - Medium-low sensitivity
+   - *Examples*: Internal reports, departmental dashboards, non-sensitive operations
+
+3. **Confidential (Tier 3)**:
+   - Comprehensive validation using multiple techniques based on context:
+     - Regex pattern validation for structured inputs
+     - Schema validation for complex objects
+     - Code analysis (AST or alternatives) for execution requests
+   - Parameter transformation or sanitization required
+   - Medium-high sensitivity
+   - *Examples*: Financial operations, PII access, business transactions
+
+4. **Restricted (Tier 4)**:
+   - Includes all lower-tier validations
+   - Secondary validation by independent system
+   - Highest sensitivity level
+   - May require time-delayed execution or human approval workflows
+   - *Examples*: Administrative actions, critical infrastructure changes, high-value transactions
+
+## Implementation Reference Architecture
 
 ```
 ┌─────────────────┐                   ┌─────────────────────────┐
 │                 │                   │                         │
 │   AI Assistant  │                   │ User Identity Provider  │
-│  (MCP Client /  │                   │      (Session Auth)     │
-│ Local MCP Srvr) │                   │                         │
-│                 │                   └───────────┬─────────────┘
-└───────┬─────────┘                               │ Session Token
+│  (Primary Agent)│                   │      (Session Auth)     │
+│                 │                   │                         │
+└───────┬─────────┘                   └───────────┬─────────────┘
+        │                                         │ Session Token
         │                                         │ (e.g., JWT)
-        │                                         │
         │ 1. Auth Req (Tool + Params + Metadata)  ▼
         ├─────────────────────────────────>┌─────────────────┐
         │         (Session Token)          │                 │
-        │                                  │   Remote MCP    │
-        │ 2. Ephemeral Tx Token <----------│     Service     │
-        │                                  │                 │
-        │ 3. Execute Tool (Tool + Params)  │       +         │
+        │                                  │ Confirmation    │
+        │ 2. Ephemeral Tx Token <----------│ Agent + State   │
+        │                                  │ Store           │
+        │ 3. Execute Tool (Tool + Params)  │                 │
         ├─────────────────────────────────>│                 │
-        │   (Session Token +               │   State Store   │
-        │    Ephemeral Tx Token Header)    │                 │
+        │   (Session Token +               │                 │
+        │    Ephemeral Tx Token)           │                 │
         │                                  │                 │
         │ 4. Result + Proof <--------------│                 │
         │                                  └───────┬─────────┘
         │                                          │
-        │                                          │ Consumes Tx Token,
-        │                                          │ Calls Service API
+        │                                          │ Validated Call
         │                                          ▼
         │                            ┌─────────────────────────┐
         │                            │                         │
@@ -73,116 +106,118 @@ Each sensitive operation requires a distinct, two-phase handshake explicitly bou
         │                            │    Environment          │
         │                            │  ┌───────────────────┐  │
         │                            │  │                   │  │
-        │                            │  │ Sensitive Service │  │
-        │                            │  │ APIs with keys    │  │
+        │                            │  │ Enterprise APIs   │  │
+        │                            │  │ & Services        │  │
         │                            │  │                   │  │
         │                            │  └───────────────────┘  │
         │                            │                         │
         │                            └─────────────────────────┘
 ```
 
-## Operational Flow
+## Reference Implementation Schema
 
-### Initialization:
-1. User activates the local MCP client/server.
-2. User authenticates to the Remote MCP Service via standard OAuth/JWT flows, obtaining a primary Session Token.
-3. Local client prepares for transaction-specific handshakes.
+```json
+{
+  "schema": "MCP.Handshake.v1",
+  "transaction": {
+    "id": "uuid-for-this-specific-request",
+    "timestamp": "ISO-8601-timestamp",
+    "user": {
+      "id": "authenticated-user-id",
+      "roles": ["role1", "role2"]
+    }
+  },
+  "tool": {
+    "name": "target-operation-name",
+    "version": "1.0.0",
+    "sensitivity": "CONFIDENTIAL", // PUBLIC, INTERNAL, CONFIDENTIAL, RESTRICTED
+    "parameters_hash": "sha256-of-parameters-object",
+    "target_api": {
+      "name": "enterprise-api-identifier",
+      "operation": "specific-api-operation"
+    }
+  },
+  "authentication": {
+    "session_token": "jwt-or-other-identity-token",
+    "ephemeral_token": "single-use-transaction-bound-token",
+    "expiry": "ISO-8601-timestamp-short-lifespan",
+    "token_state": {
+      "consumed": false,
+      "consumption_timestamp": null
+    }
+  },
+  "validation": {
+    "status": "APPROVED", // APPROVED, DENIED, PENDING
+    "timestamp": "ISO-8601-timestamp",
+    "checks_performed": ["parameter_validation", "pattern_validation", "code_analysis"],
+    "tier_level": "CONFIDENTIAL",
+    "reason": "Optional explanation if DENIED"
+  },
+  "audit": {
+    "request_ip": "client-ip-address",
+    "client_id": "application-identifier",
+    "integration_id": "specific-integration-identifier",
+    "receipt": {
+      "transaction_proof": "cryptographic-signature-of-transaction-details", // Typically HMAC or digital signature of transaction data
+      "timestamp": "ISO-8601-timestamp"
+    }
+  },
+  "error_handling": {
+    "status_code": null, // HTTP status code if error occurred
+    "error_type": null,  // AUTH_ERROR, VALIDATION_ERROR, EXECUTION_ERROR, etc.
+    "message": null,     // Human-readable error message
+    "retry_allowed": true // Whether retry is permitted for this error
+  }
+}
+```
 
-### Transaction Binding & Authorization Request:
-1. AI assistant initiates a transaction (e.g., "Create invoice for X").
-2. Local client identifies the target tool and parameters, determining the required authentication flow based on the tool's sensitivity classification (public, internal, confidential, or restricted).
-3. Local client sends an Authorization Request call to the Remote MCP Service, passing the target tool, parameters, tool sensitivity metadata, and the user's Session Token.
-4. Remote service validates the Session Token, generates a unique transactionId, hashes parameters, and checks user permissions according to the tool's sensitivity tier.
+## Operational Lifecycle
 
-### Ephemeral Token Grant (Handshake Phase 1 Complete):
-1. Remote service, only upon explicit request from the MCP client, generates a unique, single-use Ephemeral Transaction Token (nonce).
-2. Remote service stores the transaction state (transactionId, userId, targetTool, paramsHash, status: pending, short expiry) in a secure state store.
-3. Remote service returns the transactionId and the Ephemeral Transaction Token to the Local client.
+### Integration Setup Phase
+1. **Enterprise Team** (Provides infra, standards, and requirements):
+   - Defines data classification scheme and sensitivity tiers
+   - Establishes validation requirements per tier
+   - Publishes standards and requirements
 
-### Operation Execution (Handshake Phase 2):
-1. Local client immediately constructs the operation request.
-2. Local client sends the request to the Remote MCP Service, passing:
-   - The user's Session Token
-   - The Ephemeral Transaction Token
-   - The required operation parameters
-   - The sensitivity classification metadata
-3. Remote service validates the Session Token again.
-4. Remote service retrieves the transaction state from the store using the Ephemeral Transaction Token.
-5. The service atomically consumes the token and validates its expiry, user, tool, and parameter hash against the current request.
-6. For restricted sensitivity tier operations, a confirmation agent validates the request before execution (similar to the dual-agent system in agent(s).py).
+2. **IT/Ops Team**:
+   - Configures runtime environment
+   - Sets up monitoring and logging
+   - Deploys Remote MCP Service and State Store infrastructure
 
-### Sensitive Operation & Proof Generation:
-1. If ephemeral token validation succeeds and sensitivity tier validation requirements are met, the Remote MCP Service executes the sensitive operation.
-   - For public tier: Minimal validation
-   - For internal tier: Public key verification
-   - For confidential tier: Regex and AST validation
-   - For restricted tier: Secondary agent confirmation
-2. Cryptographic proofs (receipts) are generated, bound to the transactionId.
-3. Results and the complete proof chain are returned securely to the Local client.
-4. Local client validates the cryptographic receipts.
-5. Validation level and sensitivity tier are included in the audit trail.
+3. **Application Team**:
+   - Implements Local MCP Client integration
+   - Configures field mappings and classifications
+   - Develops business-specific integration logic
 
-### Handshake Termination:
-1. The Ephemeral Transaction Token is already invalidated/consumed.
-2. Operation receipt and audit logs are persisted.
-3. Remote service instance may return to hibernation.
-4. Secure connection related to the specific operation call is closed.
+### Transaction Execution Flow
 
-## Security Benefits
+1. **Authentication & Authorization**:
+   - User authenticates using standard OAuth/JWT flows
+   - Local MCP Client collects operation request details
+   - Client determines sensitivity tier for the requested operation
 
-### Zero Standing Privileges
-- No long-lived tokens grant direct access to sensitive operations.
-- The user's Session Token only grants the privilege to request a transaction authorization, not execute it.
-- The Ephemeral Transaction Token grants privilege only for the specifically authorized operation instance.
-- Principle of least privilege is enforced dynamically at the transaction level.
+2. **Handshake Phase 1: Request Authorization**:
+   - Local MCP Client sends request with tool name, parameters, tier metadata
+   - Remote MCP Service validates session token and user permissions
+   - Parameters are hashed to create a unique operation fingerprint
+   - Server generates transaction ID and ephemeral token with short expiry
+   - Token is cryptographically bound to the parameter hash
 
-### Isolated Contexts
-- Each handshake establishes an isolated security context for the specific transaction.
-- Compromise of one session token does not automatically grant execution rights.
-- Clear security boundaries between handshake participants and phases.
+3. **Handshake Phase 2: Execute Operation**:
+   - Local MCP Client immediately sends execution request with:
+     - Original parameters (will be re-hashed server-side for verification)
+     - Session token
+     - Ephemeral transaction token
+   - Remote MCP Service:
+     - Re-hashes parameters and verifies match with original hash
+     - Atomically consumes the token to prevent replay attacks
+     - Performs validation checks based on sensitivity tier:
+       - Tier 1-2: Basic input validation
+       - Tier 3: Pattern validation, AST validation
+       - Tier 4: Secondary confirmation agent validation
 
-### Reduced Attack Surface
-- Sensitive components only execute logic after successful validation of both session and ephemeral tokens.
-- Minimal network exposure of critical services; ephemeral tokens reduce the window for credential misuse.
-- Defense-in-depth through layered authentication (session + transaction).
-
-### Enhanced Audit Trail
-- Distinct transactionId for each authorized operation attempt.
-- Clear tracking of authorization requests, ephemeral token issuance, consumption attempts, and operation execution.
-- Detailed logs associate user identity, client, requested operation, parameters, and timing for each step.
-
-## Implementation Considerations
-
-### Tiered Access Control
-
-The architecture implements a tiered approach to API security based on metadata classification in the JSON header:
-
-1. **Public Tools**: 
-   - No authentication required
-   - Available to any client
-   - Lowest sensitivity level
-
-2. **Internal APIs**:
-   - Requires public key verification
-   - Basic security checks
-   - Medium-low sensitivity
-
-3. **Confidential APIs**:
-   - Requires Regex pattern validation
-   - Requires AST (Abstract Syntax Tree) validation for code execution
-   - Medium-high sensitivity
-   - May implement parameter sanitization
-
-4. **Restricted APIs**:
-   - Requires all previous validations
-   - Requires separate confirmation agent validation
-   - Employs a dual-agent approval system similar to the one described in agent(s).py
-   - Highest sensitivity level
-   - May implement additional waiting periods or human approval
-
-### Transaction-Bound Token Lifecycle
-- A two-phase protocol (authorize->execute) manages the lifecycle when required by policy.
-- Ephemeral Transaction Tokens are typically nonces or opaque strings whose state is managed server-side.
-- State must include bindings to transactionId, userId, targetTool, paramsHash, sensitivity tier, and a short expiry.
-- Atomic Consumption upon validation is the primary revocation mechanism, preventing replays.
-- Parameter hashing ensures the token cannot be reused for the same tool with different inputs.
+4. **Operation Execution & Response**:
+   - Target API operation proceeds only after all validations succeed
+   - Execution is logged with complete audit trail
+   - Results and cryptographic proof receipts returned to client
+   - State Store maintains record of consumed token
