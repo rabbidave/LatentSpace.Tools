@@ -1,4 +1,4 @@
-```markdown
+
 # Policy-Driven ModernBERT & ColBERT Classification Service
 
 This script provides a command-line interface and a RESTful API service implementing **graduated controls** for data validation and classification based on predefined API sensitivity levels. It leverages two types of models:
