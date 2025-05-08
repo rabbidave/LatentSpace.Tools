@@ -11,7 +11,7 @@ A self-installing CLI/Python tool that:
 """
 
 import os
-os.environ['HF_TOKEN'] = 'hf_realvaluehere' # Placeholder for Hugging Face Token
+os.environ['HF_TOKEN'] = 'hf_insert_token' # Placeholder for Hugging Face Token
 import sys
 import venv
 import json
@@ -506,22 +506,31 @@ class ColBERTReranker:
                 torch.save(self.reference_token_embeddings_by_class, embeddings_path); logger.info(f"Saved ColBERT ref embs to {embeddings_path}")
             except Exception as e: logger.error(f"Failed save ColBERT ref embs: {e}", exc_info=True)
 
-    def _get_token_embeddings_batched(self, texts: List[str], batch_size: int = 32) -> List[torch.Tensor]:
+    def _get_token_embeddings_batched(self, texts: List[str], batch_size: int = 32, enable_grad: bool = False) -> List[torch.Tensor]:
         if not self.tokenizer or not self.model: raise RuntimeError("ColBERT model/tokenizer not ready.")
-        all_embs_gpu = []; self.model.eval()
-        for i in tqdm(range(0, len(texts), batch_size), desc="Tokenizing & Embedding ColBERT Batches", leave=False):
-            batch_texts = texts[i:i+batch_size]
-            inputs = self.tokenizer(batch_texts, padding=True, truncation=True, return_tensors="pt", max_length=self.DEFAULT_MAX_LENGTH).to(self.device)
-            with torch.no_grad(): outputs = self.model(**inputs).last_hidden_state
-            for j in range(outputs.size(0)):
-                all_embs_gpu.append(outputs[j][inputs['attention_mask'][j] == 1])
+        all_embs_gpu = []
+        # Model train/eval state should be managed by the caller.
+
+        context_manager = torch.enable_grad() if enable_grad else torch.no_grad()
+
+        with context_manager:
+            for i in tqdm(range(0, len(texts), batch_size), desc="Tokenizing & Embedding ColBERT Batches", leave=False):
+                batch_texts = texts[i:i+batch_size]
+                inputs = self.tokenizer(batch_texts, padding=True, truncation=True, return_tensors="pt", max_length=self.DEFAULT_MAX_LENGTH).to(self.device)
+                outputs = self.model(**inputs).last_hidden_state
+                for j in range(outputs.size(0)):
+                    all_embs_gpu.append(outputs[j][inputs['attention_mask'][j] == 1])
         return all_embs_gpu
 
-    def _colbert_maxsim(self, query_embs: torch.Tensor, doc_embs: torch.Tensor) -> float:
-        if query_embs.ndim != 2 or doc_embs.ndim != 2 or query_embs.size(0) == 0 or doc_embs.size(0) == 0: return 0.0
+    def _colbert_maxsim(self, query_embs: torch.Tensor, doc_embs: torch.Tensor) -> torch.Tensor:
+        if query_embs.ndim != 2 or doc_embs.ndim != 2 or query_embs.size(0) == 0 or doc_embs.size(0) == 0:
+            # Ensure a tensor is returned, matching dtype and device if possible
+            dtype_to_use = query_embs.dtype if query_embs.numel() > 0 else (doc_embs.dtype if doc_embs.numel() > 0 else torch.float32)
+            device_to_use = self.device if self.device else 'cpu'
+            return torch.tensor(0.0, device=device_to_use, dtype=dtype_to_use)
         q_dev, d_dev = query_embs.to(self.device), doc_embs.to(self.device) # Ensure on correct device
         sim_matrix = torch.matmul(F.normalize(q_dev, p=2, dim=1), F.normalize(d_dev, p=2, dim=1).T)
-        return torch.sum(torch.max(sim_matrix, dim=1)[0]).item()
+        return torch.sum(torch.max(sim_matrix, dim=1)[0])
 
     def classify_text(self, text: str) -> Dict[str, Any]:
         if not self.model or not self.reference_token_embeddings_by_class: raise RuntimeError("ColBERT not setup.")
@@ -530,7 +539,7 @@ class ColBERTReranker:
         scores = {}
         for cls, ref_embs_list_cpu in self.reference_token_embeddings_by_class.items():
             if not ref_embs_list_cpu: scores[cls] = 0.0; continue
-            scores[cls] = sum(self._colbert_maxsim(query_embs_gpu, ref_cpu.to(self.device)) for ref_cpu in ref_embs_list_cpu) / len(ref_embs_list_cpu)
+            scores[cls] = (sum(self._colbert_maxsim(query_embs_gpu, ref_cpu.to(self.device)) for ref_cpu in ref_embs_list_cpu) / len(ref_embs_list_cpu)).item()
         pred_cls = max(scores, key=scores.get) if scores else "N/A"
         return {"input_text": text, "predicted_class": pred_cls, 
                 "class_description": self.CLASS_DESCRIPTIONS.get(pred_cls, "N/A"),
@@ -567,19 +576,52 @@ class ColBERTReranker:
             for anchor_txts, pos_txts, neg_txts in prog_bar:
                 if stop_signal_received: logger.info("ColBERT fine-tuning interrupted."); break
                 optimizer.zero_grad()
-                all_embs = self._get_token_embeddings_batched(anchor_txts + pos_txts + neg_txts, batch_size=len(anchor_txts)*3)
+                all_embs = self._get_token_embeddings_batched(anchor_txts + pos_txts + neg_txts, batch_size=len(anchor_txts)*3, enable_grad=True)
                 n = len(anchor_txts)
                 anc_e, pos_e, neg_e = all_embs[:n], all_embs[n:2*n], all_embs[2*n:]
                 
-                current_batch_loss_val = 0
-                for i in range(n):
-                    loss = F.relu(triplet_margin - self._colbert_maxsim(anc_e[i], pos_e[i]) + self._colbert_maxsim(anc_e[i], neg_e[i]))
-                    loss.backward() # Accumulate gradients
-                    current_batch_loss_val += loss.item()
+                # Initialize accumulated loss for the batch
+                accumulated_batch_loss_tensor = torch.tensor(0.0, device=self.device, requires_grad=True)
+                actual_triplets_in_batch = 0 # Count valid triplets processed in this batch
+                current_batch_sum_loss_item = 0.0 # For logging
+
+                for i in range(n): # n is len(anchor_txts)
+                    current_anchor_emb = anc_e[i]
+                    current_pos_emb = pos_e[i]
+                    current_neg_emb = neg_e[i]
+
+                    if current_anchor_emb.size(0) == 0 or \
+                       current_pos_emb.size(0) == 0 or \
+                       current_neg_emb.size(0) == 0:
+                        logger.debug(f"Skipping triplet {i} in batch due to empty embeddings for anchor, positive, or negative text.")
+                        continue
+
+                    score_pos = self._colbert_maxsim(current_anchor_emb, current_pos_emb)
+                    score_neg = self._colbert_maxsim(current_anchor_emb, current_neg_emb)
+                    
+                    loss_value_before_relu = triplet_margin - score_pos + score_neg
+                    triplet_loss = F.relu(loss_value_before_relu)
+                    
+                    # Accumulate loss for the batch
+                    if actual_triplets_in_batch == 0: # First valid triplet
+                        accumulated_batch_loss_tensor = triplet_loss
+                    else:
+                        accumulated_batch_loss_tensor = accumulated_batch_loss_tensor + triplet_loss
+                    
+                    current_batch_sum_loss_item += triplet_loss.item()
+                    actual_triplets_in_batch += 1
                 
-                optimizer.step()
-                total_loss += current_batch_loss_val / n
-                prog_bar.set_postfix({'loss': current_batch_loss_val / n})
+                if actual_triplets_in_batch > 0:
+                    mean_batch_loss = accumulated_batch_loss_tensor / actual_triplets_in_batch
+                    mean_batch_loss.backward() # Backward pass on the mean loss for the batch
+                    optimizer.step() # Step optimizer after gradients are computed for the batch
+                    
+                    avg_loss_item_for_log = current_batch_sum_loss_item / actual_triplets_in_batch
+                    total_loss += avg_loss_item_for_log # Accumulate epoch total loss (sum of batch averages)
+                    prog_bar.set_postfix({'loss': avg_loss_item_for_log})
+                else:
+                    # If all triplets in the batch were skipped, no optimizer step
+                    prog_bar.set_postfix({'loss': 0.0, 'skipped_batch': True})
             if stop_signal_received: break
             logger.info(f"ColBERT Epoch {epoch+1} avg loss: {total_loss/len(dataloader) if dataloader else 0:.4f}")
         
