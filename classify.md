@@ -7,14 +7,14 @@ This document describes a command-line interface (CLI) and RESTful API service d
 
 The service's core strength lies in its **policy enforcement layer**. This layer intelligently combines these checks based on an API's designated "API Class" (e.g., Class1 to Class5), allowing for flexible and robust data governance.
 
-The tool is self-installing, creating a Python virtual environment (`.venv_policy_classifier_service`) with all necessary dependencies on its first run.
+The tool is self-installing, creating a Python venv (`.venv_policy_classifier_service`) with all necessary dependencies on its first run.
 
 ## Why This Tool?
 
 * **Graduated Controls:** Implement precise validation policies tailored to the sensitivity of different APIs.
 * **Input-Output Coherence:** Ensure API responses are relevant and appropriate for the requests they serve using ModernBERT.
-* **Data Detection:** Identify potentially sensitive data (PII, confidential info) in inputs or outputs using ColBERT before it's mishandled.
-* __Per-API Policy Management:__ Define and manage data validation rules in one place (`API_CLASSIFICATION_REQUIREMENTS`).
+* **Automated Sensitivity Detection:** Identify potentially sensitive data (PII, confidential info) in inputs or outputs using ColBERT before it's mishandled.
+* __Centralized Policy Management:__ Define and manage data validation rules in one place (`API_CLASSIFICATION_REQUIREMENTS`).
 * **Extensible Model Framework:** Fine-tune both ModernBERT and ColBERT models for domain-specific accuracy.
 * **Self-Contained & Easy Setup:** Automatic virtual environment creation simplifies deployment and dependency management.
 
@@ -40,21 +40,6 @@ It's important to note that ModernBERT can also be trained as a **single-text bi
 * **Models:**
    * **Base ColBERT:** Uses a pre-trained model (e.g., `lightonai/GTE-ModernColBERT-v1`) with built-in or custom-provided reference examples.
    * **Fine-tuned ColBERT:** The base ColBERT model can be further fine-tuned on your specific reference examples for improved domain-specific accuracy.
-
-   ```json
-  {
-  "input_text": "My SSN is 123-45-6789.",
-  "predicted_class": "Class 1: PII",
-  "class_description": "Most sensitive...",
-  "scores_by_class (avg_maxsim)": {
-    "Class 1: PII": 9.662119388580322,
-    "Class 2: Sensitive Personal Data": 8.076715469360352,
-    "Class 3: Confidential Personal Data": 8.788877487182617,
-    "Class 4: Internal Data": 8.027799129486084,
-    "Class 5: Public Data": 8.07073450088501
-  }
-
-   ```   
 
 ### 3. The Policy Enforcement Layer & API Classification
 
@@ -213,6 +198,14 @@ python Classify.py predict-modernbert \
 ### 2. ColBERT: Data Sensitivity Classification
 
 **a. Classify Sensitivity with Base ColBERT (CLI):**
+**Windows Note:** When using text with spaces or special characters, use PowerShell escaping:
+```powershell
+python Classify.py classify-colbert --text-to-classify '\"Text with spaces & special chars\"' ...
+```
+Or pass text via file:
+```powershell
+python Classify.py classify-colbert --text-to-classify (Get-Content input.txt -Raw) ...
+```
 (Command: `classify-colbert`)
 Use a pre-trained ColBERT model with either built-in sensitivity reference examples or your own.
 
