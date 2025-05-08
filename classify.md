@@ -13,7 +13,7 @@ The tool is self-installing, creating a Python venv (`.venv_policy_classifier_se
 
 * **Graduated Controls:** Implement precise validation policies tailored to the sensitivity of different APIs.
 * **Input-Output Coherence:** Ensure API responses are relevant and appropriate for the requests they serve using ModernBERT.
-* **Automated Sensitivity Detection:** Identify potentially sensitive data (PII, confidential info) in inputs or outputs using ColBERT before it's mishandled.
+* **Data Detection:** Identify potentially sensitive data (PII, confidential info) in inputs or outputs using ColBERT before it's mishandled.
 * __Centralized Policy Management:__ Define and manage data validation rules in one place (`API_CLASSIFICATION_REQUIREMENTS`).
 * **Extensible Model Framework:** Fine-tune both ModernBERT and ColBERT models for domain-specific accuracy.
 * **Self-Contained & Easy Setup:** Automatic virtual environment creation simplifies deployment and dependency management.
