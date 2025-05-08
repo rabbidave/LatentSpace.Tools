@@ -1,154 +1,46 @@
+# Classification as a (Self-Installing) Service
+### Policy-Driven DLP via ModernBERT & ColBERT
 
-# Policy-Driven ModernBERT & ColBERT Classification Service
+This document describes a command-line interface (CLI) and RESTful API service designed to enforce data handling policies through **graduated controls**. It uses two specialized transformer models to validate and classify text data based on predefined API sensitivity levels:
 
-This script provides a command-line interface and a RESTful API service implementing **graduated controls** for data validation and classification based on predefined API sensitivity levels. It leverages two types of models:
+1.  **ModernBERT for Input-Output Validation:** Leverages fine-tuned `answerdotai/ModernBERT-base` models to determine if an API's `output_text` is an appropriate response to a given `input_text`. This is crucial for ensuring response relevance, adherence to formats, or content guidelines.
+2.  **ColBERT for Data Sensitivity Classification:** Employs `lightonai/GTE-ModernColBERT-v1` (base or fine-tuned) to classify the sensitivity of text (e.g., PII, Sensitive, Confidential). It achieves this by comparing text token embeddings against reference examples using the MaxSim (maximum similarity) technique.
 
-1.  **ModernBERT Binary Classification:** Fine-tuned models (`answerdotai/ModernBERT-base` base) validate if an `output_text` is appropriate for a given `input_text`. Useful for ensuring API responses match requests or adhere to specific formats/content rules.
-2.  **ColBERT Data Sensitivity Classification:** Models (`lightonai/GTE-ModernColBERT-v1` base, optionally fine-tuned) classify the sensitivity of a given text (e.g., PII, Sensitive, Confidential) by comparing its token embeddings against reference examples using the MaxSim technique.
+The service's core strength lies in its **policy enforcement layer**. This layer intelligently combines these checks based on an API's designated "API Class" (e.g., Class1 to Class5), allowing for flexible and robust data governance.
 
-The core feature is the **policy enforcement layer** that applies different combinations of these checks based on an API's designated classification level (Class1 to Class5).
+The tool is self-installing, creating a Python virtual environment (`.venv_policy_classifier_service`) with all necessary dependencies on its first run.
 
-The tool is self-installing, creating a Python virtual environment (`.venv_policy_classifier_service`) with all necessary dependencies.
+## Why This Tool?
 
-## Features
+*   **Graduated Controls:** Implement precise validation policies tailored to the sensitivity of different APIs.
+*   **Input-Output Coherence:** Ensure API responses are relevant and appropriate for the requests they serve using ModernBERT.
+*   **Automated Sensitivity Detection:** Identify potentially sensitive data (PII, confidential info) in inputs or outputs using ColBERT before it's mishandled.
+*   **Centralized Policy Management:** Define and manage data validation rules in one place (`API_CLASSIFICATION_REQUIREMENTS`).
+*   **Extensible Model Framework:** Fine-tune both ModernBERT and ColBERT models for domain-specific accuracy.
+*   **Self-Contained & Easy Setup:** Automatic virtual environment creation simplifies deployment and dependency management.
 
-*   **Graduated Controls:** Enforces validation policies based on API classification (`API_CLASSIFICATION_REQUIREMENTS`).
-*   **ModernBERT:**
-    *   Fine-tune for specific input-output pair validation tasks.
-    *   Save/load fine-tuned models.
-    *   CLI for direct pair prediction.
-*   **ColBERT Data Sensitivity:**
-    *   Classify text sensitivity using a base model + built-in/custom references.
-    *   Fine-tune the ColBERT model on custom references for improved accuracy.
-    *   Save/load fine-tuned ColBERT models + associated data.
-    *   CLI for direct sensitivity classification.
-    *   Caching of reference embeddings.
-*   **Policy-Driven API Server:**
-    *   Primary endpoint (`/service/validate`) applies controls based on `api_class`.
-    *   Loads required ModernBERT, base ColBERT, and fine-tuned ColBERT models.
-    *   Returns detailed validation results and overall pass/reject status.
-*   **Utilities:**
-    *   Hardware check.
-    *   Example data generation.
+## Core Components & Concepts
 
-## Setup
+### 1. ModernBERT: Input-Output Validation
 
-The script manages its own virtual environment. Run any command to trigger setup if needed.
+*   **Purpose:** To validate if an `output_text` is a "good" or "appropriate" response given an `input_text`.
+*   **How it Works:** A binary classifier fine-tuned on examples of good and bad input-output pairs.
+*   **Use Case:** Ensuring chatbot responses are relevant, API outputs match expected formats, or preventing undesirable content generation.
 
-```bash
-# Example: Show help (will trigger venv setup)
-python Classify.py --help
+### 2. ColBERT: Data Sensitivity Classification
 
-```
+*   **Purpose:** To classify a piece of text into predefined sensitivity categories (e.g., PII, Confidential, Public).
+*   **How it Works:**
+    *   Generates token-level embeddings for the input text and for a set of reference texts representing each sensitivity class.
+    *   Uses the **MaxSim** technique: For each token in the input text, it finds the maximum similarity score against all tokens in a reference document's embeddings. These per-token maximums are summed to get a query-document score.
+    *   The input text is assigned the class of the reference set it scores highest against.
+*   **Use Case:** Detecting PII in user queries, classifying the sensitivity of generated API responses, ensuring data is handled according to its classification.
+*   **Models:**
+    *   **Base ColBERT:** Uses a pre-trained model (e.g., `lightonai/GTE-ModernColBERT-v1`) with built-in or custom-provided reference examples.
+    *   **Fine-tuned ColBERT:** The base ColBERT model can be further fine-tuned on your specific reference examples for improved domain-specific accuracy.
 
-## Core Concepts
-
-### API Classification Requirements
-
-The heart of the graduated controls is the `API_CLASSIFICATION_REQUIREMENTS` dictionary defined within the script. It maps API classes (e.g., "Class1", "Class2") to specific validation requirements:
-
-* `modernbert_io_validation`: (Boolean) Whether to validate the (input, output) pair using a fine-tuned ModernBERT model.
-* `colbert_input_sensitivity`: (Boolean) Whether to classify the sensitivity of the input text using ColBERT.
-* `colbert_output_sensitivity`: (Boolean) Whether to classify the sensitivity of the output text using ColBERT.
-* `require_colbert_fine_tuned`: (Boolean) If ColBERT checks are enabled, does the policy _require_ a fine-tuned ColBERT model (True), or is the base ColBERT model acceptable (False)?
-
-### Model Roles
-
-* __ModernBERT:__ Used when `modernbert_io_validation` is `True`. Requires a model fine-tuned on relevant good/bad examples for the API context.
-* __ColBERT (Base or Fine-tuned):__ Used when `colbert_input_sensitivity` or `colbert_output_sensitivity` is `True`.
-   * If `require_colbert_fine_tuned` is `False`, the service will use the configured base ColBERT model (default `lightonai/GTE-ModernColBERT-v1`) with either built-in references or custom ones provided via JSONL during setup.
-   * If `require_colbert_fine_tuned` is `True`, the service _must_ be configured with the path to a directory containing a ColBERT model fine-tuned using the `finetune-colbert` command.
-
-## CLI Usage
-
-Use `python Classify.py <command> --help` for details.
-
-### 1. ModernBERT Fine-tuning and Prediction
-
-**a. Train a ModernBERT Model:**
-(Command: `train`)
-
-```bash
-python Classify.py train \
-    --data-path path/to/your/training_data.jsonl \
-    --model-dir models/my_modernbert_validator \
-    # ... other training args ...
-
-```
-
-**b. Predict with ModernBERT Directly (CLI):**
-(Command: `predict-modernbert`)
-
-```bash
-python Classify.py predict-modernbert \
-    --model-dir models/my_modernbert_validator \
-    --input-text "Input Query" \
-    --output-to-classify "Generated Response"
-
-```
-
-### 2. ColBERT Sensitivity Classification & Fine-tuning
-
-**a. Classify Sensitivity using Base ColBERT (CLI):**
-(Command: `classify-colbert`)
-
-```bash
-# Using built-in references
-python Classify.py classify-colbert \
-    --text-to-classify "My SSN is 123-45-6789." \
-    --cache-dir ./colbert_cache
-
-# Using custom references
-python Classify.py classify-colbert \
-    --text-to-classify "help@example.com" \
-    --custom-reference-jsonl path/to/custom_refs.jsonl \
-    --colbert-base-model-id-or-dir lightonai/GTE-ModernColBERT-v1 \
-    --cache-dir ./colbert_cache
-
-```
-
-**b. Fine-tune a ColBERT Model:**
-(Command: `finetune-colbert`)
-
-```bash
-python Classify.py finetune-colbert \
-    --reference-jsonl path/to/custom_refs.jsonl \
-    --output-model-dir models/my_finetuned_colbert \
-    # ... other fine-tuning args ...
-
-```
-
-**c. Classify Sensitivity using Fine-tuned ColBERT (CLI):**
-(Command: `classify-colbert`)
-
-```bash
-python Classify.py classify-colbert \
-    --text-to-classify "Internal project code: Phoenix" \
-    --colbert-model-dir models/my_finetuned_colbert
-    # Fine-tuned model dir implies using its specific references
-
-```
-
-### Example Classification Output
-
-Here is an example of the output from the `classify-colbert` command:
-
-```json
-{
-  "input_text": "This is a test sentence.",
-  "predicted_class": "Class 4: Internal Data",
-  "class_description": "Company non-public...",
-  "scores_by_class (avg_maxsim)": {
-    "Class 1: PII": 5.612870454788208,
-    "Class 2: Sensitive Personal Data": 5.708996772766113,
-    "Class 3: Confidential Personal Data": 5.620632171630859,
-    "Class 4: Internal Data": 5.821521043777466,
-    "Class 5: Public Data": 5.6775946617126465
-  }
-}
-```
-```json
-{
+   ```json
+  {
   "input_text": "My SSN is 123-45-6789.",
   "predicted_class": "Class 1: PII",
   "class_description": "Most sensitive...",
@@ -159,116 +51,276 @@ Here is an example of the output from the `classify-colbert` command:
     "Class 4: Internal Data": 8.027799129486084,
     "Class 5: Public Data": 8.07073450088501
   }
-}
+
+   ```
+
+### 3. The Policy Enforcement Layer & API Classification
+
+The service's intelligence resides in the `API_CLASSIFICATION_REQUIREMENTS` dictionary (defined within `Classify.py`). This configuration maps an `api_class` (a string like "Class1", "Class2", etc., that you assign to your APIs) to a specific set of validation rules:
+
+*   `modernbert_io_validation` (Boolean): If `True`, the (input_text, output_text) pair will be validated by a fine-tuned ModernBERT model.
+*   `colbert_input_sensitivity` (Boolean): If `True`, the `input_text` will be classified for sensitivity using ColBERT.
+*   `colbert_output_sensitivity` (Boolean): If `True`, the `output_text` will be classified for sensitivity using ColBERT.
+*   `require_colbert_fine_tuned` (Boolean):
+    *   If `True` (and ColBERT checks are enabled): The policy *demands* a fine-tuned ColBERT model.
+    *   If `False` (and ColBERT checks are enabled): The base ColBERT model (with appropriate references) is acceptable.
+
+**This policy-driven approach is the primary way to use the service for comprehensive validation.**
+
+## Setup
+
+The script manages its own Python virtual environment. Simply run any command, and the script will automatically create (`.venv_policy_classifier_service`), activate, and install dependencies if it's the first time or if it's not running in the venv. It may restart itself to ensure it's operating within the correct environment.
+
+```bash
+# Example: Show help (this will trigger the venv setup if needed)
+python Classify.py --help
 ```
 
-### 4. API Server
+## Using the Policy-Driven Service (Primary API)
 
-(Command: `serve-policy-api`)
-Starts the API server, loading the specified models to enforce policies.
+The main interaction point for policy-based validation is the `/service/validate` API endpoint.
+
+*   **Endpoint:** `POST /service/validate`
+*   **Purpose:** To apply graduated controls based on the provided `api_class`.
+*   **Request Body (JSON):**
+
+    ```json
+    {
+      "api_class": "Class1", // Required. Your API's classification level.
+      "input_text": "The user's input to the original API.", // Required.
+      "output_text": "The API's generated response." // Optional, but required if policy involves output checks.
+    }
+    ```
+
+*   **Server Configuration:** When starting the policy service (using the `serve-policy-api` command, detailed later), you'll need to provide paths to:
+    *   A fine-tuned ModernBERT model (if any policy uses `modernbert_io_validation`).
+    *   A base ColBERT model ID (can be default) or path.
+    *   Optionally, a fine-tuned ColBERT model directory (if any policy uses `require_colbert_fine_tuned: true`).
+    *   Optionally, custom reference examples for the base ColBERT model.
+
+*   **Response Body (JSON):** The response details the checks performed and the overall outcome.
+    *   `request`: An echo of the input request.
+    *   `policy_applied`: The specific policy rules fetched from `API_CLASSIFICATION_REQUIREMENTS` for the given `api_class`.
+    *   `modernbert_io_validation`: Result from ModernBERT if run (prediction, probability, etc.), or a status if skipped/error.
+    *   `colbert_input_sensitivity`: Result from ColBERT on input text if run (predicted class, scores, etc.), or a status.
+    *   `colbert_output_sensitivity`: Result from ColBERT on output text if run.
+    *   `overall_status`:
+        *   `"PASS"`: All required checks performed and passed.
+        *   `"REJECT_POLICY_VIOLATION"`: A required check failed (e.g., ModernBERT inappropriate, or sensitive data detected where forbidden).
+        *   `"REJECT_INVALID_POLICY"`: The `api_class` was not found.
+        *   `"ERROR"`: Internal processing error (e.g., a required model was not loaded).
+
+*   **Example Response Snippet:**
+
+    ```json
+    {
+      "request": {
+        "api_class": "Class2",
+        "input_text": "What is my address?",
+        "output_text": "123 Main St"
+      },
+      "policy_applied": {
+        "description": "Highly restricted APIs...", // Example field in policy
+        "modernbert_io_validation": true,
+        "colbert_input_sensitivity": true,
+        "colbert_output_sensitivity": true,
+        "require_colbert_fine_tuned": false
+      },
+      "modernbert_io_validation": {
+        "prediction": 1, // Assuming 1 is 'appropriate'
+        "probability_positive": 0.95
+        // ... other ModernBERT details
+      },
+      "colbert_input_sensitivity": {
+        "predicted_class": "Class5_Public", // Input was non-sensitive
+        // ... other ColBERT details
+      },
+      "colbert_output_sensitivity": {
+        "predicted_class": "Class2_SensitivePersonal", // Output was sensitive
+        // ... other ColBERT details
+      },
+      "overall_status": "REJECT_POLICY_VIOLATION" // Rejected because sensitive output violated policy for Class2
+    }
+    ```
+
+*   **Testing the `/service/validate` Endpoint:**
+
+    Use tools like `curl` or PowerShell's `Invoke-RestMethod`. (Ensure the server is running via the `serve-policy-api` command).
+
+    **Using curl (Linux/macOS/WSL):**
+    ```bash
+    curl -X POST -H "Content-Type: application/json" \
+    -d '{
+      "api_class": "Class2",
+      "input_text": "What is my name?",
+      "output_text": "Your name is John Doe."
+    }' http://localhost:5000/service/validate
+    ```
+
+    **Using PowerShell:**
+    ```powershell
+    $body = @{
+        api_class = "Class2"
+        input_text = "What is my name?"
+        output_text = "Your name is John Doe."
+    } | ConvertTo-Json
+
+    Invoke-RestMethod -Uri http://localhost:5000/service/validate -Method Post -ContentType "application/json" -Body $body
+    ```
+
+## Model-Specific Operations & Fine-Tuning (CLI)
+
+Beyond the policy service, you can directly train, fine-tune, and test the ModernBERT and ColBERT models using the CLI. Use `python Classify.py <command> --help` for detailed options.
+
+### 1. ModernBERT: Input-Output Validation
+
+**a. Train a ModernBERT Model:**
+(Command: `train`)
+You need a `.jsonl` file where each line is a JSON object, typically with `{"input": "...", "output_good_sample": "...", "output_bad_sample": "..."}` to teach the model what's appropriate.
+
+```bash
+python Classify.py train \
+    --data-path path/to/your/training_data.jsonl \
+    --model-dir models/my_modernbert_validator \
+    # ... other training arguments like --epochs, --learning-rate ...
+```
+
+**b. Predict with a Trained ModernBERT (CLI):**
+(Command: `predict-modernbert`)
+Test your fine-tuned ModernBERT model directly.
+
+```bash
+python Classify.py predict-modernbert \
+    --model-dir models/my_modernbert_validator \
+    --input-text "User Query: Tell me a joke." \
+    --output-to-classify "Response: I am a large language model."
+```
+
+### 2. ColBERT: Data Sensitivity Classification
+
+**a. Classify Sensitivity with Base ColBERT (CLI):**
+(Command: `classify-colbert`)
+Use a pre-trained ColBERT model with either built-in sensitivity reference examples or your own.
+
+```bash
+# Using built-in references (PII, Sensitive, Confidential, etc.)
+python Classify.py classify-colbert \
+    --text-to-classify "My social security number is 123-45-6789." \
+    --cache-dir ./colbert_cache # Caches embeddings for faster subsequent runs
+
+# Using custom references from a JSONL file
+# custom_refs.jsonl: {"text": "example of TypeA data", "class_name": "MyCustomClassA"} (one per line)
+python Classify.py classify-colbert \
+    --text-to-classify "user@company.com is an internal email." \
+    --custom-reference-jsonl path/to/custom_refs.jsonl \
+    --colbert-base-model-id-or-dir lightonai/GTE-ModernColBERT-v1 \
+    --cache-dir ./colbert_cache
+```
+
+**b. Fine-tune a ColBERT Model:**
+(Command: `finetune-colbert`)
+Improve sensitivity classification for your specific data by fine-tuning ColBERT on your reference examples. The reference JSONL should contain texts mapped to your defined sensitivity classes.
+
+```bash
+python Classify.py finetune-colbert \
+    --reference-jsonl path/to/your_sensitivity_references.jsonl \
+    --output-model-dir models/my_finetuned_colbert \
+    # ... other fine-tuning arguments like --epochs, --learning-rate ...
+```
+
+**c. Classify Sensitivity with Fine-tuned ColBERT (CLI):**
+(Command: `classify-colbert`)
+When you provide a directory containing a fine-tuned ColBERT model, it automatically uses the references it was fine-tuned on.
+
+```bash
+python Classify.py classify-colbert \
+    --text-to-classify "Project Dragonfire is our secret internal project." \
+    --colbert-model-dir models/my_finetuned_colbert
+    # No need for --custom-reference-jsonl; it's part of the fine-tuned model package.
+```
+
+## Starting the API Server(s)
+
+There are two ways to serve models:
+1.  **Policy-Driven Service (Recommended for main use):** Command `serve-policy-api`.
+2.  **Direct Model Service (For testing individual models):** Command `serve`.
+
+### `serve-policy-api` (Primary Service Endpoint)
+
+This command starts the API server exposing the `/service/validate` endpoint. You must configure it with paths to the models required by your policies.
 
 ```bash
 python Classify.py serve-policy-api \
-    --modernbert-model-dir models/my_modernbert_validator \
-    --colbert-base-model-id-or-dir lightonai/GTE-ModernColBERT-v1 \
-    --colbert-finetuned-model-dir models/my_finetuned_colbert \
-    --port 5000 \
-    # --colbert-custom-ref-jsonl-for-base path/to/custom_refs.jsonl # If base needs custom refs
-    # --colbert-cache-dir ./api_cache # For base model + custom refs cache
-    # --dev-server # For development
-
+    --modernbert-model-dir path/to/your/fine-tuned_modernbert \
+    --colbert-base-model-id-or-dir lightonai/GTE-ModernColBERT-v1 \ # Or path to a local base model
+    # Optional: if your policies require a fine-tuned ColBERT
+    --colbert-fine-tuned-model-dir path/to/your/fine-tuned_colbert \
+    # Optional: if using base ColBERT with custom references not bundled with a fine-tuned model
+    --colbert-custom-ref-jsonl path/to/base_colbert_custom_refs.jsonl \
+    --colbert-cache-dir ./api_colbert_cache \
+    --port 5000
 ```
 
-### 5. Utilities
+### `serve` (Direct Model Endpoints)
 
-**a. Create Example Files:**
+This command can start a server exposing individual model endpoints like `/modernbert/classify` and `/colbert/classify_sensitivity`. Useful for direct testing or simpler use cases not requiring the full policy layer.
+
+```bash
+# Example: Serve only a ModernBERT model
+python Classify.py serve --modernbert-model-dir models/my_modernbert_validator
+
+# Example: Serve only a ColBERT model (fine-tuned)
+python Classify.py serve --serve-colbert-sensitivity --colbert-model-id-or-dir models/my_finetuned_colbert
+
+# Example: Serve both, with ColBERT using base model + custom refs
+python Classify.py serve \
+    --modernbert-model-dir models/my_modernbert_validator \
+    --serve-colbert-sensitivity \
+    --colbert-model-id-or-dir lightonai/GTE-ModernColBERT-v1 \
+    --colbert-custom-ref-jsonl path/to/custom_refs.jsonl \
+    --colbert-cache-dir ./colbert_cache
+```
+
+## Utilities
+
+**a. Create Example Data Files:**
 (Command: `create-example`)
+Generates sample JSONL files for ModernBERT training and ColBERT custom references.
 
 ```bash
 python Classify.py create-example --output-dir ./my_classifier_examples
-
+# This will create:
+# ./my_classifier_examples/sample_modernbert_training.jsonl
+# ./my_classifier_examples/sample_colbert_references.jsonl
 ```
 
 **b. Check Hardware:**
 (Command: `check-hardware`)
+Displays information about available hardware (CPU/GPU, PyTorch, Transformers version).
 
 ```bash
 python Classify.py check-hardware
-
-```
-
-## Policy-Driven API Endpoint
-
-The primary way to interact with the service for graduated controls is via the `/service/validate` endpoint.
-
-* **Endpoint:** `POST /service/validate`
-
-* **Request Body (JSON):**
-
-```json
-{
-  "api_class": "Class1", // Or "Class2", "Class3", etc. Required.
-  "input_text": "The user's input to the original API.", // Required.
-  "output_text": "The API's generated response." // Optional, but needed if policy requires output checks.
-}
-
-```
-
-* **Response Body (JSON):**
-   * `request`: Echos the input request fields.
-   * `policy_applied`: The dictionary from `API_CLASSIFICATION_REQUIREMENTS` for the requested `api_class`.
-   * `modernbert_io_validation`: (Object | Null) Result from `ModernBERTClassifier.classify_input_output_pair` if the check was run. Contains `prediction`, `probability_positive`, etc., or `status`/`reason` if skipped/error.
-   * `colbert_input_sensitivity`: (Object | Null) Result from `ColBERTReranker.classify_text` on the input if the check was run. Contains `predicted_class`, `scores_by_class`, etc., or `status`/`reason`.
-   * `colbert_output_sensitivity`: (Object | Null) Result from `ColBERTReranker.classify_text` on the output if the check was run.
-   * `overall_status`: (String)
-      * `"PASS"`: All required checks were performed and passed according to basic policy rules (e.g., ModernBERT prediction != 0, critical sensitivity classes not detected where forbidden).
-      * `"REJECT_POLICY_VIOLATION"`: A required check failed (e.g., ModernBERT predicted 0, sensitive data detected).
-      * `"REJECT_INVALID_POLICY"`: The provided `api_class` was not found.
-      * `"ERROR"`: An internal error occurred during processing (e.g., required model not loaded).
-
-* **Example Response Snippet:**
-
-```json
-{
-  "request": {
-    "api_class": "Class2",
-    "input_text": "What is my address?",
-    "output_text": "123 Main St"
-  },
-  "policy_applied": {
-    "description": "Highly restricted APIs...",
-    "modernbert_io_validation": true,
-    "colbert_input_sensitivity": true,
-    "colbert_output_sensitivity": true,
-    "require_colbert_fine_tuned": false
-  },
-  "modernbert_io_validation": {
-    "prediction": 1,
-    "probability_positive": 0.95, ...
-  },
-  "colbert_input_sensitivity": {
-    "predicted_class": "Class5_Public", ...
-  },
-  "colbert_output_sensitivity": {
-    "predicted_class": "Class2_SensitivePersonal", ...
-  },
-  "overall_status": "REJECT_POLICY_VIOLATION" // Rejected due to sensitive output
-}
-
 ```
 
 ## Directory Structure & Caching
 
-* __ModernBERT Models:__ Saved via `train --model-dir`. Contains standard Hugging Face model/tokenizer files + `model_config.json`.
-* __Fine-tuned ColBERT Models:__ Saved via `finetune-colbert --output-model-dir`. Contains model/tokenizer files + `colbert_reranker_config.json`, `reference_texts_snapshot.json`, `ref_embeddings.pt`.
-* __ColBERT Cache:__ Specified via `--cache-dir` or `--colbert-cache-dir`. Used to store pre-computed embeddings for _base_ ColBERT models when used with specific reference sets (built-in or custom JSONL). This avoids recomputing embeddings on each startup or CLI run. The structure might be like `./cache_dir/base_model_cache/<sanitized_model_name>/ref_embeddings.pt`.
+*   **Fine-tuned ModernBERT Models (`--model-dir` for `train`):**
+    *   Contains standard Hugging Face model files (`pytorch_model.bin`, `config.json`, etc.) and tokenizer files.
+    *   Includes a `model_config.json` with tool-specific settings (e.g., separator token).
+*   **Fine-tuned ColBERT Models (`--output-model-dir` for `finetune-colbert`):**
+    *   Contains Hugging Face model and tokenizer files.
+    *   `colbert_reranker_config.json`: Metadata about the fine-tuning.
+    *   `reference_texts_snapshot.json`: A copy of the reference texts used for fine-tuning.
+    *   `ref_embeddings.pt`: Pre-computed embeddings for these reference texts.
+*   **ColBERT Cache (`--cache-dir` or `--colbert-cache-dir`):**
+    *   Used by **base** ColBERT models (when not using a fine-tuned ColBERT directory) to store pre-computed embeddings of reference texts (either built-in or from a `--custom-reference-jsonl`).
+    *   This avoids re-calculating embeddings on every run or server start.
+    *   Structure might be: `./your_cache_dir/sanitized_base_model_name/ref_embeddings.pt`.
 
-## Considerations
+## Important Considerations
 
-* **Model Loading:** The `serve-policy-api` command needs paths to potentially three different models (ModernBERT, base ColBERT, fine-tuned ColBERT). Ensure the correct paths are provided based on the policies you intend to support.
-* __Policy Logic:__ The current `validate_interaction` implements basic checks (ModernBERT prediction=0 -> reject, sensitive class detection -> reject). More complex rejection logic based on combinations of results might be needed for specific use cases.
-* **Resource Usage:** Loading multiple large language models requires significant RAM/VRAM.
+*   **Model Loading for Policy Service:** The `serve-policy-api` command is flexible. You only need to provide paths for models that your defined `API_CLASSIFICATION_REQUIREMENTS` will actually use. For example, if no policy requires `modernbert_io_validation`, you don't need to supply `--modernbert-model-dir`.
+*   **Policy Logic Customization:** The `overall_status` determination in the `/service/validate` endpoint is based on straightforward rules (e.g., ModernBERT predicting "inappropriate" means reject, or detection of a highly sensitive class means reject). For more nuanced decision-making (e.g., "reject if ModernBERT fails AND ColBERT detects PII"), you would need to modify the `validate_interaction` logic within `Classify.py`.
+*   **Resource Consumption:** Language models are resource-intensive. Loading multiple models (ModernBERT, base ColBERT, fine-tuned ColBERT) simultaneously for the policy service will require substantial RAM and VRAM (if using GPUs). Plan your hardware accordingly.
+*   **Security:** Ensure that any custom reference data or training data used does not inadvertently contain sensitive information that could be exposed or learned by the models in undesirable ways.
 
-```text
-
-```
