@@ -41,6 +41,21 @@ It's important to note that ModernBERT can also be trained as a **single-text bi
    * **Base ColBERT:** Uses a pre-trained model (e.g., `lightonai/GTE-ModernColBERT-v1`) with built-in or custom-provided reference examples.
    * **Fine-tuned ColBERT:** The base ColBERT model can be further fine-tuned on your specific reference examples for improved domain-specific accuracy.
 
+ ```json
+  {
+  "input_text": "My SSN is 123-45-6789.",
+  "predicted_class": "Class 1: PII",
+  "class_description": "Most sensitive...",
+  "scores_by_class (avg_maxsim)": {
+    "Class 1: PII": 9.662119388580322,
+    "Class 2: Sensitive Personal Data": 8.076715469360352,
+    "Class 3: Confidential Personal Data": 8.788877487182617,
+    "Class 4: Internal Data": 8.027799129486084,
+    "Class 5: Public Data": 8.07073450088501
+  }
+
+   ```   
+
 ### 3. The Policy Enforcement Layer & API Classification
 
 The service's intelligence resides in the `API_CLASSIFICATION_REQUIREMENTS` dictionary (defined within `Classify.py`). This configuration maps an `api_class` (a string like "Class1", "Class2", etc., that you assign to your APIs) to a specific set of validation rules:
