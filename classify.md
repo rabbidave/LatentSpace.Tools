@@ -123,7 +123,7 @@ The main interaction point for policy-based validation is the `/service/validate
 ```json
 {
   "request": {
-    "api_class": "Class2",
+    "api_class": "Class3",
     "input_text": "What is my address?",
     "output_text": "123 Main St"
   },
