@@ -14,7 +14,7 @@ The tool is self-installing, creating a Python venv (`.venv_policy_classifier_se
 * **Graduated Controls:** Implement precise validation policies tailored to the sensitivity of different APIs.
 * **Input-Output Coherence:** Ensure API responses are relevant and appropriate for the requests they serve using ModernBERT.
 * **Data Detection:** Identify potentially sensitive data (PII, confidential info) in inputs or outputs using ColBERT before it's mishandled.
-* __Centralized Policy Management:__ Define and manage data validation rules in one place (`API_CLASSIFICATION_REQUIREMENTS`).
+* __Per-Integration Policices:__ Define and manage data validation rules in one place (`API_CLASSIFICATION_REQUIREMENTS`).
 * **Extensible Model Framework:** Fine-tune both ModernBERT and ColBERT models for domain-specific accuracy.
 * **Self-Contained & Easy Setup:** Automatic virtual environment creation simplifies deployment and dependency management.
 
@@ -292,7 +292,10 @@ python Classify.py serve-policy-api \
 
 This command can start a server exposing individual model endpoints like `/modernbert/classify` and `/colbert/classify_sensitivity`. Useful for direct testing or simpler use cases not requiring the full policy layer.
 
-The `/modernbert/classify` endpoint is primarily designed for input-output validation and expects both `input_text` and `output_to_classify` in the request body. However, it can still be used with a ModernBERT model trained for single-text binary classification (using `{"input": "...", "label": ...}` training data). In this scenario, the `output_to_classify` parameter still needs to be provided in the request body, even if it's an empty string or a placeholder. The model will primarily use the `input_text` for prediction based on its single-text training.
+The `/modernbert/classify` endpoint (aliased to `/service/validate`) is designed for input-output validation and expects both `input_text` and `output_to_classify` parameters. When using a ModernBERT model trained for single-text classification:
+- The `output_to_classify` field is still required but can be empty
+- The model will use only the `input_text` for predictions
+- This maintains API consistency while supporting different training approaches
 
 ```bash
 # Example: Serve only a ModernBERT model
@@ -339,21 +342,3 @@ python Classify.py check-hardware
 * **Fine-tuned ModernBERT Models (`--model-dir` for `train`):**
    * Contains standard Hugging Face model files (`pytorch_model.bin`, `config.json`, etc.) and tokenizer files.
    * Includes a `model_config.json` with tool-specific settings (e.g., separator token).
-
-* **Fine-tuned ColBERT Models (`--output-model-dir` for `finetune-colbert`):**
-   * Contains Hugging Face model and tokenizer files.
-   * `colbert_reranker_config.json`: Metadata about the fine-tuning.
-   * `reference_texts_snapshot.json`: A copy of the reference texts used for fine-tuning.
-   * `ref_embeddings.pt`: Pre-computed embeddings for these reference texts.
-
-* **ColBERT Cache (`--cache-dir` or `--colbert-cache-dir`):**
-   * Used by **base** ColBERT models (when not using a fine-tuned ColBERT directory) to store pre-computed embeddings of reference texts (either built-in or from a `--custom-reference-jsonl`).
-   * This avoids re-calculating embeddings on every run or server start.
-   * Structure might be: `./your_cache_dir/sanitized_base_model_name/ref_embeddings.pt`.
-
-## Important Considerations
-
-* __Model Loading for Policy Service:__ The `serve-policy-api` command is flexible. You only need to provide paths for models that your defined `API_CLASSIFICATION_REQUIREMENTS` will actually use. For example, if no policy requires `modernbert_io_validation`, you don't need to supply `--modernbert-model-dir`.
-* __Policy Logic Customization:__ The `overall_status` determination in the `/service/validate` endpoint is based on straightforward rules (e.g., ModernBERT predicting "inappropriate" means reject, or detection of a highly sensitive class means reject). For more nuanced decision-making (e.g., "reject if ModernBERT fails AND ColBERT detects PII"), you would need to modify the `validate_interaction` logic within `Classify.py`.
-* **Resource Consumption:** Language models are resource-intensive. Loading multiple models (ModernBERT, base ColBERT, fine-tuned ColBERT) simultaneously for the policy service will require substantial RAM and VRAM (if using GPUs). Plan your hardware accordingly.
-* **Security:** Ensure that any custom reference data or training data used does not inadvertently contain sensitive information that could be exposed or learned by the models in undesirable ways.
