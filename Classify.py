@@ -707,6 +707,7 @@ class ClassificationAPI:
 
         if self.modernbert_classifier:
             @self.app.route('/modernbert/classify', methods=['POST'])
+            @self.app.route('/service/validate', methods=['POST'])  # Add validation endpoint alias
             def mb_classify():
                 if not self.modernbert_classifier: return jsonify({"error":"ModernBERT not loaded"}),500
                 data=request.get_json(); inp,outp=data.get('input_text'),data.get('output_to_classify')
