@@ -28,11 +28,18 @@ from typing import Dict, List, Optional, Union, Any, Tuple, Set
 # Attempt to import PyTorch and Transformers early
 try:
     import torch
+    from transformers.optimization import get_linear_schedule_with_warmup
     import torch.nn.functional as F
     from torch.utils.data import DataLoader, Dataset, TensorDataset
     from torch.optim import AdamW
     import transformers
-    from transformers import AutoModelForSequenceClassification, AutoTokenizer, AutoModel
+    from transformers import AutoModelForSequenceClassification, AutoTokenizer, AutoModel, AutoConfig
+    # ModernBERT configuration
+    from modern_bert import ModernBertConfig, ModernBertForSequenceClassification
+    AutoConfig.register("modernbert", ModernBertConfig)  # Register custom config
+    AutoModelForSequenceClassification.register(ModernBertConfig, ModernBertForSequenceClassification)  # Register model class
+    from transformers import AutoModelForSequenceClassification
+    AutoModelForSequenceClassification.register(ModernBertConfig, ModernBertForSequenceClassification)  # Register model class
     from transformers.optimization import get_linear_schedule_with_warmup
     from packaging import version
 except ImportError:
@@ -343,7 +350,7 @@ class DataProcessor:
 class ModernBERTClassifier:
     DEFAULT_MAX_LENGTH = 256; DEFAULT_PAD_TOKEN = "[PAD]"
     def __init__(self, model_dir: str = "model_files", use_mlflow: bool = False):
-        self.model_dir = Path(model_dir).resolve(); self.model_id = "answerdotai/ModernBERT-base"
+        self.model_dir = Path(model_dir).resolve(); self.model_id = "bert-base-uncased"  # Standard BERT for testing
         self.model: Optional[AutoModelForSequenceClassification] = None; self.tokenizer: Optional[AutoTokenizer] = None
         self.device: Optional[torch.device] = None; self.separator: str = " [SEP] "
         self.use_mlflow = use_mlflow
