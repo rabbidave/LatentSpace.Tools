@@ -200,7 +200,7 @@ def main_cli_entry():
 
     # finetune-colbert subcommand
     finetune_parser = subparsers.add_parser('finetune-colbert',
-                                          help='Fine-tune a ColBERT model for sensitivity classification')
+                                           help='Fine-tune a ColBERT model for sensitivity classification')
     finetune_parser.add_argument('--reference-jsonl', type=str, required=True,
                                help='Path to JSONL file with reference texts and classes')
     finetune_parser.add_argument('--output-model-dir', type=str, required=True,
@@ -215,50 +215,9 @@ def main_cli_entry():
                                help='Learning rate')
     finetune_parser.add_argument('--triplet-margin', type=float, default=0.1,
                                help='Margin for triplet loss')
+    finetune_parser.set_defaults(func=finetune_colbert_command_cli)
 
-    # Create-example command
-    create_ex_parser = subparsers.add_parser('create-example',
-                                           help='Generate example training files')
-    create_ex_parser.add_argument('--output-dir', type=str, required=True)
-    create_ex_parser.set_defaults(func=create_example_command)
-
-    # Create-example command
-    create_ex_parser = subparsers.add_parser('create-example',
-                                           help='Generate example training files')
-    create_ex_parser.add_argument('--output-dir', type=str, required=True)
-    create_ex_parser.set_defaults(func=create_example_command)
-
-    # Create-example command
-    create_ex_parser = subparsers.add_parser('create-example',
-                                           help='Generate example training files')
-    create_ex_parser.add_argument('--output-dir', type=str, required=True)
-    create_ex_parser.set_defaults(func=create_example_command)
-
-    # Create-example command
-    create_ex_parser = subparsers.add_parser('create-example',
-                                           help='Generate example training files')
-    create_ex_parser.add_argument('--output-dir', type=str, required=True)
-    create_ex_parser.set_defaults(func=create_example_command)
-
-    # Create-example command
-    create_ex_parser = subparsers.add_parser('create-example',
-                                           help='Generate example training files')
-    create_ex_parser.add_argument('--output-dir', type=str, required=True)
-    create_ex_parser.set_defaults(func=create_example_command)
-
-    # Create-example command
-    create_ex_parser = subparsers.add_parser('create-example',
-                                           help='Generate example training files')
-    create_ex_parser.add_argument('--output-dir', type=str, required=True)
-    create_ex_parser.set_defaults(func=create_example_command)
-
-    # Create-example command
-    create_ex_parser = subparsers.add_parser('create-example',
-                                           help='Generate example training files')
-    create_ex_parser.add_argument('--output-dir', type=str, required=True)
-    create_ex_parser.set_defaults(func=create_example_command)
-
-    # Create-example command
+    # Create-example command (single definition)
     create_ex_parser = subparsers.add_parser('create-example',
                                            help='Generate example training files')
     create_ex_parser.add_argument('--output-dir', type=str, required=True)
