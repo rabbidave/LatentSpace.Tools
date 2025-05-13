@@ -175,7 +175,7 @@ Use `python classify.py <command> --help` for detailed options for each command.
 *   **Fine-tune a ColBERT Model (`finetune-colbert`)**
     Reference JSONL format: `{"text": "example of ClassA text", "class_name": "ClassA"}` (one per line)
     ```bash
-    python classify.py finetune-colbert --reference-jsonl ./data/colbert_train.jsonl --output-model-dir ./models/colbert-custom --epochs 5 --batch-size 4
+    python classify.py finetune-colbert --reference-jsonl ./data/colbert_train.jsonl --output-model-dir ./models/colbert-custom --base-model-id "lightonai/GTE-ModernColBERT-v1" --epochs 5 --batch-size 4
     ```
     *(Note: The script uses an internal default for `max_seq_length` for ColBERT, which is not a direct CLI argument for `finetune-colbert`.)*
 
@@ -213,6 +213,7 @@ python classify.py serve \
 ```
 *   Adjust model paths and flags based on which services and policies you need to enable.
 *   If `--dev-server` is not used, the server runs in production mode using Waitress.
+*   **Note on `--colbert-model-id-or-dir` for the `serve` command:** This argument specifies the ColBERT model. If the path provided is a directory structured as a fine-tuned ColBERT model (containing `colbert_reranker_config.json`, model files, and `reference_texts_snapshot.json`), that fine-tuned model will be loaded. Otherwise, the value is treated as a Hugging Face model ID (e.g., `lightonai/GTE-ModernColBERT-v1`) or a path to a base model directory. If it's a base model, you might need to also provide `--colbert-custom-ref-jsonl` if you are not using its default built-in references (or if it has none).
 
 ## Development & Maintenance
 
@@ -382,5 +383,3 @@ python classify.py --help
     "ColBERT_Input_Sensitivity: Predicted class 'Class 1: PII' is in disallowed list: ['Class 1: PII']."
   ]
 }
-```
-```
