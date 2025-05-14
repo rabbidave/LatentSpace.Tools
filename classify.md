@@ -2,8 +2,6 @@
 
 This document describes `classify.py`, a command-line interface (CLI) and RESTful API service designed to enforce data handling policies through **graduated controls**. It uses two specialized transformer models to validate and classify text data based on predefined API sensitivity levels defined in an external policy configuration file.
 
-'python classify.py --help'
-
 ## Core Components
 
 ### 1. I/O Validator (Standard Transformer-Based Classification)
@@ -55,8 +53,22 @@ python classify.py --help
 ### Environment Requirements:
 
 - **Hugging Face Token**: For downloading models from the Hugging Face Hub, ensure the `HUGGING_FACE_HUB_TOKEN` (or `HF_TOKEN`) environment variable is set with your valid token. This is crucial if the models specified (base models for training/inference or pre-trained models) are private or require authentication for download. The script does not store or hardcode this token.
+
+  - In PowerShell: `$env:HUGGING_FACE_HUB_TOKEN = "YOUR_TOKEN_HERE"` (or `$env:HF_TOKEN`)
+  - In bash/zsh: `export HUGGING_FACE_HUB_TOKEN="YOUR_TOKEN_HERE"` (or `export HF_TOKEN`)
+
+  Ensure the token is set in the same session where you run classify.py, especially if not using a system-wide environment variable. The script checks for both `HUGGING_FACE_HUB_TOKEN` and `HF_TOKEN`.
+
 - **Python 3.8+** is recommended.
 - **Sufficient RAM** (e.g., 8GB-16GB+) is advised, especially when loading multiple or large models. CUDA-enabled GPU is highly recommended for acceptable performance, especially for training and faster inference.
+
+### Windows Specifics:
+
+- **Symlinks**: You might see a warning from huggingface_hub about symlinks not being supported, suggesting to enable Developer Mode or run as Administrator. While the cache system will still function in a degraded mode, enabling Developer Mode (preferred) or running as Administrator might help with certain file system interactions, especially if encountering model download/loading issues.
+
+- **Administrator Privileges for Troubleshooting**: If you face stubborn model download issues (especially "model not found" errors after verifying the model ID and token), try running the command or script from an Administrator terminal as a troubleshooting step.
+
+- **Tokenizer Dependencies**: Some models (like microsoft/deberta-v3-base) require additional libraries for their tokenizers (e.g., protobuf, tiktoken). The script aims to install these automatically during the venv setup if they are listed in `REQUIRED_PACKAGES` in classify.py. If you encounter ImportErrors related to these during model loading, ensure they are correctly listed and recreate the virtual environment (see Dependency Management section).
 
 ## Policy Configuration (`policy_config.json`)
 
@@ -158,7 +170,7 @@ These endpoints provide direct access to the underlying models, useful for testi
 
 ## CLI Commands for Model Operations & Fine-Tuning
 
-Use `python classify.py <command> --help` for detailed options for each command.
+Global flags like `--log-level` should be placed before the subcommand (e.g., `python classify.py --log-level DEBUG train ...`). Use `python classify.py <command> --help` for detailed options for each command.
 
 ### 1. I/O Validator Model Operations
 
@@ -266,21 +278,52 @@ If `--dev-server` is not used, the server runs in production mode using Waitress
 ## Development & Maintenance
 
 ### Dependency Management:
-To refresh or update the virtual environment if dependencies change or issues arise:
+
+The script manages its Python packages within the `.venv_classifier_service_tool` virtual environment.
+To refresh, update, or if `REQUIRED_PACKAGES` in classify.py are changed:
+
+1. Modify classify.py if adding/changing `REQUIRED_PACKAGES`.
+
+2. Delete the old virtual environment:
 
 ```bash
-# Remove the old virtual environment
-rm -rf .venv_classifier_service_tool  # On Linux/macOS
-# rmdir /s /q .venv_classifier_service_tool # On Windows Command Prompt
-# Remove-Item -Recurse -Force .venv_classifier_service_tool # On Windows PowerShell
-
-# Re-run any command to trigger a fresh install of dependencies into a new venv
-python classify.py --help
+# On Linux/macOS
+rm -rf .venv_classifier_service_tool
+# On Windows Command Prompt
+# rmdir /s /q .venv_classifier_service_tool
+# On Windows PowerShell
+# Remove-Item -Recurse -Force .venv_classifier_service_tool
 ```
+
+3. Re-run any python classify.py command (e.g., `python classify.py --help`). This will trigger a fresh creation of the venv and installation of all listed dependencies.
+
+## Troubleshooting Common Issues
+
+### Model Not Found Errors:
+
+- **Check Model ID Spelling**: Ensure the Hugging Face model ID is correct and does not contain extra quotes if passed via intermediate scripts.
+
+- **HF Token**: Verify your `HUGGING_FACE_HUB_TOKEN` (or `HF_TOKEN`) is correctly set in your current terminal session (see "Environment Requirements" for shell-specific commands), is valid, and has "read" permissions.
+
+- **Network Connectivity**: Ensure you have a stable internet connection to Hugging Face Hub.
+
+- **Clear Cache**: For persistent issues with a specific model, try deleting its cache directory from `~/.cache/huggingface/hub/models--<org_name>--<model_name>` (path varies slightly by OS, e.g., `C:\Users\<user>\.cache\huggingface\hub` on Windows) and retry.
+
+- **Specific Tokenizer Dependencies**: Models like microsoft/deberta-v3-base need protobuf and tiktoken. If classify.py's `REQUIRED_PACKAGES` list was updated with these but the venv wasn't recreated, you might see ImportErrors. Recreate the venv after updating `REQUIRED_PACKAGES`.
+
+- **Run as Administrator (Windows)**: As a last resort for stubborn download/access issues on Windows, try running the command from an Administrator terminal.
+
+### PowerShell Argument Parsing for Global Flags:
+Global flags like `--log-level` should be placed before the subcommand.
+- Correct: `python classify.py --log-level DEBUG train ...`
+- Incorrect: `python classify.py train ... --log-level DEBUG`
+
+### Import-Module PoshCodex (or similar profile errors in new PowerShell windows):
+These are typically related to your personal PowerShell profile attempting to load modules incompatible with the current PowerShell session (e.g., an admin window running an older PowerShell version). They generally don't affect classify.py's execution but might clutter the console.
 
 ## Example JSON Files (Referenced Above)
 
-These examples reflect the structure and terminology of the new script. The content of `sample_policy_config.json` is taken directly from the create_example_command in the new script.
+These examples reflect the structure and terminology of the new script. The content of `sample_policy_config.json` is taken directly from the create_example command in the new script.
 
 ### 1. example_policy_config.json (as generated by create-example)
 
