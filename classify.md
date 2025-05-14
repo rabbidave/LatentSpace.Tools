@@ -2,6 +2,8 @@
 
 This document describes `classify.py`, a command-line interface (CLI) and RESTful API service designed to enforce data handling policies through **graduated controls**. It uses two specialized transformer models to validate and classify text data based on predefined API sensitivity levels defined in an external policy configuration file.
 
+more detail via 'python classify.py --help'
+
 ## Core Components
 
 ### 1. I/O Validator (Standard Transformer-Based Classification)
