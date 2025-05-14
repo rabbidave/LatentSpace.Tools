@@ -38,6 +38,39 @@ Key features of this policy-driven approach:
 - **Extensible Model Framework**: Supports fine-tuning of both the I/O Validator and ColBERT-style models for domain-specific accuracy.
 - **Self-Contained Setup**: Auto-creates a Python virtual environment (`.venv_classifier_service_tool`) with all necessary dependencies on its first run.
 
+### i.e. N-Granularity Monitoring of Gateways, VPCs, APIs, etc
+
+<details>
+<summary>Quickstart Guide</summary>
+
+```bash
+# First time setup and create example files
+python classify.py create-example --output-dir ./classifier_tool_examples
+
+# Check hardware capabilities
+python classify.py check-hardware
+
+# Train an I/O Validator model 
+python classify.py train \
+    --data-path ./classifier_tool_examples/sample_modernbert_training.jsonl \
+    --model-dir ./models/my_io_validator \
+    --epochs 3 --learning-rate 2e-5 --batch-size 8
+
+# Fine-tune a ColBERT model for sensitivity classification
+python classify.py finetune-colbert \
+    --reference-jsonl ./classifier_tool_examples/sample_colbert_references.jsonl \
+    --output-model-dir ./models/my_colbert_finetuned \
+    --epochs 3 --batch-size 4
+
+# Start the server with both models and policy enforcement
+python classify.py serve \
+    --serve-modernbert --modernbert-model-dir ./models/my_io_validator \
+    --serve-colbert-sensitivity --colbert-model-id-or-dir ./models/my_colbert_finetuned \
+    --policy-config-path ./classifier_tool_examples/sample_policy_config.json \
+    --host 0.0.0.0 --port 5000
+```
+</details>
+
 ## Setup & Configuration
 
 The script manages its own Python virtual environment. On its first run (or if not in the target venv), `classify.py` will:
