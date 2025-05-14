@@ -71,6 +71,9 @@ REQUIRED_PACKAGES = [
     "waitress",
     "packaging",
     "flask-cors",
+    "protobuf",
+    "tiktoken",
+    "sentencepiece",
 ]
 
 # Global Variables
@@ -328,31 +331,124 @@ class ModernBERTClassifier: # Name kept for consistency, but it's a standard Tra
             except ImportError: logger.info("Flash Attention 2 not found for I/O Validator."); logger.debug("flash_attn import failed", exc_info=logger.level==logging.DEBUG)
 
         model_load_path = self.model_id if self.model_id and Path(self.model_id).is_dir() else self.args_base_model_id if hasattr(self, 'args_base_model_id') and self.args_base_model_id else self.DEFAULT_MODEL_A_ID
-        if not self.model_id: 
-            self.model_id = model_load_path 
+        if not self.model_id:
+            self.model_id = model_load_path
 
         logger.info(f"I/O Validator setup: Loading tokenizer and model from '{model_load_path}'")
         logger.debug(f"HF_TOKEN env var present: {bool(os.getenv('HF_TOKEN'))}")
         logger.debug(f"HUGGING_FACE_HUB_TOKEN env var present: {bool(os.getenv('HUGGING_FACE_HUB_TOKEN'))}")
         
-        self.tokenizer = AutoTokenizer.from_pretrained(model_load_path)
+        # Add detailed hf_hub logging
+        os.environ["HUGGINGFACE_HUB_VERBOSITY"] = "debug"
+        os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
+        os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"  # Faster downloads
+        os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"  # Faster downloads
+        os.environ["HF_HUB_DOWNLOAD_TIMEOUT"] = "120"   # Increase timeout
+        os.environ["HF_HUB_OFFLINE"] = "0"              # Ensure online mode
+
+        # Explicitly pass token to ensure it's used
+        # Prioritize HF_TOKEN, then HUGGING_FACE_HUB_TOKEN
+        auth_token = os.getenv("HF_TOKEN") or os.getenv("HUGGING_FACE_HUB_TOKEN")
+        if not auth_token:
+            logger.warning("HF_TOKEN or HUGGING_FACE_HUB_TOKEN not found in environment for model loading!")
+        else:
+            logger.debug(f"Using auth_token for from_pretrained: {'*' * (len(auth_token) - 4) + auth_token[-4:] if auth_token else 'None'}")
+
+        try:
+            self.tokenizer = AutoTokenizer.from_pretrained(model_load_path, token=auth_token) # Pass token
+        except Exception as e_tokenizer:
+            logger.error(f"DIRECT HUGGINGFACE ERROR during AutoTokenizer.from_pretrained for '{model_load_path}': {e_tokenizer}", exc_info=True)
+            raise # Re-raise to be caught by the main handler
+
         if self.tokenizer.pad_token is None:
             logger.warning(f"Tokenizer for I/O Validator '{model_load_path}' missing pad_token, adding default '{self.DEFAULT_PAD_TOKEN}'.")
             self.tokenizer.add_special_tokens({'pad_token': self.DEFAULT_PAD_TOKEN})
         
-        num_labels_for_model = 2 
-        model_kwargs = {"num_labels": num_labels_for_model}
+        num_labels_for_model = 2
+        model_kwargs = {"num_labels": num_labels_for_model, "token": auth_token} # Pass token
         if has_flash_attn and version.parse(torch.__version__) >= version.parse("2.0"): model_kwargs["attn_implementation"] = "flash_attention_2"
         logger.debug(f"Model kwargs for I/O Validator from_pretrained: {model_kwargs}")
 
         try:
             self.model = AutoModelForSequenceClassification.from_pretrained(model_load_path, **model_kwargs)
-        except Exception as e:
-            logger.warning(f"Failed to load I/O Validator model with initial kwargs: {e}")
-            if model_kwargs.get("attn_implementation") == "flash_attention_2":
-                logger.warning("Failed I/O Validator load with Flash Attn. Retrying default."); model_kwargs.pop("attn_implementation")
-                self.model = AutoModelForSequenceClassification.from_pretrained(model_load_path, **model_kwargs)
-            else: raise e
+        except Exception as e_hf_model_load: # Changed variable name to avoid conflict
+            logger.error(f"DIRECT HUGGINGFACE ERROR during AutoModelForSequenceClassification.from_pretrained for '{model_load_path}': {e_hf_model_load}", exc_info=True)
+            # Check if the issue is with snapshot_download specifically
+            from huggingface_hub.hf_api import HfApi
+            from huggingface_hub.utils import EntryNotFoundError
+            api = HfApi()
+            try:
+                logger.debug(f"Attempting to get model info for {model_load_path} via HfApi")
+                model_info_obj = api.model_info(repo_id=model_load_path, token=auth_token)
+                logger.debug(f"HfApi.model_info successful. SHA: {model_info_obj.sha}")
+                
+                # Try to simulate what from_pretrained does internally (simplified)
+                from huggingface_hub import snapshot_download
+                logger.debug(f"Attempting snapshot_download for {model_load_path}")
+                downloaded_folder = snapshot_download(
+                    repo_id=model_load_path,
+                    token=auth_token,
+                    cache_dir=os.getenv('HF_HOME') or (Path.home() / ".cache" / "huggingface" / "hub"),
+                    allow_patterns=["*.json", "*.bin", "*.model", "*.txt", "*.md"],  # Expanded patterns
+                    ignore_patterns=["*.h5", "*.ot", "*.msgpack"],  # Exclude non-PyTorch formats
+                    local_files_only=False,
+                    resume_download=True
+                )
+                logger.info(f"snapshot_download completed. Folder: {downloaded_folder}")
+                
+                # Detailed file listing with sizes
+                file_list = []
+                for f in Path(downloaded_folder).rglob('*'):
+                    if f.is_file():
+                        try:
+                            file_list.append(f"{f.relative_to(downloaded_folder)} ({f.stat().st_size} bytes)")
+                        except Exception as e:
+                            file_list.append(f"{f.name} [size error]")
+                logger.debug(f"Downloaded files:\n- " + "\n- ".join(file_list))
+                
+                # Verify critical files exist
+                required_files = {
+                    "config.json": False,
+                    "pytorch_model.bin": False,
+                    "tokenizer_config.json": False,
+                    "vocab.txt": False,
+                    "special_tokens_map.json": False
+                }
+                for fname in required_files:
+                    if (Path(downloaded_folder) / fname).exists():
+                        required_files[fname] = True
+                logger.info(f"Required files check:\n{json.dumps(required_files, indent=2)}")
+                logger.info(f"snapshot_download completed. Folder: {downloaded_folder}")
+                
+                # Detailed file listing with sizes
+                file_list = []
+                for f in Path(downloaded_folder).rglob('*'):
+                    if f.is_file():
+                        try:
+                            file_list.append(f"{f.relative_to(downloaded_folder)} ({f.stat().st_size} bytes)")
+                        except Exception as e:
+                            file_list.append(f"{f.name} [size error]")
+                logger.debug(f"Downloaded files:\n- " + "\n- ".join(file_list))
+                
+                # Verify critical files exist
+                required_files = {
+                    "config.json": False,
+                    "pytorch_model.bin": False,
+                    "tokenizer_config.json": False,
+                    "vocab.txt": False,
+                    "special_tokens_map.json": False
+                }
+                for fname in required_files:
+                    if (Path(downloaded_folder) / fname).exists():
+                        required_files[fname] = True
+                logger.info(f"Required files check:\n{json.dumps(required_files, indent=2)}")
+
+            except EntryNotFoundError:
+                logger.error(f"HfApi confirms EntryNotFoundError for {model_load_path}.", exc_info=True)
+            except Exception as e_snapshot:
+                logger.error(f"Error during manual HfApi/snapshot_download attempt: {e_snapshot}", exc_info=True)
+            # Re-raise original error
+            raise e_hf_model_load # Re-raise to be caught by the main handler
 
         if self.model and self.tokenizer.pad_token_id is not None and self.tokenizer.pad_token_id >= self.model.config.vocab_size:
             logger.info(f"Resizing token embeddings for I/O Validator '{model_load_path}'. Old vocab: {self.model.config.vocab_size}, New (tokenizer): {len(self.tokenizer)}")
