@@ -1,20 +1,11 @@
 #!/usr/bin/env python
 """
-Standard Transformer-Based Classification and Reranking Service
+Transformer-Based Classification and Reranking Service 
+with VLM-Powered Markdown Processing and JSON Policy Validation
 
-A self-installing CLI/Python tool that:
-1. Fine-tunes a standard Hugging Face Transformer model (e.g., DeBERTa-v3) for binary
-   classification of input-output text pairs (I/O Validation).
-2. Fine-tunes a ColBERT-style model (e.g., from sentence-transformers like msmarco-distilbert-base-tas-b)
-   for data sensitivity classification by comparing input against reference examples via MaxSim.
-3. Provides CLI-based direct classification using the fine-tuned or base models for both I/O
-   validation and sensitivity classification.
-4. Deploys a RESTful API server featuring:
-    a. Direct access to the fine-tuned I/O validation model.
-    b. Direct access to the (base or fine-tuned) ColBERT sensitivity classification model.
-    c. A policy-driven '/service/validate' endpoint that integrates both models to enforce
-       custom rules on input and output text based on their content and sensitivity.
-5. Manages its own Python virtual environment and dependencies.
+This enhanced version includes:
+1. VLM-based markdown processing 
+2. Comprehensive testing framework
 """
 
 import os
@@ -28,37 +19,27 @@ import logging
 import subprocess
 import signal
 import copy
+import tempfile
+import requests
+import re
+import ast
+import urllib.request
+import urllib.parse
 from pathlib import Path
-from typing import Dict, List, Optional, Union, Any, Tuple, Set
+from typing import Dict, List, Optional, Union, Any, Tuple, Set, TYPE_CHECKING
 
-# Configure logging first
+if TYPE_CHECKING:
+    import torch
+    from PIL import Image  # Add this import for type checking
+
+# Configure basic logging first
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-)
+) # Logger instance will be created after venv check
+
+# Create global logger instance
 logger = logging.getLogger("classifier_service_tool")
-
-# Attempt to import PyTorch and Transformers early
-try:
-    import torch
-    from transformers.optimization import get_linear_schedule_with_warmup
-    import torch.nn.functional as F
-    from torch.utils.data import DataLoader, Dataset, TensorDataset
-    from torch.optim import AdamW
-    import transformers
-    from transformers import AutoModelForSequenceClassification, AutoTokenizer, AutoModel, AutoConfig # Keep this
-    from packaging import version
-    
-    # Custom modern_bert.py imports and registrations are removed.
-    # We will use standard Hugging Face models.
-    logger.info("Standard Hugging Face models will be used. Custom 'modern_bert.py' and its registrations are no longer needed.")
-
-except ImportError as e:
-    logger.error("CRITICAL IMPORT ERROR: Failed to import PyTorch or Transformers. The script cannot function.", exc_info=True)
-    sys.exit(1) # Exit if essential libraries are missing
-except Exception as e:
-    logger.error(f"An unexpected error occurred during initial imports: {e}", exc_info=True)
-    sys.exit(1) # Exit on other unexpected import errors
 
 # Venv setup constants
 VENV_DIR = Path(__file__).parent.resolve() / ".venv_classifier_service_tool"
@@ -74,10 +55,31 @@ REQUIRED_PACKAGES = [
     "protobuf",
     "tiktoken",
     "sentencepiece",
+    "opencv-python",
+    "Pillow",
+    "sentence-transformers>=2.2.0",
+    "ranx>=0.3.10",
+    "requests>=2.25.0",
+    "llama-cpp-python",  # Added for VLM markdown processing
 ]
 
 # Global Variables
 stop_signal_received = False
+DEFAULT_DOCS_URL = "https://github.com/rabbidave/LatentSpace.Tools/blob/main/classify.md"
+RAG_COMPONENT_CACHE = {}
+
+# Global flag, will be updated in __main__ after venv confirmation and llama_cpp import attempt
+LLAMA_CPP_AVAILABLE = False
+
+# Placeholder for global availability, will be properly imported in __main__ if venv is OK
+np = None
+SentenceTransformer = None
+Flask = None
+request = None
+jsonify = None
+CORS = None
+serve = None
+torch = None
 
 def setup_signal_handling():
     """Set up signal handling for graceful shutdown."""
@@ -103,14 +105,21 @@ def ensure_venv():
 
     if is_in_target_venv:
         logger.info(f"Running inside the '{VENV_DIR}' virtual environment.")
+        try:
+            import sentence_transformers
+            import ranx
+            import llama_cpp
+            logger.debug("All required dependencies available.")
+        except ImportError:
+            logger.info("Missing dependencies detected. Will attempt install.")
+            is_in_target_venv = False
+
+    if is_in_target_venv:
         return True
 
-    logger.info(f"Not running inside the target '{VENV_DIR}' virtual environment.")
-    venv_exists = os.path.isdir(venv_path)
-    logger.debug(f"Virtual environment exists at '{venv_path}': {venv_exists}")
-
-    if not venv_exists:
-        logger.info(f"Creating virtual environment in '{venv_path}'...")
+    logger.info(f"Setting up virtual environment at '{venv_path}'...")
+    
+    if not os.path.isdir(venv_path):
         try:
             venv.create(venv_path, with_pip=True, system_site_packages=False)
             logger.info("Virtual environment created successfully.")
@@ -124,1798 +133,3231 @@ def ensure_venv():
     else:
         python_executable = os.path.join(venv_path, "bin", "python")
         pip_executable = os.path.join(venv_path, "bin", "pip")
-    logger.debug(f"Python executable in venv: {python_executable}")
-    logger.debug(f"Pip executable in venv: {pip_executable}")
 
-
-    if not os.path.exists(python_executable):
-        logger.error(f"Python executable not found at '{python_executable}'. Venv creation might have failed.")
-        sys.exit(1)
-    if not os.path.exists(pip_executable):
-        logger.error(f"Pip executable not found at '{pip_executable}'. Venv creation might have failed.")
+    if not os.path.exists(python_executable) or not os.path.exists(pip_executable):
+        logger.error(f"Virtual environment setup failed. Executables not found.")
         sys.exit(1)
 
     try:
-        logger.info("Attempting to upgrade pip in the virtual environment...")
-        pip_upgrade_cmd = [pip_executable, "install", "--upgrade", "pip"]
-        logger.debug(f"Running pip upgrade command: {' '.join(pip_upgrade_cmd)}")
-        subprocess.run(pip_upgrade_cmd, check=True, capture_output=True, text=True, encoding='utf-8', errors='replace')
-        logger.info("Pip upgraded successfully in the virtual environment.")
+        subprocess.run([pip_executable, "install", "--upgrade", "pip"], 
+                      check=True, capture_output=True, text=True)
+        logger.info("Pip upgraded successfully.")
     except subprocess.CalledProcessError as e:
-        logger.warning(f"Failed to upgrade pip: {e.stderr}. Continuing with existing pip version.")
-    except Exception as e:
-        logger.warning(f"An unexpected error occurred while upgrading pip: {e}. Continuing.")
+        logger.warning(f"Failed to upgrade pip: {e.stderr}")
 
     current_packages_to_install = list(REQUIRED_PACKAGES)
-    if sys.platform != "win32":
-        try:
-            logger.info("Temporarily installing torch to check CUDA for flash-attn decision...")
-            torch_install_cmd = [pip_executable, "install", "torch"]
-            logger.debug(f"Running torch install command for CUDA check: {' '.join(torch_install_cmd)}")
-            subprocess.run(torch_install_cmd, check=True, capture_output=True, text=True, encoding='utf-8', errors='replace')
-
-            cuda_check_script = "import torch; print(torch.cuda.is_available())"
-            cuda_check_cmd = [python_executable, "-c", cuda_check_script]
-            logger.debug(f"Running CUDA check command: {' '.join(cuda_check_cmd)}")
-            result = subprocess.run(cuda_check_cmd, check=True, capture_output=True, text=True, encoding='utf-8', errors='replace')
-            cuda_available = result.stdout.strip().lower() == "true"
-            logger.debug(f"CUDA available check result: {cuda_available}")
-
-            if cuda_available:
-                logger.info("CUDA is available. Adding flash-attn to requirements for non-Windows OS.")
-                current_packages_to_install.append("flash-attn>=2.0.0")
-            else:
-                logger.info("CUDA not available (or check failed). Skipping flash-attn installation.")
-        except subprocess.CalledProcessError as e:
-            logger.warning(f"Failed during CUDA check/torch install for flash-attn: {e.stderr}. Skipping flash-attn consideration.")
-        except Exception as e:
-            logger.warning(f"An unexpected error occurred during CUDA check for flash-attn: {e}. Skipping flash-attn.")
-
-    logger.info(f"Installing/checking required packages in '{venv_path}': {', '.join(current_packages_to_install)}")
+    
+    logger.info(f"Installing required packages: {', '.join(current_packages_to_install)}")
     install_command = [pip_executable, "install"] + current_packages_to_install
-    logger.debug(f"Running package install command: {' '.join(install_command)}")
     try:
-        result = subprocess.run(install_command, check=True, capture_output=True, text=True, encoding='utf-8', errors='replace')
-        logger.info("Required packages installed/verified successfully.")
-        if result.stdout: logger.debug(f"pip install stdout:\n{result.stdout}")
-        if result.stderr: logger.debug(f"pip install stderr:\n{result.stderr}")
+        result = subprocess.run(install_command, check=True, capture_output=True, text=True)
+        logger.info("Required packages installed successfully.")
     except subprocess.CalledProcessError as e:
-        logger.error(f"Error installing required packages using command: {' '.join(e.cmd)}")
-        logger.error(f"Pip stdout:\n{e.stdout if e.stdout else 'N/A'}")
-        logger.error(f"Pip stderr:\n{e.stderr if e.stderr else 'N/A'}")
-        sys.exit(1)
-    except Exception as e:
-        logger.error(f"An unexpected error occurred during package installation: {e}", exc_info=True)
+        logger.error(f"Error installing packages: {e.stderr}")
         sys.exit(1)
 
-    logger.info(f"\nRestarting script using Python from '{venv_path}'...\n{'='*20}\n")
+    logger.info(f"Restarting script using Python from '{venv_path}'...")
     script_path = os.path.abspath(__file__)
     exec_args = [python_executable, script_path] + sys.argv[1:]
-    logger.debug(f"Executing os.execv with: {exec_args}")
     try:
         os.execv(python_executable, exec_args)
     except OSError as e:
-        logger.error(f"os.execv failed: {e}. Executable='{python_executable}', Script='{script_path}'", exc_info=True)
+        logger.error(f"os.execv failed: {e}", exc_info=True)
         sys.exit(1)
-    except Exception as e:
-        logger.error(f"Unexpected error during script restart attempt: {e}", exc_info=True)
-        sys.exit(1)
-    return False # Should not be reached if os.execv is successful
-
-# Import other necessary modules after venv check
-import numpy as np
-from sklearn.model_selection import train_test_split as sklearn_train_test_split
-from sklearn.metrics import accuracy_score, precision_recall_fscore_support
-from tqdm import tqdm
-from flask import Flask, request, jsonify
-from flask_cors import CORS
-from waitress import serve
+    
+    return False
 
 
-class DataProcessor:
-    """Handles JSONL data loading for I/O Validator (ModernBERTClassifier) fine-tuning."""
-    def __init__(self, jsonl_paths: Union[str, List[str]]):
-        if isinstance(jsonl_paths, str): self.jsonl_paths = [Path(jsonl_paths)]
-        else: self.jsonl_paths = [Path(p) for p in jsonl_paths]
-        self.data_entries: List[Dict[str, Any]] = []
-        self.stats = { "total_files_processed": 0, "total_lines_read": 0, "valid_entries": 0,
-                       "invalid_entries_missing_fields": 0, "invalid_entries_wrong_type": 0,
-                       "invalid_entries_json_decode_error": 0, "files_with_errors": set() }
-        logger.debug(f"DataProcessor initialized with paths: {self.jsonl_paths}")
+# --- VLM-Based Markdown Processing ---
 
-    def load_and_validate(self) -> bool:
-        logger.info(f"Loading I/O Validator training data from {len(self.jsonl_paths)} path(s)...")
-        for file_path_obj in self.jsonl_paths:
-            file_path_str = str(file_path_obj)
-            logger.debug(f"Processing file: {file_path_str}")
-            if not file_path_obj.exists() or not file_path_obj.is_file():
-                logger.warning(f"File not found: {file_path_str}. Skipping."); self.stats["files_with_errors"].add(file_path_str); continue
-            self.stats["total_files_processed"] += 1
-            try:
-                with open(file_path_obj, 'r', encoding='utf-8') as f:
-                    for i, line in enumerate(f):
-                        self.stats["total_lines_read"] += 1; line = line.strip()
-                        if not line: logger.debug(f"Skipping empty line {i+1} in {file_path_str}"); continue
-                        try:
-                            item = json.loads(line)
-                            if 'input' in item and 'output_good_sample' in item and 'output_bad_sample' in item:
-                                if not all(isinstance(item[k], str) for k in ['input', 'output_good_sample', 'output_bad_sample']):
-                                    logger.debug(f"Invalid type in line {i+1} (triplet format) in {file_path_str}: {item}")
-                                    self.stats["invalid_entries_wrong_type"] += 1; continue
-                                self.data_entries.append(item); self.stats["valid_entries"] += 1
-                            elif 'input' in item and 'label' in item:
-                                if not isinstance(item['input'], str) or not isinstance(item['label'], int) or item['label'] not in (0,1):
-                                    logger.debug(f"Invalid type/value in line {i+1} (labeled format) in {file_path_str}: {item}")
-                                    self.stats["invalid_entries_wrong_type"] += 1; continue
-                                self.data_entries.append({'input': item['input'], 'label': item['label']}); self.stats["valid_entries"] += 1
-                            else:
-                                logger.debug(f"Missing fields in line {i+1} in {file_path_str}: {item}")
-                                self.stats["invalid_entries_missing_fields"] += 1
-                        except json.JSONDecodeError:
-                            logger.debug(f"JSON decode error in line {i+1} in {file_path_str}: '{line[:100]}...'")
-                            self.stats["invalid_entries_json_decode_error"] += 1; self.stats["files_with_errors"].add(file_path_str)
-                        except Exception as e_item:
-                            logger.debug(f"Unexpected error processing item from line {i+1} in {file_path_str}: {e_item}", exc_info=True)
-                            self.stats["invalid_entries_json_decode_error"] += 1; self.stats["files_with_errors"].add(file_path_str) # Classify as decode error for simplicity
-            except Exception as e_file: logger.error(f"Error processing file {file_path_str}: {e_file}", exc_info=True); self.stats["files_with_errors"].add(file_path_str)
-        logger.info(f"Data loading stats: {self.stats}")
-        return bool(self.data_entries)
-
-    def prepare_classification_data(self, separator: str = " [SEP] ", balance_classes: bool = True) -> Tuple[List[str], List[int]]:
-        texts, labels = [], []
-        logger.debug(f"Preparing classification data with separator: '{separator}', balance_classes: {balance_classes}")
-        for item_idx, item in enumerate(self.data_entries):
-            if 'output_good_sample' in item:
-                texts.append(f"{item['input'].strip()}{separator}{item['output_good_sample'].strip()}"); labels.append(1)
-                texts.append(f"{item['input'].strip()}{separator}{item['output_bad_sample'].strip()}"); labels.append(0)
-            elif 'label' in item: texts.append(item['input'].strip()); labels.append(item['label'])
-            if item_idx < 5: logger.debug(f"Sample item {item_idx} being processed: {item} -> texts/labels added")
-
-
-        if balance_classes and labels:
-            pos_indices = [i for i, lbl in enumerate(labels) if lbl == 1]
-            neg_indices = [i for i, lbl in enumerate(labels) if lbl == 0]
-            logger.debug(f"Balancing classes: {len(pos_indices)} positive, {len(neg_indices)} negative samples initially.")
-            if not pos_indices or not neg_indices: logger.warning("Cannot balance: one class has no samples.")
-            elif len(pos_indices) != len(neg_indices):
-                import random
-                min_samples = min(len(pos_indices), len(neg_indices))
-                logger.debug(f"Balancing to {min_samples} samples per class.")
-                chosen_pos = random.sample(pos_indices, min_samples)
-                chosen_neg = random.sample(neg_indices, min_samples)
-                balanced_texts, balanced_labels = [], []
-                for i in chosen_pos + chosen_neg: balanced_texts.append(texts[i]); balanced_labels.append(labels[i])
-                combined = list(zip(balanced_texts, balanced_labels)); random.shuffle(combined)
-                texts, labels = [list(t) for t in zip(*combined)] if combined else ([], [])
-                logger.info(f"Classes balanced. New count: {len(texts)}")
-        logger.info(f"Prepared {len(texts)} samples for I/O Validator classification.")
-        if texts: logger.debug(f"First few prepared samples: Texts: {texts[:2]}, Labels: {labels[:2]}")
-        return texts, labels
-
-    def perform_train_test_split(self, texts: List[str], labels: List[int], test_size: float = 0.2, random_state: int = 42) -> Dict[str, List[Any]]:
-        logger.debug(f"Performing train/test split: test_size={test_size}, random_state={random_state}, num_samples={len(texts)}")
-        if not texts or not labels:
-            logger.warning("Empty texts or labels for train/test split.")
-            return {'train_texts': [], 'train_labels': [], 'test_texts': [], 'test_labels': []}
-        stratify_param = labels if len(set(labels)) >= 2 else None
-        logger.debug(f"Stratify parameter for split: {'labels' if stratify_param else 'None'}")
-        if test_size <= 0 or int(len(texts) * test_size) < 1 :
-            logger.info(f"Test size {test_size} too small for {len(texts)} samples, using all data for training.")
-            return {'train_texts': texts, 'train_labels': labels, 'test_texts': [], 'test_labels': []}
-        X_train, X_test, y_train, y_test = sklearn_train_test_split(texts, labels, test_size=test_size, stratify=stratify_param, random_state=random_state)
-        logger.info(f"Train/test split: {len(X_train)} train, {len(X_test)} test samples.")
-        return {'train_texts': X_train, 'train_labels': y_train, 'test_texts': X_test, 'test_labels': y_test}
-
-class ModernBERTClassifier: # Name kept for consistency, but it's a standard Transformer now
-    DEFAULT_MAX_LENGTH = 256; DEFAULT_PAD_TOKEN = "[PAD]"
-    DEFAULT_MODEL_A_ID = "microsoft/deberta-v3-base" 
-
-    def __init__(self, model_dir: str = "model_files", use_mlflow: bool = False, base_model_id_for_training: Optional[str] = None):
-        self.model_dir = Path(model_dir).resolve()
-        self.model_id: Optional[str] = None 
-        self.args_base_model_id = base_model_id_for_training
-        self.model: Optional[AutoModelForSequenceClassification] = None; self.tokenizer: Optional[AutoTokenizer] = None
-        self.device: Optional[torch.device] = None; self.separator: str = " [SEP] "
-        self.use_mlflow = use_mlflow
-        logger.debug(f"I/O Validator (ModernBERTClassifier) initialized. model_dir='{self.model_dir}', base_for_train='{base_model_id_for_training}', use_mlflow={self.use_mlflow}")
-        if self.use_mlflow:
-            try: import mlflow; self.mlflow_client = mlflow; logger.debug("MLflow imported successfully.")
-            except ImportError: logger.warning("MLflow not found, disabling."); self.use_mlflow = False
-
-    def setup(self):
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        logger.info(f"I/O Validator using device: {self.device}")
-        has_flash_attn = False
-        if self.device.type == 'cuda':
-            try: import flash_attn; has_flash_attn = True; logger.info("Flash Attention 2 available for I/O Validator.")
-            except ImportError: logger.info("Flash Attention 2 not found for I/O Validator."); logger.debug("flash_attn import failed", exc_info=logger.level==logging.DEBUG)
-
-        model_load_path = self.model_id if self.model_id and Path(self.model_id).is_dir() else self.args_base_model_id if hasattr(self, 'args_base_model_id') and self.args_base_model_id else self.DEFAULT_MODEL_A_ID
-        if not self.model_id:
-            self.model_id = model_load_path
-
-        logger.info(f"I/O Validator setup: Loading tokenizer and model from '{model_load_path}'")
-        logger.debug(f"HF_TOKEN env var present: {bool(os.getenv('HF_TOKEN'))}")
-        logger.debug(f"HUGGING_FACE_HUB_TOKEN env var present: {bool(os.getenv('HUGGING_FACE_HUB_TOKEN'))}")
+class MarkdownReformatterVLM:
+    """VLM-powered markdown reformatter using GGUF models via llama-cpp-python."""
+    
+    DEFAULT_MODEL_ID = "PleIAs/Pleias-RAG-1B"
+    
+    def __init__(self, model_path_or_id: str, **kwargs):
+        self.model_path_or_id = model_path_or_id
+        self.model: Optional[llama_cpp.Llama] = None
+        self.is_loaded = False
         
-        # Add detailed hf_hub logging
-        os.environ["HUGGINGFACE_HUB_VERBOSITY"] = "debug"
-        os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
-        os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"  # Faster downloads
-        os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"  # Faster downloads
-        os.environ["HF_HUB_DOWNLOAD_TIMEOUT"] = "120"   # Increase timeout
-        os.environ["HF_HUB_OFFLINE"] = "0"              # Ensure online mode
-
-        # Explicitly pass token to ensure it's used
-        # Prioritize HF_TOKEN, then HUGGING_FACE_HUB_TOKEN
-        auth_token = os.getenv("HF_TOKEN") or os.getenv("HUGGING_FACE_HUB_TOKEN")
-        if not auth_token:
-            logger.warning("HF_TOKEN or HUGGING_FACE_HUB_TOKEN not found in environment for model loading!")
-        else:
-            logger.debug(f"Using auth_token for from_pretrained: {'*' * (len(auth_token) - 4) + auth_token[-4:] if auth_token else 'None'}")
-
-        try:
-            self.tokenizer = AutoTokenizer.from_pretrained(model_load_path, token=auth_token) # Pass token
-        except Exception as e_tokenizer:
-            logger.error(f"DIRECT HUGGINGFACE ERROR during AutoTokenizer.from_pretrained for '{model_load_path}': {e_tokenizer}", exc_info=True)
-            raise # Re-raise to be caught by the main handler
-
-        if self.tokenizer.pad_token is None:
-            logger.warning(f"Tokenizer for I/O Validator '{model_load_path}' missing pad_token, adding default '{self.DEFAULT_PAD_TOKEN}'.")
-            self.tokenizer.add_special_tokens({'pad_token': self.DEFAULT_PAD_TOKEN})
+        # Model parameters
+        self.n_ctx = kwargs.get('n_ctx', 4096)
+        self.n_gpu_layers = kwargs.get('n_gpu_layers', 0)
+        self.verbose = kwargs.get('verbose', False)
         
-        num_labels_for_model = 2
-        model_kwargs = {"num_labels": num_labels_for_model, "token": auth_token} # Pass token
-        if has_flash_attn and version.parse(torch.__version__) >= version.parse("2.0"): model_kwargs["attn_implementation"] = "flash_attention_2"
-        logger.debug(f"Model kwargs for I/O Validator from_pretrained: {model_kwargs}")
-
+    def load_model(self) -> bool:
+        """Load the GGUF model."""
+        if not LLAMA_CPP_AVAILABLE:
+            logger.error("llama-cpp-python not available. Cannot load VLM model.")
+            return False
+            
         try:
-            self.model = AutoModelForSequenceClassification.from_pretrained(model_load_path, **model_kwargs)
-        except Exception as e_hf_model_load: # Changed variable name to avoid conflict
-            logger.error(f"DIRECT HUGGINGFACE ERROR during AutoModelForSequenceClassification.from_pretrained for '{model_load_path}': {e_hf_model_load}", exc_info=True)
-            # Check if the issue is with snapshot_download specifically
-            from huggingface_hub.hf_api import HfApi
-            from huggingface_hub.utils import EntryNotFoundError
-            api = HfApi()
-            try:
-                logger.debug(f"Attempting to get model info for {model_load_path} via HfApi")
-                model_info_obj = api.model_info(repo_id=model_load_path, token=auth_token)
-                logger.debug(f"HfApi.model_info successful. SHA: {model_info_obj.sha}")
-                
-                # Try to simulate what from_pretrained does internally (simplified)
-                from huggingface_hub import snapshot_download
-                logger.debug(f"Attempting snapshot_download for {model_load_path}")
-                downloaded_folder = snapshot_download(
-                    repo_id=model_load_path,
-                    token=auth_token,
-                    cache_dir=os.getenv('HF_HOME') or (Path.home() / ".cache" / "huggingface" / "hub"),
-                    allow_patterns=["*.json", "*.bin", "*.model", "*.txt", "*.md"],  # Expanded patterns
-                    ignore_patterns=["*.h5", "*.ot", "*.msgpack"],  # Exclude non-PyTorch formats
-                    local_files_only=False,
-                    resume_download=True
-                )
-                logger.info(f"snapshot_download completed. Folder: {downloaded_folder}")
-                
-                # Detailed file listing with sizes
-                file_list = []
-                for f in Path(downloaded_folder).rglob('*'):
-                    if f.is_file():
-                        try:
-                            file_list.append(f"{f.relative_to(downloaded_folder)} ({f.stat().st_size} bytes)")
-                        except Exception as e:
-                            file_list.append(f"{f.name} [size error]")
-                logger.debug(f"Downloaded files:\n- " + "\n- ".join(file_list))
-                
-                # Verify critical files exist
-                required_files = {
-                    "config.json": False,
-                    "pytorch_model.bin": False,
-                    "tokenizer_config.json": False,
-                    "vocab.txt": False,
-                    "special_tokens_map.json": False
-                }
-                for fname in required_files:
-                    if (Path(downloaded_folder) / fname).exists():
-                        required_files[fname] = True
-                logger.info(f"Required files check:\n{json.dumps(required_files, indent=2)}")
-                logger.info(f"snapshot_download completed. Folder: {downloaded_folder}")
-                
-                # Detailed file listing with sizes
-                file_list = []
-                for f in Path(downloaded_folder).rglob('*'):
-                    if f.is_file():
-                        try:
-                            file_list.append(f"{f.relative_to(downloaded_folder)} ({f.stat().st_size} bytes)")
-                        except Exception as e:
-                            file_list.append(f"{f.name} [size error]")
-                logger.debug(f"Downloaded files:\n- " + "\n- ".join(file_list))
-                
-                # Verify critical files exist
-                required_files = {
-                    "config.json": False,
-                    "pytorch_model.bin": False,
-                    "tokenizer_config.json": False,
-                    "vocab.txt": False,
-                    "special_tokens_map.json": False
-                }
-                for fname in required_files:
-                    if (Path(downloaded_folder) / fname).exists():
-                        required_files[fname] = True
-                logger.info(f"Required files check:\n{json.dumps(required_files, indent=2)}")
-
-            except EntryNotFoundError:
-                logger.error(f"HfApi confirms EntryNotFoundError for {model_load_path}.", exc_info=True)
-            except Exception as e_snapshot:
-                logger.error(f"Error during manual HfApi/snapshot_download attempt: {e_snapshot}", exc_info=True)
-            # Re-raise original error
-            raise e_hf_model_load # Re-raise to be caught by the main handler
-
-        if self.model and self.tokenizer.pad_token_id is not None and self.tokenizer.pad_token_id >= self.model.config.vocab_size:
-            logger.info(f"Resizing token embeddings for I/O Validator '{model_load_path}'. Old vocab: {self.model.config.vocab_size}, New (tokenizer): {len(self.tokenizer)}")
-            self.model.resize_token_embeddings(len(self.tokenizer))
-        if self.model:
-            self.model.to(self.device)
-            logger.debug(f"I/O Validator model '{self.model.config._name_or_path}' moved to {self.device}.")
-        return self
-
-    def _create_dataloader(self, texts: List[str], labels: Optional[List[int]], batch_size: int, shuffle: bool = False):
-        if not self.tokenizer: raise RuntimeError("I/O Validator tokenizer not initialized.")
-        logger.debug(f"Creating DataLoader for I/O Validator: {len(texts)} texts, batch_size={batch_size}, shuffle={shuffle}, max_length={self.DEFAULT_MAX_LENGTH}")
-        encodings = self.tokenizer(texts, truncation=True, padding="max_length", max_length=self.DEFAULT_MAX_LENGTH, return_tensors="pt")
-        ds_input_ids, ds_attn_mask = encodings.input_ids, encodings.attention_mask
-        logger.debug(f"Encoded input_ids shape: {ds_input_ids.shape}, attention_mask shape: {ds_attn_mask.shape}")
-        if labels is not None:
-            logger.debug(f"Number of labels provided: {len(labels)}")
-            if len(ds_input_ids) != len(labels): 
-                min_len = min(len(ds_input_ids), len(labels))
-                logger.warning(f"Mismatch between encoded inputs ({len(ds_input_ids)}) and labels ({len(labels)}). Truncating to {min_len}.")
-                ds_input_ids, ds_attn_mask, labels = ds_input_ids[:min_len], ds_attn_mask[:min_len], labels[:min_len]
-            dataset = TensorDataset(ds_input_ids, ds_attn_mask, torch.tensor(labels, dtype=torch.long))
-        else: dataset = TensorDataset(ds_input_ids, ds_attn_mask)
-        logger.debug(f"TensorDataset created for I/O Validator. Sample 0 input_ids: {dataset[0][0][:10]}...")
-        return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, num_workers=0)
-
-    def train(self, train_texts: List[str], train_labels: List[int], eval_texts: Optional[List[str]] = None, eval_labels: Optional[List[int]] = None,
-              batch_size: int = 8, learning_rate: float = 2e-5, epochs: int = 3, gradient_accumulation_steps: int = 1,
-              early_stopping_patience: int = 0, warmup_ratio: float = 0.1, weight_decay: float = 0.01):
-        if not self.model or not self.tokenizer: raise RuntimeError("I/O Validator model/tokenizer not setup.")
-        logger.debug(f"I/O Validator training parameters: batch_size={batch_size}, lr={learning_rate}, epochs={epochs}, grad_accum={gradient_accumulation_steps}, early_stop={early_stopping_patience}, warmup_ratio={warmup_ratio}, weight_decay={weight_decay}")
-        train_loader = self._create_dataloader(train_texts, train_labels, batch_size, shuffle=True)
-        eval_loader = self._create_dataloader(eval_texts, eval_labels, batch_size) if eval_texts and eval_labels else None
-        if eval_loader: logger.debug(f"Evaluation DataLoader for I/O Validator created with {len(eval_loader.dataset)} samples.")
-
-        optimizer = AdamW(self.model.parameters(), lr=learning_rate, weight_decay=weight_decay)
-        total_steps = len(train_loader) * epochs // gradient_accumulation_steps
-        num_warmup_steps = int(total_steps * warmup_ratio)
-        scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=num_warmup_steps, num_training_steps=total_steps)
-        logger.debug(f"Optimizer: AdamW. Total train steps for I/O Validator: {total_steps}, Warmup steps: {num_warmup_steps}")
-        best_eval_metric, epochs_no_improve = -float('inf'), 0
-
-        logger.info("Starting I/O Validator training...")
-        for epoch in range(epochs):
-            if stop_signal_received: logger.info("I/O Validator training interrupted by signal."); break
-            self.model.train(); total_loss, train_steps = 0, 0
-            progress_bar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs} Training (I/O Validator)", leave=False, disable=logger.level > logging.INFO)
-            for step, batch_data in enumerate(progress_bar):
-                b_input_ids, b_attn_mask, b_labels = [b.to(self.device) for b in batch_data]
-                if step == 0 and epoch == 0: logger.debug(f"First batch - input_ids shape: {b_input_ids.shape}, attention_mask shape: {b_attn_mask.shape}, labels shape: {b_labels.shape}")
-                outputs = self.model(b_input_ids, attention_mask=b_attn_mask, labels=b_labels)
-                loss = outputs.loss
-                if gradient_accumulation_steps > 1: loss = loss / gradient_accumulation_steps
-                loss.backward(); total_loss += loss.item() * (gradient_accumulation_steps if gradient_accumulation_steps > 1 else 1); train_steps +=1
-                if (step + 1) % gradient_accumulation_steps == 0 or (step + 1) == len(train_loader):
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
-                    optimizer.step(); scheduler.step(); optimizer.zero_grad()
-                current_loss_display = loss.item() * (gradient_accumulation_steps if gradient_accumulation_steps > 1 else 1)
-                progress_bar.set_postfix({'loss': current_loss_display})
-                if step % (len(train_loader)//5 +1) == 0 : logger.debug(f"Epoch {epoch+1}, Step {step+1}: Current batch loss {current_loss_display:.4f}")
-
-            avg_train_loss = total_loss/train_steps if train_steps else 0
-            logger.info(f"Epoch {epoch+1} (I/O Validator) avg train loss: {avg_train_loss:.4f}")
-            if self.use_mlflow: self.mlflow_client.log_metric(f"io_validator_train_loss_epoch_{epoch+1}", avg_train_loss, step=epoch+1)
-
-            if eval_loader:
-                metrics = self._evaluate_from_loader(eval_loader)
-                logger.info(f"Epoch {epoch+1} (I/O Validator) Eval: {metrics}")
-                if self.use_mlflow:
-                    for m_name, m_val in metrics.items(): self.mlflow_client.log_metric(f"io_validator_eval_{m_name}_epoch_{epoch+1}", m_val, step=epoch+1)
-
-                current_metric = metrics.get('f1', metrics.get('accuracy', 0.0))
-                if current_metric > best_eval_metric:
-                    logger.debug(f"New best eval metric for I/O Validator: {current_metric:.4f} (was {best_eval_metric:.4f}). Saving 'best' model.")
-                    best_eval_metric, epochs_no_improve = current_metric, 0; self._save_model("best")
-                else: epochs_no_improve += 1
-                logger.debug(f"Epochs without improvement for I/O Validator: {epochs_no_improve}")
-                if early_stopping_patience > 0 and epochs_no_improve >= early_stopping_patience:
-                    logger.info(f"I/O Validator early stopping triggered after {epochs_no_improve} epochs without improvement."); break
-
-        logger.info("I/O Validator training finished."); self._save_model("latest")
-        if early_stopping_patience > 0 and (self.model_dir / "best").exists() and best_eval_metric > -float('inf'):
-            logger.info(f"Loading best I/O Validator model (metric: {best_eval_metric:.4f}).")
-            try:
-                self.model = AutoModelForSequenceClassification.from_pretrained(self.model_dir / "best").to(self.device)
-                self.tokenizer = AutoTokenizer.from_pretrained(self.model_dir / "best")
-                logger.debug("Successfully loaded best I/O Validator model and tokenizer.")
-            except Exception as e: logger.error(f"Failed to load best I/O Validator model: {e}", exc_info=True)
-        elif self.use_mlflow: self.mlflow_client.log_params({"io_validator_final_model_type": "latest_after_full_epochs"})
-        return self
-
-    def _evaluate_from_loader(self, eval_loader: DataLoader) -> Dict[str, float]:
-        if not self.model: raise RuntimeError("I/O Validator model not initialized for evaluation.")
-        self.model.eval(); total_loss, eval_steps = 0,0; all_logits, all_labels = [], []
-        logger.debug(f"Starting I/O Validator evaluation with {len(eval_loader.dataset)} samples.")
-        with torch.no_grad():
-            for batch_idx, batch_data in enumerate(tqdm(eval_loader, desc="Evaluating (I/O Validator)", leave=False, disable=logger.level > logging.INFO)):
-                b_input_ids, b_attn_mask, b_labels = [b.to(self.device) for b in batch_data]
-                if batch_idx == 0: logger.debug(f"Eval batch 0 - input_ids shape: {b_input_ids.shape}")
-                outputs = self.model(b_input_ids, attention_mask=b_attn_mask, labels=b_labels)
-                total_loss += outputs.loss.item(); eval_steps += 1
-                all_logits.append(outputs.logits.cpu().numpy()); all_labels.append(b_labels.cpu().numpy())
-        preds = np.argmax(np.concatenate(all_logits), axis=1)
-        true_labels = np.concatenate(all_labels)
-        logger.debug(f"I/O Validator evaluation shapes: preds {preds.shape}, true_labels {true_labels.shape}")
-        p, r, f1, _ = precision_recall_fscore_support(true_labels, preds, average='binary', zero_division=0)
-        acc = accuracy_score(true_labels, preds)
-        avg_loss = total_loss/eval_steps if eval_steps else 0
-        metrics = {'loss': avg_loss, 'accuracy': acc, 'precision': p, 'recall': r, 'f1': f1}
-        logger.debug(f"I/O Validator evaluation metrics computed: {metrics}")
-        return metrics
-
-    def predict(self, texts: List[str], batch_size: int = 16) -> List[Dict[str, Any]]:
-        if not self.model or not self.tokenizer: raise RuntimeError("I/O Validator model/tokenizer not setup.")
-        self.model.eval(); predictions_data = []
-        logger.debug(f"I/O Validator predicting for {len(texts)} texts, batch_size={batch_size}")
-        if texts: logger.debug(f"First text for I/O Validator prediction: '{texts[0][:100]}...'")
-        predict_loader = self._create_dataloader(texts, None, batch_size)
-        text_idx_offset = 0
-        with torch.no_grad():
-            for batch_idx, batch_data in enumerate(tqdm(predict_loader, desc="Predicting (I/O Validator)", leave=False, disable=logger.level > logging.INFO)):
-                b_input_ids, b_attn_mask = batch_data[0].to(self.device), batch_data[1].to(self.device)
-                if batch_idx == 0: logger.debug(f"Prediction batch 0 - input_ids shape: {b_input_ids.shape}")
-                logits = self.model(b_input_ids, attention_mask=b_attn_mask).logits
-                probs = torch.softmax(logits, dim=1).cpu().numpy()
-                preds = np.argmax(probs, axis=1)
-                logger.debug(f"Batch {batch_idx} - logits shape: {logits.shape}, probs shape: {probs.shape}, preds shape: {preds.shape}")
-                for i in range(len(preds)):
-                    current_text_idx = text_idx_offset + i
-                    if current_text_idx >= len(texts): 
-                        logger.error(f"Index out of bounds: current_text_idx={current_text_idx}, len(texts)={len(texts)}")
-                        continue
-                    current_text = texts[current_text_idx]
-                    parts = current_text.split(self.separator, 1)
-                    input_part = parts[0]
-                    output_part = parts[1] if len(parts) > 1 else ""
-                    pred_data_item = {'prediction': int(preds[i]), 'probability_positive': float(probs[i][1]),
-                                             'input_text': input_part, 'output_text': output_part}
-                    predictions_data.append(pred_data_item)
-                    if i==0 and batch_idx==0: logger.debug(f"First I/O Validator prediction item: {pred_data_item}")
-                text_idx_offset += len(preds)
-        return predictions_data
-
-    def classify_input_output_pair(self, input_text: str, output_text: str) -> Dict[str, Any]:
-        safe_output_text = output_text if output_text is not None else ""
-        full_text = f"{input_text}{self.separator}{safe_output_text}"
-        logger.debug(f"I/O Validator classifying pair. Input: '{input_text[:50]}...', Output: '{safe_output_text[:50]}...'. Combined: '{full_text[:100]}...'")
-        return self.predict([full_text])[0]
-
-    def _save_model(self, suffix: str = ""):
-        if not self.model or not self.tokenizer:
-            logger.warning("Attempted to save I/O Validator model, but model or tokenizer is not available.")
-            return
-        save_path = self.model_dir / suffix if suffix else self.model_dir
-        save_path.mkdir(parents=True, exist_ok=True)
-        logger.info(f"Saving I/O Validator model to {save_path}...")
-        self.model.save_pretrained(save_path)
-        if self.tokenizer:
-            self.tokenizer.save_pretrained(save_path)
-        else:
-            logger.warning(f"Tokenizer not available for I/O Validator, cannot save to {save_path}")
-        config_to_save = {"separator": self.separator, "model_base_id_on_train": self.model.config._name_or_path if self.model else self.model_id}
-        with open(save_path / "model_config.json", 'w', encoding='utf-8') as f: json.dump(config_to_save, f, indent=2)
-        logger.debug(f"Saved I/O Validator model config: {config_to_save} to {save_path / 'model_config.json'}")
-
-    @classmethod
-    def load(cls, model_dir: str, use_mlflow_during_load: bool = False):
-        model_dir_path = Path(model_dir);
-        logger.debug(f"Attempting to load I/O Validator model from directory: {model_dir_path}")
-        if not model_dir_path.exists() or not model_dir_path.is_dir():
-             raise FileNotFoundError(f"I/O Validator model directory not found: {model_dir_path}")
-
-        instance = cls(model_dir=str(model_dir_path), use_mlflow=use_mlflow_during_load)
-        instance.model_id = str(model_dir_path.resolve()) 
-        logger.debug(f"I/O Validator load: instance.model_id set to local fine-tuned path '{instance.model_id}' for setup.")
-        instance.setup() 
-
-        cfg_path = model_dir_path / "model_config.json"
-        if cfg_path.exists():
-            logger.debug(f"Loading I/O Validator model_config.json from {cfg_path}")
-            with open(cfg_path, 'r', encoding='utf-8') as f:
-                loaded_cfg = json.load(f)
-                instance.separator = loaded_cfg.get("separator", instance.separator)
-                logger.debug(f"Loaded separator '{instance.separator}' for I/O Validator from config. Loaded config: {loaded_cfg}")
-        else: logger.warning(f"I/O Validator model_config.json not found in {model_dir_path}")
-        logger.info(f"I/O Validator model loaded from {model_dir_path}.")
-        return instance
-
-    def get_hardware_info(self) -> Dict[str, Any]:
-        info = {"device": str(self.device), "cuda_available": torch.cuda.is_available(), "torch_version": torch.__version__, "transformers_version": transformers.__version__}
-        if torch.cuda.is_available() and self.device and self.device.type == 'cuda':
-             info["gpu_name"] = torch.cuda.get_device_name(0) if torch.cuda.device_count() > 0 else "N/A"
-        else: info["gpu_name"] = "N/A"
-        try: import flash_attn; info["flash_attn_available"] = True
-        except ImportError: info["flash_attn_available"] = False
-        logger.debug(f"I/O Validator Hardware Info collected: {info}")
-        return info
-
-class ColBERTReranker:
-    DEFAULT_MAX_LENGTH = 512; DEFAULT_PAD_TOKEN = "[PAD]"; DEFAULT_MODEL_ID = "sentence-transformers/msmarco-distilbert-base-tas-b"
-    COLBERT_CONFIG_FILENAME = "colbert_reranker_config.json"; REFERENCE_TEXTS_SNAPSHOT_FILENAME = "reference_texts_snapshot.json"
-    PRECOMPUTED_REF_EMBEDDINGS_FILENAME = "ref_embeddings.pt"
-    BUILTIN_REFERENCE_TEXTS_BY_CLASS: Dict[str, List[str]] = {
-        "Class 1: PII": ["SSN is 987-65-4321.", "User credit card ...1234, CVV 567."],
-        "Class 2: Sensitive Personal Data": ["Employee review: Needs improvement.", "User search: 'flu symptoms'."],
-        "Class 3: Confidential Personal Data": ["Customer email jane.doe@example.com.", "Shipping address: 123 Main St."],
-        "Class 4: Internal Data": ["Q3 marketing strategy 'Project Phoenix'.", "Internal memo: team-building."],
-        "Class 5: Public Data": ["Press release: new product.", "Company 'About Us' page."] }
-    CLASS_DESCRIPTIONS = { "Class 1: PII": "Most sensitive...", "Class 2: Sensitive Personal Data": "Highly restricted...",
-                           "Class 3: Confidential Personal Data": "Customer data...", "Class 4: Internal Data": "Company non-public...",
-                           "Class 5: Public Data": "Public data" }
-
-    def __init__(self, model_id_or_path: str = DEFAULT_MODEL_ID):
-        self.model_id_or_path = model_id_or_path
-        self.model: Optional[AutoModel] = None; self.tokenizer: Optional[AutoTokenizer] = None
-        self.device: Optional[torch.device] = None
-        self.reference_texts_for_model: Dict[str, List[str]] = {}
-        self.reference_token_embeddings_by_class: Dict[str, List[torch.Tensor]] = {}
-        self.is_fine_tuned: bool = False
-        logger.debug(f"ColBERTReranker initialized with model_id_or_path: '{self.model_id_or_path}'")
-        if not Path(self.model_id_or_path).is_dir():
-            logger.debug(f"'{self.model_id_or_path}' is not a directory, using built-in ColBERT references by default.")
-            self.reference_texts_for_model = copy.deepcopy(self.BUILTIN_REFERENCE_TEXTS_BY_CLASS)
-        else:
-            config_path = Path(self.model_id_or_path) / self.COLBERT_CONFIG_FILENAME
-            if config_path.exists():
-                logger.debug(f"Found ColBERT config at {config_path}, assuming fine-tuned model path.")
-                self.is_fine_tuned = True 
-
-    def _load_custom_references_from_jsonl(self, jsonl_path: Path):
-        logger.info(f"Loading ColBERT custom references from {jsonl_path}...")
-        custom_refs: Dict[str, List[str]] = {}
-        valid_cls = set(self.CLASS_DESCRIPTIONS.keys()) if self.CLASS_DESCRIPTIONS else None
-        logger.debug(f"Valid predefined class names for ColBERT: {valid_cls if valid_cls else 'Any (dynamic)'}")
-
-        if not jsonl_path.exists(): logger.error(f"Custom ref JSONL not found: {jsonl_path}"); return
-        try:
-            with open(jsonl_path, 'r', encoding='utf-8') as f:
-                for i, line in enumerate(f):
-                    try:
-                        item = json.loads(line)
-                        text, cls_name = item.get("text"), item.get("class_name")
-                        if not text or not cls_name:
-                            logger.debug(f"Skipping L{i+1} in {jsonl_path}: missing text or class_name. Item: {item}")
-                            continue
-                        if valid_cls and cls_name not in valid_cls:
-                             logger.warning(f"L{i+1} in {jsonl_path}: Class name '{cls_name}' not in known ColBERT CLASS_DESCRIPTIONS. Adding it dynamically.")
-                        custom_refs.setdefault(cls_name, []).append(text)
-                        if i < 5 : logger.debug(f"Loaded custom ref L{i+1}: Class '{cls_name}', Text '{text[:50]}...'")
-                    except json.JSONDecodeError: logger.warning(f"L{i+1} JSON error in {jsonl_path}")
-            if not custom_refs: logger.warning(f"No valid custom refs in {jsonl_path}"); return
-            self.reference_texts_for_model = custom_refs
-            num_loaded_refs = sum(len(v) for v in custom_refs.values())
-            num_loaded_classes = len(custom_refs)
-            logger.info(f"Loaded {num_loaded_refs} custom ColBERT references for {num_loaded_classes} classes.")
-            logger.debug(f"Final custom reference classes and counts: {{c: len(t) for c, t in self.reference_texts_for_model.items()}}")
-        except Exception as e: logger.error(f"Error loading custom ref file {jsonl_path}: {e}", exc_info=True)
-
-    def setup_model_and_references(self, cache_dir: Optional[Path] = None, force_recompute_embeddings: bool = False):
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        logger.info(f"ColBERT using device: {self.device} for model: {self.model_id_or_path}")
-        logger.debug(f"ColBERT setup: cache_dir='{cache_dir}', force_recompute_embeddings={force_recompute_embeddings}")
-        logger.debug(f"HF_TOKEN env var for ColBERT setup: {os.getenv('HF_TOKEN')}")
-        logger.debug(f"HUGGING_FACE_HUB_TOKEN env var for ColBERT setup: {os.getenv('HUGGING_FACE_HUB_TOKEN')}")
-        try:
-            logger.info(f"Attempting to load tokenizer for ColBERT from: {self.model_id_or_path}")
-            self.tokenizer = AutoTokenizer.from_pretrained(self.model_id_or_path)
-            if self.tokenizer.pad_token is None:
-                logger.debug("ColBERT tokenizer missing pad_token, adding default.")
-                self.tokenizer.add_special_tokens({'pad_token': self.DEFAULT_PAD_TOKEN})
-            logger.debug(f"ColBERT tokenizer.pad_token_id: {self.tokenizer.pad_token_id}, vocab_size: {self.tokenizer.vocab_size}")
-        except Exception as e: logger.error(f"Fatal: ColBERT tokenizer load error: {e}", exc_info=True); raise
-
-        has_flash_attn = False
-        if self.device.type == 'cuda':
-            try: import flash_attn; has_flash_attn = True; logger.info("Flash Attention 2 available for ColBERT.")
-            except ImportError: logger.info("Flash Attention 2 not found for ColBERT."); logger.debug("flash_attn import failed for ColBERT", exc_info=logger.level==logging.DEBUG)
-        model_kwargs = {}
-        if has_flash_attn and version.parse(torch.__version__) >= version.parse("2.0"): model_kwargs["attn_implementation"] = "flash_attention_2"
-        logger.debug(f"ColBERT model_kwargs for from_pretrained: {model_kwargs}")
-
-        try:
-            logger.info(f"Attempting to load base model for ColBERT from: {self.model_id_or_path}")
-            self.model = AutoModel.from_pretrained(self.model_id_or_path, **model_kwargs) 
-        except Exception as e:
-            logger.warning(f"Failed to load ColBERT with initial kwargs: {e}")
-            if model_kwargs: logger.warning("Failed ColBERT load w/ Flash Attn. Retrying default."); model_kwargs={}
-            try:
-                logger.debug(f"Retrying ColBERT load with kwargs: {model_kwargs}")
-                self.model = AutoModel.from_pretrained(self.model_id_or_path, **model_kwargs)
-            except Exception as e2: logger.error(f"Fatal: ColBERT model load error: {e2}", exc_info=True); raise
-
-        if self.model and self.tokenizer.pad_token_id is not None and self.tokenizer.pad_token_id >= self.model.config.vocab_size:
-             logger.debug(f"Resizing ColBERT token embeddings. Old vocab size: {self.model.config.vocab_size}, new (tokenizer): {len(self.tokenizer)}")
-             self.model.resize_token_embeddings(len(self.tokenizer))
-        if self.model:
-            self.model.to(self.device).eval()
-            logger.info(f"ColBERT Model '{self.model.config._name_or_path}' loaded and set to eval mode on {self.device}.")
-        else:
-            logger.error(f"ColBERT Model object is None after attempting to load {self.model_id_or_path}. Cannot proceed with setup.")
-            return
-
-        if not self.reference_texts_for_model:
-            logger.warning("No ColBERT references available (neither built-in nor custom loaded). Classification might not be meaningful.");
-            self.reference_token_embeddings_by_class = {}
-            return
-
-        emb_path = cache_dir / self.PRECOMPUTED_REF_EMBEDDINGS_FILENAME if cache_dir else None
-        ref_snapshot_path = cache_dir / self.REFERENCE_TEXTS_SNAPSHOT_FILENAME if cache_dir else None
-        logger.debug(f"ColBERT ref embeddings path: {emb_path}, snapshot path: {ref_snapshot_path}")
-
-        refs_match = False
-        if ref_snapshot_path and ref_snapshot_path.exists() and emb_path and emb_path.exists():
-            try:
-                logger.debug(f"Checking existing reference snapshot at {ref_snapshot_path}")
-                with open(ref_snapshot_path, 'r', encoding='utf-8') as f:
-                    snapshot_refs = json.load(f)
-                if snapshot_refs == self.reference_texts_for_model:
-                    refs_match = True
-                    logger.debug("Reference texts match snapshot.")
-                else:
-                    logger.info("Reference texts have changed since last embedding computation. Recomputing.")
-                    logger.debug(f"Snapshot refs: {str(snapshot_refs)[:200]}..., Current refs: {str(self.reference_texts_for_model)[:200]}...")
-            except Exception as e:
-                logger.warning(f"Could not compare reference snapshot: {e}. Recomputing embeddings.")
-
-        if not force_recompute_embeddings and emb_path and emb_path.exists() and refs_match:
-            try:
-                logger.debug(f"Attempting to load pre-computed ColBERT ref embeddings from {emb_path}")
-                self.reference_token_embeddings_by_class = torch.load(emb_path, map_location='cpu')
-                if set(self.reference_token_embeddings_by_class.keys()) == set(self.reference_texts_for_model.keys()):
-                    num_loaded_cls = len(self.reference_token_embeddings_by_class)
-                    num_loaded_embs = sum(len(v) for v in self.reference_token_embeddings_by_class.values())
-                    logger.info(f"Loaded {num_loaded_embs} pre-computed ColBERT ref embeddings for {num_loaded_cls} classes from {emb_path}.")
-                    return
-                else:
-                    logger.warning("Cached embeddings do not match current reference classes. Recomputing.")
-                    logger.debug(f"Cached emb keys: {set(self.reference_token_embeddings_by_class.keys())}, Current ref keys: {set(self.reference_texts_for_model.keys())}")
-            except Exception as e: logger.warning(f"Failed load pre-computed ColBERT embs: {e}. Recomputing.", exc_info=True)
-
-        logger.info("Computing ColBERT reference embeddings...");
-        self._compute_and_cache_reference_embeddings(embeddings_path=emb_path, ref_snapshot_path=ref_snapshot_path)
-
-    def _compute_and_cache_reference_embeddings(self, embeddings_path: Optional[Path], ref_snapshot_path: Optional[Path]):
-        if not self.model or not self.tokenizer: raise RuntimeError("ColBERT model/tokenizer not ready for embs.")
-        self.reference_token_embeddings_by_class = {}
-        all_texts_flat, class_text_counts = [], {}
-        logger.debug("Starting computation of ColBERT reference embeddings.")
-
-        for cls_name, texts in self.reference_texts_for_model.items():
-            if not texts:
-                logger.debug(f"Class '{cls_name}' has no reference texts, will have empty embeddings list.")
-                self.reference_token_embeddings_by_class[cls_name] = []
-                class_text_counts[cls_name] = 0
-                continue
-            all_texts_flat.extend(texts)
-            class_text_counts[cls_name] = len(texts)
-            logger.debug(f"For class '{cls_name}', added {len(texts)} texts to flat list for embedding.")
-
-        if not all_texts_flat:
-            logger.warning("No reference texts found across all classes to compute embeddings for ColBERT.")
-            if embeddings_path:
-                 try:
-                    embeddings_path.parent.mkdir(parents=True, exist_ok=True)
-                    torch.save(self.reference_token_embeddings_by_class, embeddings_path)
-                    logger.info(f"Saved (empty) ColBERT ref embs to {embeddings_path}")
-                    if ref_snapshot_path:
-                        with open(ref_snapshot_path, 'w', encoding='utf-8') as f: json.dump(self.reference_texts_for_model, f, indent=2)
-                        logger.debug(f"Saved empty reference snapshot to {ref_snapshot_path}")
-                 except Exception as e: logger.error(f"Failed save empty ColBERT ref embs: {e}", exc_info=True)
-            return
-
-        logger.debug(f"Total of {len(all_texts_flat)} reference texts to embed in batches.")
-        all_embs_gpu = self._get_token_embeddings_batched(all_texts_flat)
-        current_idx = 0
-        for cls_name, count in class_text_counts.items():
-            if count > 0:
-                cls_embs_gpu = all_embs_gpu[current_idx : current_idx + count]
-                self.reference_token_embeddings_by_class[cls_name] = [emb.cpu() for emb in cls_embs_gpu]
-                logger.debug(f"Assigned {len(cls_embs_gpu)} embeddings to class '{cls_name}'. First embedding shape (if any): {cls_embs_gpu[0].shape if cls_embs_gpu else 'N/A'}")
-                current_idx += count
-
-        if embeddings_path:
-            try:
-                embeddings_path.parent.mkdir(parents=True, exist_ok=True)
-                torch.save(self.reference_token_embeddings_by_class, embeddings_path)
-                logger.info(f"Saved ColBERT ref embs to {embeddings_path}")
-                if ref_snapshot_path:
-                    with open(ref_snapshot_path, 'w', encoding='utf-8') as f: json.dump(self.reference_texts_for_model, f, indent=2)
-                    logger.info(f"Saved ColBERT reference snapshot to {ref_snapshot_path}")
-            except Exception as e: logger.error(f"Failed save ColBERT ref embs/snapshot: {e}", exc_info=True)
-
-    def _get_token_embeddings_batched(self, texts: List[str], batch_size: int = 32, enable_grad: bool = False) -> List[torch.Tensor]:
-        if not self.tokenizer or not self.model: raise RuntimeError("ColBERT model/tokenizer not ready.")
-        all_embs_gpu = []
-        logger.debug(f"Getting token embeddings for {len(texts)} texts. Batch size: {batch_size}, enable_grad: {enable_grad}, max_length: {self.DEFAULT_MAX_LENGTH}")
-
-        original_model_training_state = self.model.training
-        if enable_grad: self.model.train(); logger.debug("Set ColBERT model to train mode for embeddings (grad enabled).")
-        else: self.model.eval(); logger.debug("Set ColBERT model to eval mode for embeddings (no grad).")
-
-        context_manager = torch.enable_grad() if enable_grad else torch.no_grad()
-
-        with context_manager:
-            for i in tqdm(range(0, len(texts), batch_size), desc="Tokenizing & Embedding ColBERT Batches", leave=False, disable=logger.level > logging.INFO):
-                batch_texts = texts[i:i+batch_size]
-                if i==0 and logger.level == logging.DEBUG : logger.debug(f"First batch texts (first text sample): '{batch_texts[0][:100]}...'")
-                inputs = self.tokenizer(batch_texts, padding=True, truncation=True, return_tensors="pt", max_length=self.DEFAULT_MAX_LENGTH).to(self.device)
-                outputs = self.model(**inputs).last_hidden_state 
-                if i==0 and logger.level == logging.DEBUG: logger.debug(f"Batch {i//batch_size} - input_ids shape: {inputs['input_ids'].shape}, last_hidden_state shape: {outputs.shape}")
-
-                for j in range(outputs.size(0)): 
-                    non_padded_mask = inputs['attention_mask'][j] == 1
-                    token_embeddings = outputs[j][non_padded_mask] 
-                    all_embs_gpu.append(token_embeddings)
-                    if i==0 and j==0 and logger.level == logging.DEBUG: logger.debug(f"First item in first batch - token_embeddings shape: {token_embeddings.shape}")
-
-        self.model.train(original_model_training_state) 
-        logger.debug(f"Restored ColBERT model training state to: {self.model.training}. Produced {len(all_embs_gpu)} embedding tensors.")
-        return all_embs_gpu
-
-    def _colbert_maxsim(self, query_embs: torch.Tensor, doc_embs: torch.Tensor) -> torch.Tensor:
-        if query_embs.ndim != 2 or doc_embs.ndim != 2 or query_embs.size(0) == 0 or doc_embs.size(0) == 0:
-            logger.debug(f"ColBERT MaxSim: Empty or non-2D input. Query shape: {query_embs.shape}, Doc shape: {doc_embs.shape}. Returning 0.")
-            dtype_to_use = query_embs.dtype if query_embs.numel() > 0 else (doc_embs.dtype if doc_embs.numel() > 0 else torch.float32)
-            device_to_use = self.device if self.device else 'cpu'
-            return torch.tensor(0.0, device=device_to_use, dtype=dtype_to_use)
-
-        q_dev, d_dev = query_embs.to(self.device), doc_embs.to(self.device)
-        q_norm = F.normalize(q_dev, p=2, dim=1) 
-        d_norm = F.normalize(d_dev, p=2, dim=1) 
-
-        sim_matrix = torch.matmul(q_norm, d_norm.T) 
-        if sim_matrix.numel() == 0:
-             logger.debug("ColBERT MaxSim: Similarity matrix is empty. Returning 0.")
-             return torch.tensor(0.0, device=self.device, dtype=q_dev.dtype)
-        
-        max_sim_scores_per_query_token = torch.max(sim_matrix, dim=1)[0] 
-        total_score = torch.sum(max_sim_scores_per_query_token)
-
-        if logger.level == logging.DEBUG:
-            logger.debug(f"ColBERT MaxSim: Query shape {query_embs.shape}, Doc shape {doc_embs.shape} on device {self.device}")
-            logger.debug(f"  Sim matrix shape: {sim_matrix.shape}, Max scores per query token shape: {max_sim_scores_per_query_token.shape}, Final sum: {total_score.item()}")
-        return total_score
-
-    def classify_text(self, text: str) -> Dict[str, Any]:
-        if not self.model: raise RuntimeError("ColBERT model not loaded.")
-        logger.debug(f"ColBERT classifying text: '{text[:100]}...'")
-        if not self.reference_token_embeddings_by_class and not self.reference_texts_for_model:
-            logger.warning("ColBERT has no reference texts or embeddings loaded. Cannot classify.")
-            return {"error": "ColBERT references not configured", "predicted_class": "N/A", "scores_by_class": {}}
-        if not self.reference_token_embeddings_by_class and self.reference_texts_for_model:
-            logger.error("ColBERT references exist but embeddings are missing. Please check setup.")
-            return {"error": "ColBERT reference embeddings missing", "predicted_class": "N/A", "scores_by_class": {}}
-
-        if not text.strip():
-            logger.debug("ColBERT classify_text: Input text is empty or whitespace.")
-            return {"input_text": text, "error": "Empty input text", "predicted_class": "N/A", "scores_by_class": {}}
-
-        query_embs_list = self._get_token_embeddings_batched([text])
-        if not query_embs_list:
-            logger.error(f"Failed to generate embeddings for input text: '{text[:100]}...'")
-            return {"input_text": text, "error": "Failed to generate embeddings for input text", "predicted_class": "N/A", "scores_by_class": {}}
-        query_embs_gpu = query_embs_list[0]
-        logger.debug(f"Query embedding shape for input text: {query_embs_gpu.shape}")
-
-        scores = {}
-        for cls_name, ref_embs_list_cpu in self.reference_token_embeddings_by_class.items():
-            logger.debug(f"Calculating score for class: '{cls_name}' which has {len(ref_embs_list_cpu)} reference embeddings.")
-            if not ref_embs_list_cpu:
-                scores[cls_name] = 0.0
-                logger.debug(f"  Class '{cls_name}' has no reference embeddings, score set to 0.0")
-                continue
-
-            class_total_score = 0.0
-            num_valid_references_for_class = 0
-            for idx, ref_cpu_embs in enumerate(ref_embs_list_cpu):
-                if ref_cpu_embs.numel() == 0:
-                    logger.debug(f"  Skipping empty reference embedding {idx} for class '{cls_name}'.")
-                    continue
-                if ref_cpu_embs.ndim == 1:
-                    logger.warning(f"Skipping 1D reference embedding {idx} for class {cls_name}. Shape: {ref_cpu_embs.shape}")
-                    continue
-
-                maxsim_score = self._colbert_maxsim(query_embs_gpu, ref_cpu_embs.to(self.device)).item()
-                logger.debug(f"  MaxSim score with ref {idx} ('{self.reference_texts_for_model.get(cls_name, ['N/A'])[idx][:30]}...') for class '{cls_name}': {maxsim_score:.4f}")
-                class_total_score += maxsim_score
-                num_valid_references_for_class +=1
-
-            if num_valid_references_for_class > 0:
-                scores[cls_name] = class_total_score / num_valid_references_for_class
-                logger.debug(f"  Average MaxSim score for class '{cls_name}': {scores[cls_name]:.4f} (from {num_valid_references_for_class} refs)")
+            logger.info(f"Loading VLM model: {self.model_path_or_id}")
+            
+            # Handle model path resolution
+            if os.path.exists(self.model_path_or_id):
+                model_path = self.model_path_or_id
             else:
-                scores[cls_name] = 0.0
-                logger.debug(f"  No valid reference embeddings found for class '{cls_name}' after filtering, score set to 0.0")
+                # For HuggingFace model IDs, user should provide local GGUF path
+                logger.error(f"Model path not found: {self.model_path_or_id}")
+                logger.info("Please provide a local path to a GGUF model file.")
+                return False
+            
+            self.model = llama_cpp.Llama(
+                model_path=model_path,
+                n_ctx=self.n_ctx,
+                n_gpu_layers=self.n_gpu_layers,
+                verbose=self.verbose
+            )
+            
+            self.is_loaded = True
+            logger.info(f"Successfully loaded VLM model from {model_path}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Failed to load VLM model: {e}", exc_info=True)
+            return False
+    
+    def reformat(self, markdown_text: str, prompt_template: str) -> str:
+        """Reformat markdown using the VLM."""
+        if not self.is_loaded:
+            if not self.load_model(): # Attempt to load if not already
+                raise RuntimeError("VLM model not loaded and failed to load.")
+        
+        if not self.model: # Should be caught by above, but as a safeguard
+             raise RuntimeError("VLM model is None after load attempt.")
 
-        pred_cls = max(scores, key=scores.get) if scores else "N/A"
-        class_desc = self.CLASS_DESCRIPTIONS.get(pred_cls, "Description not available") if pred_cls != "N/A" else "N/A"
-        logger.debug(f"Predicted class: '{pred_cls}'. All scores: {scores}")
+        try:
+            # Construct the full prompt
+            full_prompt = prompt_template.format(raw_markdown_content=markdown_text)
+            
+            logger.debug(f"VLM prompt length: {len(full_prompt)} characters")
+            
+            # Generate response
+            response = self.model(
+                full_prompt,
+                # max_tokens=8192, # Old: Potentially problematic if > n_ctx - prompt_tokens
+                max_tokens=None, # New: Let llama-cpp-python derive from n_ctx and prompt length for safety.
+                                 # Llama.__call__ defaults max_tokens to n_ctx - prompt_tokens if None.
+                temperature=0.1,
+                top_p=0.9,
+                stop=["```\n\n", "\n\n---", "END_OUTPUT"], # Stop sequences
+                echo=False # Don't echo the prompt in the output
+            )
+            
+            if response and "choices" in response and response["choices"]:
+                output_text = response["choices"][0]["text"].strip()
+                logger.debug(f"VLM output length: {len(output_text)} characters")
+                return output_text
+            else:
+                logger.error(f"No valid response or choices from VLM. Response: {response}")
+                return ""
+                
+        except Exception as e:
+            logger.error(f"Error during VLM inference: {e}", exc_info=True)
+            return ""
 
-        return {"input_text": text, "predicted_class": pred_cls,
-                "class_description": class_desc,
-                "scores_by_class (avg_maxsim)": scores}
+def create_vlm_markdown_prompt_template() -> str:
+    """Create the prompt template for VLM markdown processing."""
+    return """You are an expert document processor specialized in preparing markdown documents for RAG (Retrieval Augmented Generation) indexing.
 
-    def finetune(self, reference_jsonl_path: Path, output_model_dir: Path, base_model_id: str = DEFAULT_MODEL_ID,
-                 epochs: int = 3, learning_rate: float = 1e-5, batch_size: int = 4, triplet_margin: float = 0.2):
-        self.triplet_margin = triplet_margin 
-        logger.info(f"Starting ColBERT fine-tuning. Base: {base_model_id}, Output: {output_model_dir}")
-        logger.debug(f"Fine-tuning params: epochs={epochs}, lr={learning_rate}, batch_size={batch_size}, triplet_margin={triplet_margin}")
-        output_model_dir.mkdir(parents=True, exist_ok=True)
-        self._load_custom_references_from_jsonl(reference_jsonl_path)
-        if not self.reference_texts_for_model: logger.error("No ColBERT refs for fine-tuning from JSONL. Aborting."); return
+Your task is to analyze the following markdown document and output a structured JSON array where each object represents a semantic chunk optimized for search and retrieval.
 
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        logger.debug(f"ColBERT fine-tuning on device: {self.device}")
-        logger.debug(f"HF_TOKEN env var for ColBERT finetune: {os.getenv('HF_TOKEN')}")
-        logger.debug(f"HUGGING_FACE_HUB_TOKEN env var for ColBERT finetune: {os.getenv('HUGGING_FACE_HUB_TOKEN')}")
+Requirements:
+1. Create semantic chunks that preserve context and meaning.
+2. Maintain code blocks as complete units when possible.
+3. Identify and preserve document structure (headers, sections).
+4. Generate unique, descriptive IDs for each chunk (e.g., based on section and type).
+5. Extract relevant metadata for each chunk.
 
-        self.tokenizer = AutoTokenizer.from_pretrained(base_model_id)
-        if self.tokenizer.pad_token is None: self.tokenizer.add_special_tokens({'pad_token': self.DEFAULT_PAD_TOKEN})
-        self.model = AutoModel.from_pretrained(base_model_id).to(self.device) 
-        if self.model and self.tokenizer and self.tokenizer.pad_token_id is not None and self.model.config and self.tokenizer.pad_token_id >= self.model.config.vocab_size:
-             self.model.resize_token_embeddings(len(self.tokenizer))
-        if not self.model: logger.error("ColBERT model could not be loaded for fine-tuning. Aborting."); return
-        logger.debug(f"Base model '{base_model_id}' and tokenizer loaded for fine-tuning.")
+Output a valid JSON array with this exact structure, enclosed in a JSON code block:
+```json
+[
+  {{
+    "id": "unique_chunk_identifier_from_content_and_type",
+    "text": "The complete text content of this chunk. Preserve markdown formatting within the text, especially for code blocks.",
+    "metadata": {{
+      "h1_section": "Primary section title or null if not applicable",
+      "h2_section": "Secondary section title or null", 
+      "h3_section": "Tertiary section title or null",
+      "h4_section": "Quaternary section title or null",
+      "is_code_block": true_if_this_entire_chunk_is_a_single_code_block_else_false,
+      "contains_code_elements": true_if_chunk_contains_any_inline_code_or_code_blocks_else_false,
+      "contains_commands": true_if_chunk_contains_shell_commands_or_cli_examples_else_false,
+      "chunk_type": "header|content|code|example|reference|list_item|table_fragment",
+      "topics": ["extracted_topic1", "extracted_topic2"]
+    }}
+  }}
+]
+```
 
-        triplets = self._prepare_triplets_for_finetuning()
-        if not triplets: logger.error("No triplets generated for ColBERT fine-tuning. Aborting."); return
-        logger.info(f"Prepared {len(triplets)} triplets for fine-tuning.")
-        if triplets: logger.debug(f"Sample triplet 0: Anchor='{triplets[0][0][:50]}...', Pos='{triplets[0][1][:50]}...', Neg='{triplets[0][2][:50]}...'")
+Markdown Document to Process:
+---
+{raw_markdown_content}
+---
 
-        class TripletDataset(Dataset):
-            def __init__(self, d): self.d = d
-            def __len__(self): return len(self.d)
-            def __getitem__(self, i): return self.d[i]
+JSON Output:"""
 
-        def collate_fn(b): return ([x[0] for x in b], [x[1] for x in b], [x[2] for x in b])
-        dataloader = DataLoader(TripletDataset(triplets), batch_size=batch_size, shuffle=True, collate_fn=collate_fn)
-        optimizer = AdamW(self.model.parameters(), lr=learning_rate)
-        logger.debug(f"Triplet DataLoader and AdamW optimizer (lr={learning_rate}) created.")
+def reformat_markdown_with_vlm(
+    markdown_content: str, 
+    vlm_instance: MarkdownReformatterVLM, 
+    source_url: str,
+    target_chunk_size_hint: Optional[int] = 1000
+) -> List[Dict[str, Any]]:
+    """
+    Reformat markdown content using VLM into structured chunks.
+    """
+    logger.info(f"Processing markdown with VLM ({len(markdown_content)} chars from {source_url})")
+    
+    try:
+        # Get the prompt template
+        prompt_template = create_vlm_markdown_prompt_template()
+        
+        # Process with VLM
+        vlm_output = vlm_instance.reformat(markdown_content, prompt_template)
+        
+        if not vlm_output:
+            logger.error(f"VLM returned empty output for {source_url}")
+            # Fallback for this specific document
+            return fallback_markdown_processing(markdown_content, source_url, target_chunk_size_hint)
+        
+        # Parse VLM output
+        chunks = parse_vlm_output(vlm_output, source_url)
+        
+        if not chunks: # If VLM output parsing failed
+            logger.warning(f"Failed to parse VLM output for {source_url}, using fallback.")
+            return fallback_markdown_processing(markdown_content, source_url, target_chunk_size_hint)
 
-        self.model.train()
-        epoch_acc = 0 # Initialize epoch_acc
-        batches_processed_acc = 0 # Initialize batches_processed_acc for accuracy calculation
+        # Apply secondary chunking if needed
+        if target_chunk_size_hint:
+            chunks = apply_secondary_chunking(chunks, target_chunk_size_hint)
+        
+        logger.info(f"Successfully processed markdown from {source_url} into {len(chunks)} chunks via VLM.")
+        return chunks
+        
+    except Exception as e:
+        logger.error(f"Error in VLM markdown processing for {source_url}: {e}", exc_info=True)
+        # Fallback to simple chunking for this document
+        return fallback_markdown_processing(markdown_content, source_url, target_chunk_size_hint)
 
-        for epoch in range(epochs):
-            logger.info(f"ColBERT Fine-tune Epoch {epoch+1}/{epochs}"); total_loss_epoch = 0; batches_processed = 0
-            epoch_acc = 0 # Reset for each epoch
-            batches_processed_acc = 0 # Reset for each epoch
+def parse_vlm_output(vlm_output: str, source_url: str) -> List[Dict[str, Any]]:
+    """Parse VLM output into chunk structure."""
+    try:
+        # Extract JSON from VLM output (handles ```json ... ``` or just [...] )
+        json_str = None
+        # Try to find JSON within a fenced code block first
+        json_match_fenced = re.search(r'```json\s*(\[.*?\])\s*```', vlm_output, re.DOTALL)
+        if json_match_fenced:
+            json_str = json_match_fenced.group(1)
+        else:
+            # If not found, try to find a raw JSON array (more lenient)
+            json_match_raw = re.search(r'(\[.*?\])', vlm_output, re.DOTALL)
+            if json_match_raw:
+                json_str = json_match_raw.group(1)
+        
+        if not json_str:
+            logger.error(f"Could not extract JSON array from VLM output for {source_url}. Raw output sample: {vlm_output[:500]}...")
+            return []
+        
+        # Parse JSON
+        chunks_data = json.loads(json_str)
+        
+        if not isinstance(chunks_data, list):
+            logger.error(f"VLM output for {source_url} is not a JSON array. Parsed data type: {type(chunks_data)}")
+            return []
+        
+        # Validate and enhance chunks
+        validated_chunks = []
+        for i, chunk_data in enumerate(chunks_data):
+            try:
+                validated_chunk = validate_and_enhance_chunk(chunk_data, source_url, i)
+                if validated_chunk:
+                    validated_chunks.append(validated_chunk)
+            except Exception as e: # Catch errors during individual chunk validation
+                logger.warning(f"Error validating chunk {i} from {source_url}: {e}. Chunk data: {str(chunk_data)[:200]}")
+                continue # Skip this problematic chunk
+        
+        return validated_chunks
+        
+    except json.JSONDecodeError as e:
+        logger.error(f"JSON parsing error for {source_url}: {e}. Problematic JSON string sample: {json_str[:500] if json_str else 'N/A'}...")
+        logger.debug(f"Full VLM output for {source_url} that failed to parse: {vlm_output[:1000]}...")
+        return []
+    except Exception as e:
+        logger.error(f"Error parsing VLM output for {source_url}: {e}", exc_info=True)
+        return []
 
-            prog_bar = tqdm(dataloader, desc=f"Epoch {epoch+1} Fine-tuning ColBERT", leave=False, disable=logger.level > logging.INFO)
-            for batch_idx, (anchor_txts, pos_txts, neg_txts) in enumerate(prog_bar):
-                if stop_signal_received: logger.info("ColBERT fine-tuning interrupted by signal."); break
-                optimizer.zero_grad()
+def validate_and_enhance_chunk(chunk_data: Dict, source_url: str, index: int) -> Optional[Dict[str, Any]]:
+    """Validate and enhance a chunk from VLM output."""
+    try:
+        # Ensure required fields
+        if not isinstance(chunk_data, dict):
+            logger.warning(f"Chunk {index} from {source_url} is not a dictionary.")
+            return None
+        
+        text = chunk_data.get("text", "").strip()
+        if not text:
+            logger.warning(f"Chunk {index} from {source_url} has empty text.")
+            return None
+        
+        # Generate ID if missing or ensure it's a string
+        chunk_id = str(chunk_data.get("id", f"vlm_chunk_{source_url}_{index}"))
+        
+        # Ensure metadata structure
+        metadata = chunk_data.get("metadata", {})
+        if not isinstance(metadata, dict): # Ensure metadata is a dict
+            logger.warning(f"Chunk {index} from {source_url} has invalid metadata type: {type(metadata)}. Using empty metadata.")
+            metadata = {}
 
-                all_triplet_texts = anchor_txts + pos_txts + neg_txts
-                if batch_idx == 0: logger.debug(f"Epoch {epoch+1}, Batch {batch_idx}: Processing {len(anchor_txts)} triplets. Total texts in batch: {len(all_triplet_texts)}")
-                all_embs = self._get_token_embeddings_batched(all_triplet_texts, batch_size=len(all_triplet_texts), enable_grad=True)
+        enhanced_metadata = {
+            "h1_section": metadata.get("h1_section"),
+            "h2_section": metadata.get("h2_section"),
+            "h3_section": metadata.get("h3_section"), 
+            "h4_section": metadata.get("h4_section"),
+            "is_code_block": bool(metadata.get("is_code_block", False)),
+            "contains_code_elements": bool(metadata.get("contains_code_elements", '`' in text or "```" in text)), # Default if not provided
+            "contains_commands": bool(metadata.get("contains_commands", False)),
+            "chunk_type": metadata.get("chunk_type", "content"),
+            "topics": metadata.get("topics", []),
+            "source_url": source_url,
+            "vlm_processed": True,
+            "char_count": len(text),
+            "chunk_index": index
+        }
+        
+        return {
+            "id": chunk_id,
+            "text": text,
+            "metadata": enhanced_metadata
+        }
+        
+    except Exception as e: # Catch any unexpected error during validation
+        logger.error(f"Unexpected error validating chunk {index} from {source_url}: {e}")
+        return None
 
-                n_actual_triplets_in_batch = len(anchor_txts)
-                anc_e = all_embs[:n_actual_triplets_in_batch]
-                pos_e = all_embs[n_actual_triplets_in_batch : 2*n_actual_triplets_in_batch]
-                neg_e = all_embs[2*n_actual_triplets_in_batch:]
-                if batch_idx == 0: logger.debug(f"  Embeddings split: {len(anc_e)} anchors, {len(pos_e)} positives, {len(neg_e)} negatives.")
+def apply_secondary_chunking(chunks: List[Dict[str, Any]], target_size: int) -> List[Dict[str, Any]]:
+    """Apply secondary chunking to oversized chunks."""
+    result_chunks = []
+    
+    for chunk_idx, chunk in enumerate(chunks):
+        text = chunk["text"]
+        if len(text) <= target_size:
+            result_chunks.append(chunk)
+        else:
+            # Split large chunk
+            logger.info(f"Applying secondary chunking to chunk {chunk.get('id', chunk_idx)} (length {len(text)}) from {chunk.get('metadata',{}).get('source_url')}")
+            sub_chunks_text = split_text_with_overlap(text, target_size, target_size // 4)
+            for i, sub_text in enumerate(sub_chunks_text):
+                if not sub_text.strip(): # Skip empty sub-chunks
+                    continue
+                sub_chunk = copy.deepcopy(chunk)
+                sub_chunk["text"] = sub_text
+                sub_chunk["id"] = f"{chunk.get('id', f'chunk_{chunk_idx}')}_part_{i+1}"
+                sub_chunk["metadata"]["char_count"] = len(sub_text)
+                sub_chunk["metadata"]["is_sub_chunk"] = True
+                sub_chunk["metadata"]["parent_chunk_id"] = chunk.get('id', f'chunk_{chunk_idx}')
+                result_chunks.append(sub_chunk)
+    
+    return result_chunks
 
-                accumulated_batch_loss = []
-                current_batch_correct = 0
-                current_batch_total_valid_triplets = 0
+def split_text_with_overlap(text: str, chunk_size: int, overlap: int) -> List[str]:
+    """Split text into overlapping chunks, respecting sentence boundaries and newlines."""
+    if len(text) <= chunk_size:
+        return [text]
+    
+    chunks = []
+    start_index = 0
+    
+    while start_index < len(text):
+        end_index = min(start_index + chunk_size, len(text))
+        
+        # If we are not at the end of the text, try to find a good split point
+        if end_index < len(text):
+            # Prefer double newlines, then single newlines, then sentence-ending punctuation
+            split_delimiters = ['\n\n', '\n', '. ', '! ', '? ']
+            best_split_pos = -1
 
-                for i in range(n_actual_triplets_in_batch):
-                    current_anchor_emb = anc_e[i]
-                    current_pos_emb = pos_e[i]
-                    current_neg_emb = neg_e[i]
+            for delim in split_delimiters:
+                # Search backwards from end_index for the delimiter
+                pos = text.rfind(delim, start_index, end_index)
+                if pos != -1 and pos > start_index : # Ensure it's a valid split point
+                    # Check if this split point is better (closer to desired chunk_size, but not too small)
+                    if pos + len(delim) > start_index + (chunk_size // 4): # Avoid tiny first chunks
+                         best_split_pos = pos + len(delim)
+                         break # Found a good delimiter
+            
+            if best_split_pos != -1:
+                end_index = best_split_pos
+        
+        current_chunk_text = text[start_index:end_index].strip()
+        if current_chunk_text: # Add non-empty chunks
+            chunks.append(current_chunk_text)
+        
+        if end_index >= len(text): # Reached the end
+            break
+            
+        # Move start_index for the next chunk, considering overlap
+        # Ensure overlap doesn't cause infinite loops if chunk_size is too small relative to overlap
+        start_index = max(start_index + 1, end_index - overlap) 
+        if start_index >= end_index : # Safety break if start_index doesn't advance
+            logger.warning(f"Chunking might be stuck. Start: {start_index}, End: {end_index}. Advancing past end.")
+            start_index = end_index 
 
-                    if current_anchor_emb.size(0) == 0 or current_pos_emb.size(0) == 0 or current_neg_emb.size(0) == 0:
-                        logger.debug(f"Skipping triplet {i} in batch {batch_idx} due to empty embeddings (A:{current_anchor_emb.shape}, P:{current_pos_emb.shape}, N:{current_neg_emb.shape}). Anchor text: '{anchor_txts[i][:50]}...'")
+
+    return chunks
+
+def fallback_markdown_processing(markdown_content: str, source_url: str, target_chunk_size: Optional[int]) -> List[Dict[str, Any]]:
+    """Fallback to simple Python-based markdown processing."""
+    logger.warning(f"Using fallback markdown processing for {source_url}")
+    
+    # First, split by major headers (H1, H2) to create large semantic blocks
+    # This regex splits by H1 or H2, keeping the delimiter (header line)
+    # (?=^#{1,2} ) looks ahead for H1 or H2 at the start of a line
+    blocks = re.split(r'(?=^#{1,2} )', markdown_content, flags=re.MULTILINE)
+    
+    all_chunks = []
+    chunk_id_counter = 0
+    current_h1 = None
+    current_h2 = None
+
+    for block_content in blocks:
+        if not block_content.strip():
+            continue
+
+        block_lines = block_content.strip().split('\n')
+        first_line = block_lines[0]
+
+        if first_line.startswith('# ') and not first_line.startswith('##'):
+            current_h1 = first_line[2:].strip()
+            current_h2 = None # Reset H2 when a new H1 is encountered
+            # If the block is just the header, might skip or handle as header-only chunk
+            # For now, the content after header will be processed
+        elif first_line.startswith('## '):
+            current_h2 = first_line[3:].strip()
+
+        # Further split the block if it's too large, or process as is
+        # We can use a simple text splitter for these blocks or iterate by paragraphs/code blocks
+        
+        # Simplistic approach: treat the whole block as one, then apply secondary if too big
+        # More advanced: iterate through paragraphs and code blocks within this block
+        
+        # For this fallback, let's use the split_text_with_overlap on the block_content
+        # if target_chunk_size is provided.
+        
+        if target_chunk_size and len(block_content) > target_chunk_size:
+            sub_chunks_text = split_text_with_overlap(block_content, target_chunk_size, target_chunk_size // 4)
+        else:
+            sub_chunks_text = [block_content]
+
+        for sub_text in sub_chunks_text:
+            if not sub_text.strip():
+                continue
+
+            # Basic metadata extraction for this sub_chunk
+            # For H3/H4, one might parse sub_text, but this fallback is simpler
+            current_h3 = None # Simplified: not extracting H3/H4 in this basic fallback
+            current_h4 = None
+            
+            # Re-check headers for the sub_text, in case split_text_with_overlap split them
+            sub_text_lines = sub_text.strip().split('\n')
+            sub_first_line = sub_text_lines[0]
+            final_h1, final_h2 = current_h1, current_h2
+
+            if sub_first_line.startswith('# ') and not sub_first_line.startswith('##'):
+                final_h1 = sub_first_line[2:].strip()
+                final_h2 = None
+            elif sub_first_line.startswith('## '):
+                final_h2 = sub_first_line[3:].strip()
+
+
+            is_code_block_chunk = sub_text.strip().startswith('```') and sub_text.strip().endswith('```')
+            contains_code_elements = '`' in sub_text or "```" in sub_text
+            contains_commands = bool(re.search(r'^\s*(curl|python|pip|docker|git)', sub_text, re.MULTILINE | re.IGNORECASE))
+
+
+            chunk_data = {
+                "id": f"fallback_chunk_{source_url}_{chunk_id_counter}",
+                "text": sub_text.strip(),
+                "metadata": {
+                    "h1_section": final_h1,
+                    "h2_section": final_h2,
+                    "h3_section": current_h3, # Simplified
+                    "h4_section": current_h4, # Simplified
+                    "is_code_block": is_code_block_chunk,
+                    "contains_code_elements": contains_code_elements,
+                    "contains_commands": contains_commands,
+                    "chunk_type": "code" if is_code_block_chunk else "content",
+                    "topics": [], # Fallback doesn't extract topics
+                    "source_url": source_url,
+                    "vlm_processed": False,
+                    "char_count": len(sub_text.strip()),
+                    "chunk_index": chunk_id_counter
+                }
+            }
+            all_chunks.append(chunk_data)
+            chunk_id_counter += 1
+            
+    return all_chunks
+
+
+# --- Enhanced Documentation RAG Functions ---
+
+def fetch_documentation(docs_url_or_path: Union[str, List[str]]) -> str:
+    """Fetch documentation content from URL(s) or local file(s).
+    If a list is provided, it concatenates content from all sources.
+    If a single URL/path is provided, it fetches that one.
+    """
+    
+    sources_to_fetch = [docs_url_or_path] if isinstance(docs_url_or_path, str) else docs_url_or_path
+    
+    combined_content = ""
+    
+    for source_item in sources_to_fetch:
+        logger.info(f"Fetching documentation from: {source_item}")
+        content_for_item = ""
+        try:
+            if source_item.startswith(('http://', 'https://')):
+                with urllib.request.urlopen(source_item, timeout=30) as response:
+                    content_for_item = response.read().decode('utf-8')
+            else: # Assume local file path
+                file_path = Path(source_item)
+                if file_path.is_file():
+                    with open(file_path, 'r', encoding='utf-8') as f:
+                        content_for_item = f.read()
+                else:
+                    logger.error(f"Local file not found: {source_item}")
+                    continue # Skip this source
+            
+            # Add a source marker if combining multiple, or for clarity
+            combined_content += f"\n\n# Source Document: {source_item}\n\n{content_for_item}"
+            logger.debug(f"Successfully fetched {len(content_for_item)} characters from {source_item}")
+            
+        except Exception as e:
+            logger.error(f"Failed to fetch documentation from {source_item}: {e}")
+            continue # Skip this source
+    
+    if not combined_content.strip() and sources_to_fetch:
+        # Raise error only if all sources failed or were empty
+        raise RuntimeError(f"Could not fetch any documentation content from {sources_to_fetch}")
+    
+    logger.info(f"Successfully fetched {len(combined_content)} total characters of documentation.")
+    return combined_content
+
+def save_chunks_as_jsonl(chunks: List[Dict[str, Any]], output_path: Path) -> None:
+    """Save chunks to a JSONL file."""
+    logger.info(f"Saving {len(chunks)} chunks to {output_path}")
+    
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    
+    with open(output_path, 'w', encoding='utf-8') as f:
+        for chunk in chunks:
+            f.write(json.dumps(chunk) + '\n')
+    
+    logger.info(f"Successfully saved chunks to {output_path}")
+
+def build_documentation_rag_index(
+    docs_url_or_path_list: Union[str, List[str]], 
+    index_path: Path, 
+    embedding_model_id: str, 
+    chunk_size: int, 
+    chunk_overlap: int, # Note: chunk_overlap is not directly used by VLM, but by secondary/fallback
+    vlm_model_path: Optional[str] = None,
+    processing_strategy: str = "vlm"
+) -> bool:
+    """Build a RAG index from documentation using VLM or fallback processing.
+       Processes each document source individually for better metadata.
+    """
+    try:
+        logger.info(f"Building documentation RAG index at {index_path} using strategy '{processing_strategy}'")
+        
+        all_processed_chunks: List[Dict[str, Any]] = []
+        
+        sources_to_process = [docs_url_or_path_list] if isinstance(docs_url_or_path_list, str) else docs_url_or_path_list
+
+        vlm_processor_instance: Optional[MarkdownReformatterVLM] = None
+        if processing_strategy == "vlm" and vlm_model_path and LLAMA_CPP_AVAILABLE:
+            vlm_processor_instance = MarkdownReformatterVLM(vlm_model_path)
+            # Try to load model once if VLM strategy is chosen
+            if not vlm_processor_instance.load_model():
+                logger.warning("VLM model loading failed. Will fallback to Python processing for all documents.")
+                processing_strategy = "python" # Force fallback for all if initial load fails
+                vlm_processor_instance = None # Ensure it's not used
+
+        for doc_source_identifier in sources_to_process:
+            logger.info(f"Fetching and processing documentation from: {doc_source_identifier}")
+            try:
+                # fetch_documentation now returns content prefixed with "# Source Document: ..."
+                markdown_content_for_source = fetch_documentation(doc_source_identifier)
+                
+                # Check if meaningful content was fetched (beyond the added source header)
+                source_header = f"# Source Document: {doc_source_identifier}"
+                actual_content_test = markdown_content_for_source.replace(source_header, "").strip()
+                if not actual_content_test:
+                    logger.warning(f"No actual content fetched from {doc_source_identifier} (after removing source header), skipping.")
+                    continue
+
+                source_url_for_chunks = str(doc_source_identifier) # Use the specific identifier
+                doc_chunks: List[Dict[str, Any]] = []
+
+                if processing_strategy == "vlm" and vlm_processor_instance and vlm_processor_instance.is_loaded:
+                    logger.info(f"Using VLM-based markdown processing for {source_url_for_chunks}")
+                    doc_chunks = reformat_markdown_with_vlm(
+                        markdown_content_for_source, 
+                        vlm_processor_instance, 
+                        source_url_for_chunks, 
+                        chunk_size 
+                    )
+                else:
+                    if processing_strategy == "vlm": # VLM was intended but failed or unavailable
+                        logger.info(f"VLM processing requested but conditions not met for {source_url_for_chunks}. Using fallback Python processing.")
+                    else: # Fallback was explicitly chosen
+                        logger.info(f"Using fallback Python-based markdown processing for {source_url_for_chunks}")
+                    doc_chunks = fallback_markdown_processing(markdown_content_for_source, source_url_for_chunks, chunk_size) # Pass target_chunk_size
+                
+                if doc_chunks:
+                    all_processed_chunks.extend(doc_chunks)
+                else:
+                    logger.warning(f"No chunks created from {source_url_for_chunks}")
+
+            except RuntimeError as e: 
+                logger.error(f"Could not fetch or process content from {doc_source_identifier}: {e}")
+            except Exception as e:
+                logger.error(f"General error processing document {doc_source_identifier}: {e}", exc_info=True)
+        
+        if not all_processed_chunks:
+            logger.error("No chunks created from any documentation source(s). Index not built.")
+            return False
+        
+        temp_jsonl = index_path.parent / f"{index_path.name}_temp_chunks.jsonl"
+        save_chunks_as_jsonl(all_processed_chunks, temp_jsonl)
+        
+        retriever = RAGRetriever(index_path)
+        retriever.index_corpus(
+            corpus_path=temp_jsonl,
+            embedding_model_id=embedding_model_id,
+            doc_id_field="id",
+            text_field="text",
+            metadata_fields=[ # Ensure these match what validate_and_enhance_chunk & fallback_markdown_processing produce
+                "h1_section", "h2_section", "h3_section", "h4_section",
+                "is_code_block", "contains_code_elements", "contains_commands", 
+                "chunk_type", "topics", "source_url", "vlm_processed",
+                "char_count", "chunk_index", "is_sub_chunk", "parent_chunk_id" # Added potential secondary chunking metadata
+            ]
+        )
+        
+        temp_jsonl.unlink(missing_ok=True)
+        
+        logger.info(f"Successfully built documentation RAG index with {len(all_processed_chunks)} chunks from {len(sources_to_process)} source(s).")
+        return True
+        
+    except Exception as e:
+        logger.error(f"Failed to build documentation RAG index: {e}", exc_info=True)
+        return False
+
+# --- RAGRetriever Class (Preserved) ---
+class RAGRetriever:
+    INDEX_CONFIG_FILE = "rag_index_config.json"
+    DOCUMENTS_FILE = "documents.jsonl"
+    EMBEDDINGS_FILE = "embeddings.npy"
+
+    def __init__(self, index_path: Union[str, Path]):
+        self.index_path = Path(index_path)
+        self.config: Optional[Dict[str, Any]] = None
+        self.documents: List[Dict[str, Any]] = []
+        self.embeddings: Optional[np.ndarray] = None
+        self.model: Optional[SentenceTransformer] = None
+        self._is_loaded = False
+
+    def _load_model(self, model_id: str):
+        if self.model and self.config and self.config.get("embedding_model_id") == model_id:
+            logger.debug(f"SentenceTransformer model '{model_id}' already loaded.")
+            return
+        try:
+            self.model = SentenceTransformer(model_id)
+            logger.info(f"SentenceTransformer model '{model_id}' loaded.")
+        except Exception as e:
+            logger.error(f"Failed to load SentenceTransformer model '{model_id}': {e}")
+            raise
+
+    def index_corpus(self, corpus_path: Union[str, Path],
+                     embedding_model_id: str = "all-MiniLM-L6-v2",
+                     doc_id_field: str = "id",
+                     text_field: str = "text",
+                     metadata_fields: Optional[List[str]] = None,
+                     batch_size: int = 32):
+        logger.info(f"Starting RAG corpus indexing from '{corpus_path}'")
+        corpus_path = Path(corpus_path)
+        
+        if not corpus_path.exists():
+            raise FileNotFoundError(f"Corpus file not found: {corpus_path}")
+
+        self._load_model(embedding_model_id)
+        self.index_path.mkdir(parents=True, exist_ok=True)
+        
+        parsed_documents = []
+        texts_to_embed = []
+        
+        with open(corpus_path, 'r', encoding='utf-8') as f:
+            for i, line in enumerate(f):
+                try:
+                    item = json.loads(line)
+                    doc_id = item.get(doc_id_field)
+                    text_content = item.get(text_field)
+
+                    if doc_id is None or text_content is None:
+                        logger.warning(f"Skipping line {i+1}: missing ID or text")
                         continue
                     
-                    current_batch_total_valid_triplets +=1
-                    score_pos = self._colbert_maxsim(current_anchor_emb, current_pos_emb)
-                    score_neg = self._colbert_maxsim(current_anchor_emb, current_neg_emb)
-                    triplet_loss = F.relu(triplet_margin - score_pos + score_neg)
-                    accumulated_batch_loss.append(triplet_loss)
-                    if batch_idx == 0 and i < 2: logger.debug(f"  Triplet {i}: score_pos={score_pos.item():.4f}, score_neg={score_neg.item():.4f}, loss={triplet_loss.item():.4f}")
+                    # Ensure text_content is a string
+                    text_content_str = str(text_content)
+
+                    metadata = {}
+                    if metadata_fields:
+                        for m_field in metadata_fields:
+                            if m_field in item.get("metadata", {}): # Access metadata correctly
+                                metadata[m_field] = item["metadata"][m_field]
+                            elif m_field in item: # Fallback for top-level metadata (less common)
+                                 metadata[m_field] = item[m_field]
+
                     
-                    with torch.no_grad():
-                         if (score_pos > score_neg + self.triplet_margin): # Check accuracy condition
-                            current_batch_correct +=1
-                
-                if current_batch_total_valid_triplets > 0:
-                    epoch_acc += current_batch_correct / current_batch_total_valid_triplets # Add batch accuracy to epoch accuracy
-                    batches_processed_acc +=1
-
-
-                if accumulated_batch_loss:
-                    mean_batch_loss = torch.stack(accumulated_batch_loss).mean()
-                    mean_batch_loss.backward()
-                    optimizer.step()
-
-                    total_loss_epoch += mean_batch_loss.item()
-                    batches_processed += 1
-                    batch_accuracy_display = (current_batch_correct / current_batch_total_valid_triplets) * 100 if current_batch_total_valid_triplets > 0 else "N/A"
-                    prog_bar.set_postfix({
-                        'loss': mean_batch_loss.item(),
-                        'acc': f"{batch_accuracy_display:.1f}%" if isinstance(batch_accuracy_display, float) else batch_accuracy_display
+                    parsed_documents.append({
+                        "id": str(doc_id),
+                        "text": text_content_str,
+                        "metadata": metadata
                     })
-                    if batch_idx % (len(dataloader)//5 +1) == 0: logger.debug(f"  Batch {batch_idx} mean loss: {mean_batch_loss.item():.4f}")
-                else:
-                    prog_bar.set_postfix({'loss': 0.0, 'skipped_batch': True, 'acc': "N/A"})
-                    logger.debug(f"  Batch {batch_idx} skipped as no valid triplets were processed.")
+                    texts_to_embed.append(text_content_str)
 
-            if stop_signal_received: break
-            avg_epoch_loss = total_loss_epoch / batches_processed if batches_processed else 0
-            avg_acc_epoch = (epoch_acc / batches_processed_acc) * 100 if batches_processed_acc > 0 else 0
-            logger.info(f"ColBERT Epoch {epoch+1} - Loss: {avg_epoch_loss:.4f}, Accuracy: {avg_acc_epoch:.1f}%")
+                except json.JSONDecodeError:
+                    logger.warning(f"Skipping line {i+1}: JSON decode error")
+                except Exception as e:
+                    logger.warning(f"Skipping line {i+1} due to unexpected error: {e}")
+        
+        if not texts_to_embed:
+            logger.error("No valid documents found in corpus to embed.")
+            return
 
-        self.model.eval()
-        logger.info("ColBERT fine-tuning finished.");
-        self._save_fine_tuned_model_assets(output_model_dir, base_model_id)
-        self.model_id_or_path = str(output_model_dir.resolve())
-        self.is_fine_tuned = True
-        logger.info(f"Re-setting up ColBERT with fine-tuned model from {self.model_id_or_path} and recomputing reference embeddings.")
-        self.setup_model_and_references(cache_dir=output_model_dir, force_recompute_embeddings=True)
+        logger.info(f"Embedding {len(texts_to_embed)} documents...")
+        if not self.model:
+            logger.error("Embedding model not loaded. Cannot proceed with indexing.")
+            return
 
-    def _save_fine_tuned_model_assets(self, save_dir: Path, base_model_id_used: str):
-        save_dir.mkdir(parents=True, exist_ok=True)
-        logger.debug(f"Saving fine-tuned ColBERT assets to {save_dir}. Base model used for tuning: {base_model_id_used}")
-        if self.model: self.model.save_pretrained(save_dir)
-        if self.tokenizer: self.tokenizer.save_pretrained(save_dir)
-
-        snapshot_path = save_dir / self.REFERENCE_TEXTS_SNAPSHOT_FILENAME
-        logger.debug(f"Saving reference texts snapshot (used for this fine-tuning) to {snapshot_path}")
-        with open(snapshot_path, 'w', encoding='utf-8') as f: json.dump(self.reference_texts_for_model, f, indent=2)
-
-        config_data = {
-            "base_model_id_used_for_finetuning": base_model_id_used,
-            "finetuned_from_hf_id_or_path_before_this_finetune": self.model.config._name_or_path if self.model else "N/A", 
-            "timestamp": time.time(),
-            "source_reference_texts_summary": {cls: len(texts) for cls, texts in self.reference_texts_for_model.items()}
+        embeddings_array = self.model.encode(
+            texts_to_embed, 
+            batch_size=batch_size, 
+            show_progress_bar=True, 
+            normalize_embeddings=True # Normalizing is good for cosine similarity
+        )
+        
+        # Save documents
+        with open(self.index_path / self.DOCUMENTS_FILE, 'w', encoding='utf-8') as f_docs:
+            for doc in parsed_documents:
+                f_docs.write(json.dumps(doc) + '\n')
+        
+        # Save embeddings
+        np.save(self.index_path / self.EMBEDDINGS_FILE, embeddings_array)
+        
+        # Save config
+        self.config = {
+            "embedding_model_id": embedding_model_id,
+            "doc_id_field": doc_id_field,
+            "text_field": text_field,
+            "metadata_fields": metadata_fields or [],
+            "num_documents": len(parsed_documents),
+            "embedding_dimension": embeddings_array.shape,
+            "index_timestamp": time.time()
         }
-        config_path = save_dir / self.COLBERT_CONFIG_FILENAME
-        logger.debug(f"Saving ColBERT fine-tuning config to {config_path}: {config_data}")
-        with open(config_path, 'w', encoding='utf-8') as f: json.dump(config_data, f, indent=2)
-        logger.info(f"Fine-tuned ColBERT assets (model, tokenizer, references, config) saved to {save_dir}")
+        
+        with open(self.index_path / self.INDEX_CONFIG_FILE, 'w', encoding='utf-8') as f_cfg:
+            json.dump(self.config, f_cfg, indent=2)
+        
+        logger.info(f"Successfully indexed {len(parsed_documents)} documents to {self.index_path}")
+        self.documents = parsed_documents
+        self.embeddings = embeddings_array
+        self._is_loaded = True
 
-    def _prepare_triplets_for_finetuning(self) -> List[Tuple[str, str, str]]:
-        import random
-        triplets = []; class_names = list(self.reference_texts_for_model.keys())
-        logger.debug(f"Preparing triplets for ColBERT fine-tuning from {len(class_names)} classes.")
-        if len(class_names) < 2:
-            logger.warning("Need at least 2 classes with reference texts for ColBERT triplet generation. No triplets generated.")
+    def load_index(self) -> bool:
+        if self._is_loaded:
+            return True
+            
+        logger.info(f"Loading RAG index from '{self.index_path}'")
+        
+        if not self.index_path.is_dir():
+            logger.error(f"Index directory not found: {self.index_path}")
+            return False
+        
+        config_file = self.index_path / self.INDEX_CONFIG_FILE
+        docs_file = self.index_path / self.DOCUMENTS_FILE
+        embed_file = self.index_path / self.EMBEDDINGS_FILE
+
+        if not all([config_file.exists(), docs_file.exists(), embed_file.exists()]):
+            logger.error(f"Index files missing in '{self.index_path}'. Cannot load.")
+            return False
+        
+        try:
+            with open(config_file, 'r', encoding='utf-8') as f:
+                self.config = json.load(f)
+            
+            self._load_model(self.config["embedding_model_id"])
+
+            self.documents = []
+            with open(docs_file, 'r', encoding='utf-8') as f_docs:
+                for line in f_docs:
+                    self.documents.append(json.loads(line))
+            
+            self.embeddings = np.load(embed_file)
+
+            if len(self.documents) != self.embeddings.shape[0]:
+                logger.error(f"Document count ({len(self.documents)}) and embedding count ({self.embeddings.shape}) mismatch. Index corrupt.")
+                return False
+            
+            self._is_loaded = True
+            logger.info(f"Successfully loaded RAG index with {len(self.documents)} documents from {self.index_path}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error loading RAG index from {self.index_path}: {e}", exc_info=True)
+            self._is_loaded = False # Ensure consistent state on failure
+            self.config = None
+            self.documents = []
+            self.embeddings = None
+            return False
+
+    def retrieve(self, query: str, top_k: int = 5) -> List[Dict[str, Any]]:
+        if not self._is_loaded and not self.load_index(): # Attempt to load if not loaded
+            logger.error("Cannot retrieve: RAG index not loaded and failed to load.")
+            return []
+        
+        if not self.model or self.embeddings is None or not self.documents:
+            logger.error("Cannot retrieve: model, embeddings, or documents unavailable even after load attempt.")
+            return []
+            
+        try:
+            query_embedding = self.model.encode(query, normalize_embeddings=True)
+            # Ensure embeddings are 2D for dot product, query_embedding is 1D
+            # Similarities: (num_docs, embed_dim) dot (embed_dim,) -> (num_docs,)
+            similarities = np.dot(self.embeddings, query_embedding).flatten() 
+            
+            # Get indices of top_k largest similarities
+            # Using argpartition for efficiency if only top_k are needed, then sort only those.
+            # For typical top_k values, argsort is fine.
+            if top_k >= len(similarities): # Handle case where top_k is more than available docs
+                 top_k_indices = np.argsort(-similarities) # Sort all
+            else:
+                 top_k_indices = np.argpartition(-similarities, top_k)[:top_k]
+                 # Sort only the selected top_k partition by their scores
+                 top_k_indices = top_k_indices[np.argsort(-similarities[top_k_indices])]
+
+
+            results = []
+            for idx in top_k_indices:
+                doc = self.documents[idx]
+                score = float(similarities[idx]) # Make sure score is standard float
+                results.append({
+                    "id": doc["id"],
+                    "text": doc["text"],
+                    "metadata": doc.get("metadata", {}),
+                    "score": score
+                })
+            
+            return results
+            
+        except Exception as e:
+            logger.error(f"Error during RAG retrieval: {e}", exc_info=True)
             return []
 
-        for cls_name, texts in self.reference_texts_for_model.items():
-            if len(texts) < 2:
-                logger.debug(f"Skipping class '{cls_name}' for triplet generation: needs at least 2 examples, found {len(texts)}.")
-                continue
+    def get_status(self) -> Dict[str, Any]:
+        if not self._is_loaded:
+            exists = self.index_path.is_dir() and \
+                     (self.index_path / self.INDEX_CONFIG_FILE).exists() and \
+                     (self.index_path / self.DOCUMENTS_FILE).exists() and \
+                     (self.index_path / self.EMBEDDINGS_FILE).exists()
+            if exists:
+                try:
+                    with open(self.index_path / self.INDEX_CONFIG_FILE, 'r') as f:
+                        cfg = json.load(f)
+                    return {
+                        "status": "exists_not_loaded",
+                        "index_path": str(self.index_path),
+                        "num_documents": cfg.get("num_documents"),
+                        "embedding_model_id": cfg.get("embedding_model_id")
+                    }
+                except Exception as e:
+                    logger.warning(f"Could not read config for existing but unloaded index: {e}")
+                    return {"status": "exists_corrupt_config", "index_path": str(self.index_path)}
+            else:
+                return {"status": "does_not_exist", "index_path": str(self.index_path)}
+        
+        # If loaded
+        return {
+            "status": "loaded",
+            "index_path": str(self.index_path),
+            "num_documents": len(self.documents) if self.documents else self.config.get("num_documents",0),
+            "embedding_model_id": self.config.get("embedding_model_id", "N/A") if self.config else "N/A",
+            "embedding_dimension": self.embeddings.shape if self.embeddings is not None else (self.config.get("embedding_dimension", "N/A") if self.config else "N/A"),
+        }
 
-            other_classes_with_texts = {cn: txts_list for cn, txts_list in self.reference_texts_for_model.items() if cn != cls_name and txts_list}
-            if not other_classes_with_texts:
-                logger.debug(f"Skipping class '{cls_name}' for triplet generation: no other classes with texts available for negatives.")
-                continue
-            logger.debug(f"Generating triplets for class '{cls_name}' ({len(texts)} texts). Other classes for negatives: {list(other_classes_with_texts.keys())}")
+# --- Placeholder Model Classes (for completeness) ---
 
-            for i, anchor_text in enumerate(texts):
-                positive_candidates = texts[:i] + texts[i+1:]
-                if not positive_candidates: continue 
-                positive_text = random.choice(positive_candidates)
-
-                negative_class_name = random.choice(list(other_classes_with_texts.keys()))
-                negative_text = random.choice(other_classes_with_texts[negative_class_name])
-
-                triplets.append((anchor_text, positive_text, negative_text))
-                if len(triplets) < 5 and logger.level == logging.DEBUG: 
-                     logger.debug(f"  Created triplet: A='{anchor_text[:30]}...', P='{positive_text[:30]}...', N='{negative_text[:30]}...' (from class '{negative_class_name}')")
-
-        random.shuffle(triplets)
-        logger.debug(f"Total {len(triplets)} triplets generated and shuffled.")
-        return triplets
-
-    @classmethod
-    def load_from_directory(cls, model_directory: Path):
-        logger.info(f"Loading fine-tuned ColBERT from: {model_directory}")
-        if not model_directory.is_dir(): raise FileNotFoundError(f"ColBERT model dir not found: {model_directory}")
-
-        cfg_p = model_directory / cls.COLBERT_CONFIG_FILENAME
-        ref_p = model_directory / cls.REFERENCE_TEXTS_SNAPSHOT_FILENAME
-        logger.debug(f"ColBERT load paths: Config='{cfg_p}', References Snapshot='{ref_p}'")
-
-        if not cfg_p.exists(): raise FileNotFoundError(f"Missing ColBERT config ({cls.COLBERT_CONFIG_FILENAME}) in {model_directory}")
-        if not ref_p.exists(): raise FileNotFoundError(f"Missing ColBERT reference snapshot ({cls.REFERENCE_TEXTS_SNAPSHOT_FILENAME}) in {model_directory}")
-
-        instance = cls(str(model_directory.resolve())) 
-        instance.is_fine_tuned = True
-        logger.debug(f"ColBERT instance created for loading, model_id_or_path set to '{instance.model_id_or_path}', is_fine_tuned=True.")
+class ModernBERTClassifier:
+    """I/O Validator using transformer models."""
+    DEFAULT_MODEL_ID = "microsoft/deberta-v3-base"
+    
+    def __init__(self, model_id: str = DEFAULT_MODEL_ID, **kwargs):
+        self.model_id = model_id
+        self.model = None
+        self.tokenizer = None
+        self.is_setup = False
+        logger.info(f"ModernBERTClassifier initialized with model: {model_id}")
+    
+    def setup(self):
+        """Load model and tokenizer from Hugging Face."""
+        from transformers import AutoModelForSequenceClassification, AutoTokenizer
+        
+        try:
+            logger.info(f"Loading ModernBERT model: {self.model_id}")
+            self.tokenizer = AutoTokenizer.from_pretrained(self.model_id, use_fast=True)
+            self.model = AutoModelForSequenceClassification.from_pretrained(self.model_id)
+            self.is_setup = True
+            logger.info("Model and tokenizer loaded successfully")
+        except Exception as e:
+            logger.error(f"Error loading model: {e}")
+            raise
+        return self
+    
+    def classify_input_output_pair(self, input_text: str, output_text: str) -> Dict[str, Any]:
+        """Classify input-output pair using transformer model."""
+        if not self.is_setup:
+            self.setup()
 
         try:
-            with open(ref_p, 'r', encoding='utf-8') as f:
-                instance.reference_texts_for_model = json.load(f)
-            num_loaded_refs = sum(len(v) for v in instance.reference_texts_for_model.values())
-            num_loaded_classes = len(instance.reference_texts_for_model)
-            logger.info(f"Loaded {num_loaded_refs} reference texts for {num_loaded_classes} classes for fine-tuned ColBERT from {ref_p}")
-            logger.debug(f"Loaded reference text details: {{c: len(t) for c,t in instance.reference_texts_for_model.items()}}")
+            # Tokenize input-output pair
+            inputs = self.tokenizer(
+                input_text,
+                output_text,
+                return_tensors="pt",
+                truncation=True,
+                max_length=512,
+                padding="max_length"
+            )
+            
+            # Get model predictions
+            outputs = self.model(**inputs)
+            logits = outputs.logits
+            probabilities = logits.softmax(dim=-1).detach().numpy()[0]
+            
+            # Assuming binary classification: 0=invalid, 1=valid
+            prediction = int(probabilities.argmax())
+            confidence = float(probabilities.max())
+            
+            return {
+                "prediction": prediction,
+                "probability_positive": float(probabilities[1]),
+                "confidence": confidence,
+                "details": f"Model: {self.model_id} | Input length: {len(input_text)} | Output length: {len(output_text)}"
+            }
         except Exception as e:
-            logger.error(f"Failed to load ColBERT reference snapshot from {ref_p}: {e}", exc_info=True)
-            raise
+            logger.error(f"Classification error: {e}")
+            return {
+                "prediction": 0,
+                "probability_positive": 0.0,
+                "confidence": 0.0,
+                "details": f"Error during classification: {str(e)}"
+            }
+    
+    @classmethod
+    def load(cls, model_dir: str, **kwargs):
+        """Load a fine-tuned model from directory."""
+        from transformers import AutoModelForSequenceClassification, AutoTokenizer
         
-        with open(cfg_p, 'r', encoding='utf-8') as f_cfg: 
-            loaded_colbert_config = json.load(f_cfg)
-            logger.debug(f"Loaded ColBERT config from {cfg_p}: {loaded_colbert_config}")
+        try:
+            logger.info(f"Loading fine-tuned model from: {model_dir}")
+            instance = cls(model_dir, **kwargs)
+            instance.tokenizer = AutoTokenizer.from_pretrained(model_dir)
+            instance.model = AutoModelForSequenceClassification.from_pretrained(model_dir)
+            instance.is_setup = True
+            logger.info("Fine-tuned model loaded successfully")
+            return instance
+        except Exception as e:
+            logger.error(f"Error loading fine-tuned model: {e}")
+            raise
 
-        instance.setup_model_and_references(cache_dir=model_directory, force_recompute_embeddings=False)
-        logger.info(f"Fine-tuned ColBERT model and its references loaded successfully from {model_directory}")
-        return instance
+class ColBERTReranker:
+    """ColBERT-based sensitivity classifier using MaxSim technique."""
+    DEFAULT_MODEL_ID = "sebastian-hofstaetter/colbert-distilbert-margin_mse-T2-msmarco"
+    
+    def __init__(self, model_id: str = DEFAULT_MODEL_ID, reference_examples: Optional[Dict[str, List[str]]] = None):
+        from transformers import AutoTokenizer, AutoModel
+        import torch
+        from transformers import AutoTokenizer, AutoModel
+        import torch
+        
+        self.model_id = model_id # Example: "sebastian-hofstaetter/colbert-distilbert-margin_mse-T2-msmarco"
+        self.tokenizer = AutoTokenizer.from_pretrained(model_id, use_fast=True)
+        self.model = AutoModel.from_pretrained(model_id)
+        self.reference_embeddings = {}
+        
+        # Load default reference examples if none provided
+        self.reference_examples = reference_examples or {
+            "Class 1: PII": ["SSN: 123-45-6789", "Credit card: 4111-1111-1111-1111"],
+            "Class 2: Confidential": ["Project codename: Phoenix", "Internal memo"],
+            "Class 3: Internal": ["Meeting notes", "Draft document"],
+            "Class 4: Public": ["Press release", "Public blog post"]
+        }
+        
+        # Precompute embeddings for reference examples
+        for class_name, examples in self.reference_examples.items():
+            self.reference_embeddings[class_name] = [
+                self._get_text_embedding(example) for example in examples
+            ]
+        
+        logger.info(f"ColBERTReranker initialized with model: {model_id}")
+    
+    def _get_text_embedding(self, text: str) -> "torch.Tensor":
+        """Get token-level embeddings for a text."""
+        inputs = self.tokenizer(
+            text,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            max_length=512
+        )
+        with torch.no_grad():
+            outputs = self.model(**inputs)
+        return outputs.last_hidden_state.squeeze(0)
+    
+    def _maxsim_score(self, query_embed: "torch.Tensor", doc_embed: "torch.Tensor") -> float:
+        """Compute MaxSim score between query and document embeddings."""
+        # Compute pairwise cosine similarities
+        similarities = torch.nn.functional.cosine_similarity(
+            query_embed.unsqueeze(1),  # [Q, 1, D]
+            doc_embed.unsqueeze(0),    # [1, D, D]
+            dim=-1
+        )
+        # Take maximum similarity per query token
+        max_sims = similarities.max(dim=-1).values  # [Q]
+        # Average over query tokens
+        return max_sims.mean().item()
+    
+    def classify_text(self, text: str) -> Dict[str, Any]:
+        """Classify text sensitivity using ColBERT-style MaxSim technique."""
+        try:
+            text_embed = self._get_text_embedding(text)
+            class_scores = {}
+            
+            for class_name, ref_embeds in self.reference_embeddings.items():
+                # Compute MaxSim against all reference examples for this class
+                scores = [self._maxsim_score(text_embed, ref_embed) for ref_embed in ref_embeds]
+                class_scores[class_name] = max(scores)  # Take best match
+            
+            # Get predicted class and confidence
+            predicted_class = max(class_scores, key=class_scores.get)
+            max_score = class_scores[predicted_class]
+            
+            return {
+                "predicted_class": predicted_class,
+                "class_scores": class_scores,
+                "confidence": max_score,
+                "details": f"ColBERT classification using {self.model_id}"
+            }
+        except Exception as e:
+            logger.error(f"Error in sensitivity classification: {e}")
+            return {
+                "predicted_class": "Class 5: Unknown",
+                "class_scores": {},
+                "confidence": 0.0,
+                "details": f"Classification error: {str(e)}"
+            }
+    
+    @classmethod
+    def load(cls, model_dir: str, reference_examples_path: Optional[str] = None):
+        """Load a ColBERT model with optional reference examples."""
+        reference_examples = None
+        if reference_examples_path:
+            try:
+                with open(reference_examples_path, "r") as f:
+                    reference_examples = json.load(f)
+            except Exception as e:
+                logger.warning(f"Could not load reference examples: {e}")
+        
+        return cls(model_dir, reference_examples)
 
-    def get_hardware_info(self) -> Dict[str, Any]:
-        info = {"device": str(self.device), "cuda_available": torch.cuda.is_available(), "torch_version": torch.__version__, "transformers_version": transformers.__version__}
-        if torch.cuda.is_available() and self.device and self.device.type == 'cuda':
-             info["gpu_name"] = torch.cuda.get_device_name(0) if torch.cuda.device_count() > 0 else "N/A"
-        else: info["gpu_name"] = "N/A"
-        try: import flash_attn; info["flash_attn_available"] = True
-        except ImportError: info["flash_attn_available"] = False
-        logger.debug(f"ColBERT Hardware Info collected: {info}")
-        return info
+class VisionLanguageProcessor:
+    """Vision-Language Model processor for image and video analysis."""
+    DEFAULT_MODEL_ID = "llava-hf/llava-1.5-7b-hf"
+    
+    def __init__(self, model_id: str = DEFAULT_MODEL_ID, **kwargs):
+        from transformers import pipeline, AutoProcessor
+        # torch will be imported in methods when needed
+         
+        self.model_id = model_id
+        self.device = None  # Will be set in setup()
+        self.is_setup = False
+        logger.info(f"VisionLanguageProcessor initialized with model: {model_id}")
+
+    def setup(self):
+        """Load the VLM model and processor."""
+        from transformers import pipeline, AutoProcessor
+        import torch
+        
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        
+        try:
+            self.processor = AutoProcessor.from_pretrained(self.model_id, trust_remote_code=True) # VLM models often need trust_remote_code
+            self.model = pipeline(
+                "image-to-text",
+                model=self.model_id,
+                device=self.device,
+                torch_dtype=torch.float16 if self.device == "cuda" else torch.float32
+            )
+            self.is_setup = True
+            logger.info("VLM model loaded successfully")
+        except Exception as e:
+            logger.error(f"Error loading VLM model: {e}")
+            raise
+        return self
+    
+    def _load_image(self, image_source: str) -> "Image.Image":  # Use string literal for forward reference
+        """Load image from file path, URL, or bytes."""
+        from PIL import Image
+        import requests
+        from io import BytesIO
+        
+        if isinstance(image_source, bytes):
+            return Image.open(BytesIO(image_source))
+        elif image_source.startswith(("http://", "https://")):
+            response = requests.get(image_source)
+            response.raise_for_status()
+            return Image.open(BytesIO(response.content))
+        else:
+            return Image.open(image_source)
+    
+    def describe_image(self, image_source: str, prompt: Optional[str] = None) -> Dict[str, Any]:
+        """Analyze an image using VLM with optional custom prompt."""
+        from PIL import Image
+        import torch
+        
+        if not self.is_setup:
+            self.setup()
+        
+        try:
+            image = self._load_image(image_source)
+            
+            # Use default prompt if none provided
+            final_prompt = prompt or "Describe this image in detail, focusing on any text, objects, and activities."
+            
+            inputs = self.processor(
+                text=final_prompt,
+                images=image,
+                return_tensors="pt"
+            ).to(self.device)
+            
+            with torch.no_grad():
+                outputs = self.model.generate(**inputs, max_new_tokens=200)
+            
+            description = self.processor.decode(outputs[0], skip_special_tokens=True)
+            
+            return {
+                "description": description,
+                "analysis": self._analyze_description(description),
+                "prompt_used": final_prompt,
+                "model": self.model_id,
+                "details": f"Processed image of size {image.size} with {self.model_id}"
+            }
+        except Exception as e:
+            logger.error(f"Image processing error: {e}")
+            return {
+                "description": "Error processing image",
+                "analysis": {},
+                "details": f"Error: {str(e)}"
+            }
+    
+    def _analyze_description(self, description: str) -> Dict[str, Any]:
+        """Perform basic analysis on the generated description."""
+        analysis = {
+            "contains_text": any(c.isalpha() for c in description),
+            "word_count": len(description.split()),
+            "sentiment": self._get_sentiment(description),
+            "key_phrases": self._extract_key_phrases(description)
+        }
+        return analysis
+    
+    def describe_video_frames(self, video_source: str, prompt: Optional[str] = None,
+                            frame_interval: int = 5) -> Dict[str, Any]:
+        """Analyze video by sampling frames at given interval (seconds)."""
+        import cv2
+        from PIL import Image
+        import tempfile
+        
+        if not self.is_setup:
+            self.setup()
+        
+        try:
+            # Open video file
+            if video_source.startswith(("http://", "https://")):
+                # Download video to temp file
+                with tempfile.NamedTemporaryFile(delete=False) as temp_file:
+                    response = requests.get(video_source)
+                    response.raise_for_status()
+                    temp_file.write(response.content)
+                    video_path = temp_file.name
+            else:
+                video_path = video_source
+            
+            cap = cv2.VideoCapture(video_path)
+            fps = cap.get(cv2.CAP_PROP_FPS)
+            frame_step = int(fps * frame_interval)
+            
+            frame_descriptions = []
+            frame_count = 0
+            
+            while cap.isOpened():
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                
+                if frame_count % frame_step == 0:
+                    # Convert OpenCV frame to PIL Image
+                    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    pil_image = Image.fromarray(frame_rgb)
+                    
+                    # Describe frame
+                    frame_desc = self.describe_image(pil_image, prompt)
+                    frame_desc["timestamp"] = frame_count / fps
+                    frame_descriptions.append(frame_desc)
+                
+                frame_count += 1
+            
+            cap.release()
+            
+            # Generate summary
+            summary = self._summarize_frame_descriptions(frame_descriptions)
+            
+            return {
+                "frame_descriptions": frame_descriptions,
+                "summary": summary,
+                "total_frames": frame_count,
+                "frames_analyzed": len(frame_descriptions),
+                "details": f"Analyzed {len(frame_descriptions)} frames from {frame_count} total frames"
+            }
+        except Exception as e:
+            logger.error(f"Video processing error: {e}")
+            return {
+                "frame_descriptions": [],
+                "summary": "Error processing video",
+                "details": f"Error: {str(e)}"
+            }
+    
+    def _summarize_frame_descriptions(self, frame_descs: List[Dict]) -> str:
+        """Generate a summary from multiple frame descriptions."""
+        # Simple implementation - could be enhanced with LLM
+        unique_descriptions = set(desc["description"] for desc in frame_descs)
+        return "Video contains: " + "; ".join(unique_descriptions)
+    
+    @classmethod
+    def load(cls, model_dir: str, **kwargs):
+        """Load a VLM from a local directory."""
+        return cls(model_dir, **kwargs)
+    
+    def describe_video_frames(self, video_source: str, prompt: Optional[str] = None) -> Dict[str, Any]:
+        """Generate description for video frames (placeholder)."""
+        if not self.is_setup: self.setup()
+        logger.info(f"Describing video: {video_source} with prompt: '{prompt}' (placeholder)")
+
+        desc = f"Placeholder analysis of video '{video_source}'."
+        if "sensitive" in (prompt or "").lower():
+            desc += " Video frames suggest some sensitive material might be present."
+
+        return {
+            "description": desc,
+            "confidence": 0.80,
+            "frame_count_analyzed": 10, # Placeholder
+            "scene_changes_detected": 2, # Placeholder
+            "key_events": ["placeholder_event_1", "placeholder_event_2"],
+            "details": "Placeholder VLM video frame analysis."
+        }
+
+# --- Enhanced Classification API with Complete Policy Logic ---
 
 class ClassificationAPI:
+    """Enhanced Classification API with complete policy validation."""
+    
     def __init__(self, modernbert_model_dir: Optional[str],
                  host: str, port: int,
-                 policy_config_path: Optional[str] = "policy_config.json"):
-        self.modernbert_model_dir = modernbert_model_dir # Directory for the I/O validation model
+                 policy_config_path: Optional[str] = "policy_config.json",
+                 vlm_model_id_or_dir: Optional[str] = None, # Note: this is for the API's internal VLM, not doc processing VLM
+                 global_rag_retriever_index_path: Optional[str] = None):
+        
+        self.modernbert_model_dir = modernbert_model_dir
         self.host = host
         self.port = port
         self.policy_config_path = policy_config_path
+        # This VLM is for item processing in policies, distinct from MarkdownReformatterVLM for docs
+        self.vlm_for_item_processing_id_or_dir = vlm_model_id_or_dir 
+        
         self.api_policy_config: Dict[str, Any] = {}
-        self.modernbert_classifier: Optional[ModernBERTClassifier] = None # I/O validation model instance
+        self.modernbert_classifier: Optional[ModernBERTClassifier] = None
         self.colbert_reranker: Optional[ColBERTReranker] = None
+        self.vision_language_processor: Optional[VisionLanguageProcessor] = None # For item processing
+        
+        # RAG components
+        self.global_rag_retriever_index_path = global_rag_retriever_index_path
+        self.documentation_rag_retriever: Optional[RAGRetriever] = None # Specifically for documentation assistance per policy
+        
         self.app = Flask(__name__)
-        CORS(self.app)
+        CORS(self.app) # Enable CORS for all routes
         self.request_count = 0
-        logger.debug(f"ClassificationAPI initialized: I/O_Validator_dir='{modernbert_model_dir}', host='{host}', port={port}, policy_path='{policy_config_path}'")
 
-    def setup(self, serve_modernbert: bool, serve_colbert: bool,
-              colbert_model_id_or_dir: Optional[str],
-              colbert_custom_ref_jsonl: Optional[str],
-              colbert_cache_dir: Optional[str]):
+    def _handle_request_policy(self, payload: Dict, policy_rules: Dict, files: Optional[Any], response_data: Dict) -> List[str]:
+        """
+        Complete implementation of policy validation logic.
+        Returns a list of violation reason strings. Populates response_data.
+        """
+        violations = []
+        
+        try:
+            # Handle legacy format (simple input/output text)
+            # These checks apply if relevant fields are in payload, regardless of input_items
+            violations.extend(self._handle_legacy_policy_validation(payload, policy_rules, response_data))
+            
+            # Handle multimodal format (input_items with potential files)
+            if "input_items" in payload: # Only process if input_items are provided
+                violations.extend(self._handle_multimodal_policy_validation(payload, policy_rules, files, response_data))
+            
+            # Additional policy checks (custom rules, etc.)
+            violations.extend(self._handle_additional_policy_checks(payload, policy_rules, response_data))
+            
+        except Exception as e:
+            logger.error(f"Critical error in policy processing: {e}", exc_info=True)
+            violations.append(f"Policy processing error: {str(e)}")
+        
+        return violations
+
+    def _handle_legacy_policy_validation(self, payload: Dict, policy: Dict, response_data: Dict) -> List[str]:
+        """Handle legacy format policy validation (ModernBERT, ColBERT on input/output text)."""
+        violations = []
+        
+        input_text = payload.get("input_text", "")
+        output_text = payload.get("output_text", "")
+        
+        # ModernBERT I/O Validation
+        if policy.get("modernbert_io_validation", False) and self.modernbert_classifier:
+            if input_text or output_text: # Only run if there's text to validate
+                try:
+                    io_result = self.modernbert_classifier.classify_input_output_pair(input_text, output_text)
+                    response_data["modernbert_io_validation"] = io_result
+                    
+                    if io_result.get("prediction") == 0: # 0 = fail, 1 = pass
+                        prob_positive = io_result.get("probability_positive", 0.0)
+                        violations.append(f"ModernBERT I/O validation failed (validity score: {prob_positive:.2f}).")
+                        
+                except Exception as e:
+                    logger.error(f"Error in ModernBERT I/O validation: {e}", exc_info=True)
+                    violations.append("I/O validation processing error (ModernBERT).")
+                    response_data["modernbert_io_validation"] = {"error": str(e)}
+        
+        # ColBERT Input Sensitivity Check
+        if policy.get("colbert_input_sensitivity", False) and self.colbert_reranker and input_text:
+            try:
+                input_sensitivity = self.colbert_reranker.classify_text(input_text)
+                response_data["colbert_input_sensitivity"] = input_sensitivity
+                predicted_class = input_sensitivity.get("predicted_class")
+                
+                disallowed_classes = policy.get("disallowed_colbert_input_classes", [])
+                if predicted_class in disallowed_classes:
+                    violations.append(f"Input text classified as disallowed sensitivity: '{predicted_class}'.")
+                
+                allowed_classes = policy.get("allowed_colbert_input_classes", [])
+                if allowed_classes and predicted_class not in allowed_classes:
+                     violations.append(f"Input text sensitivity class '{predicted_class}' not in allowed list.")
+                    
+            except Exception as e:
+                logger.error(f"Error in ColBERT input sensitivity check: {e}", exc_info=True)
+                violations.append("Input sensitivity check processing error (ColBERT).")
+                response_data["colbert_input_sensitivity"] = {"error": str(e)}
+
+        # ColBERT Output Sensitivity Check
+        if policy.get("colbert_output_sensitivity", False) and self.colbert_reranker and output_text:
+            try:
+                output_sensitivity = self.colbert_reranker.classify_text(output_text)
+                response_data["colbert_output_sensitivity"] = output_sensitivity
+                predicted_class = output_sensitivity.get("predicted_class")
+
+                disallowed_classes = policy.get("disallowed_colbert_output_classes", [])
+                if predicted_class in disallowed_classes:
+                    violations.append(f"Output text classified as disallowed sensitivity: '{predicted_class}'.")
+
+                allowed_classes = policy.get("allowed_colbert_output_classes", [])
+                if allowed_classes and predicted_class not in allowed_classes:
+                    violations.append(f"Output text sensitivity class '{predicted_class}' not in allowed list.")
+
+            except Exception as e:
+                logger.error(f"Error in ColBERT output sensitivity check: {e}", exc_info=True)
+                violations.append("Output sensitivity check processing error (ColBERT).")
+                response_data["colbert_output_sensitivity"] = {"error": str(e)}
+        
+        return violations
+
+    def _handle_multimodal_policy_validation(self, payload: Dict, policy: Dict, files: Optional[Any], response_data: Dict) -> List[str]:
+        """Handle multimodal format policy validation (VLM on items, derived text checks)."""
+        violations = []
+        
+        input_items = payload.get("input_items", [])
+        if not isinstance(input_items, list):
+            violations.append("Invalid 'input_items' format: expected a list.")
+            return violations
+
+        item_processing_rules = policy.get("item_processing_rules", [])
+        if not item_processing_rules: # No rules, no processing needed for items.
+            return violations
+
+        response_data["item_processing_results"] = {} # Store results for each item
+        
+        for item_idx, item in enumerate(input_items):
+            if not isinstance(item, dict):
+                violations.append(f"Item at index {item_idx} is not a valid object.")
+                continue
+
+            item_id = item.get("id", f"item_{item_idx}")
+            item_type = item.get("type", "unknown_type")
+            filename_in_form = item.get("filename_in_form") # Key to find file in 'files'
+            
+            item_result_data = {"item_id": item_id, "item_type": item_type, "violations": []} # Store item-specific violations
+
+            try:
+                matching_rule = next((rule for rule in item_processing_rules if rule.get("item_type") == item_type), None)
+                
+                if not matching_rule:
+                    # No specific rule for this item_type, could be a violation or just skipped
+                    if policy.get("strict_item_type_matching", False): # Example of a stricter policy meta-rule
+                        item_result_data["violations"].append(f"No processing rule defined for item type: '{item_type}'.")
+                    continue # Skip if no rule and not strict
+
+                # VLM Processing for the item (image/video)
+                vlm_config = matching_rule.get("vlm_processing", {})
+                if vlm_config.get("required", False) and self.vision_language_processor:
+                    if not filename_in_form:
+                        item_result_data["violations"].append(f"VLM processing required for item '{item_id}', but 'filename_in_form' is missing.")
+                    elif not files or filename_in_form not in files:
+                        item_result_data["violations"].append(f"Required file '{filename_in_form}' for item '{item_id}' not found in form data.")
+                    else:
+                        # file_obj = files[filename_in_form] # In a real scenario, pass this to VLM
+                        vlm_output_text = ""
+                        try:
+                            if item_type in ["image", "screenshot"]:
+                                vlm_result = self.vision_language_processor.describe_image(
+                                    image_source=filename_in_form, # Pass name, VLP would handle file access
+                                    prompt=vlm_config.get("prompt")
+                                )
+                            elif item_type in ["video", "recording"]:
+                                vlm_result = self.vision_language_processor.describe_video_frames(
+                                    video_source=filename_in_form,
+                                    prompt=vlm_config.get("prompt")
+                                )
+                            else:
+                                item_result_data["violations"].append(f"VLM processing not supported for item type: '{item_type}'.")
+                                vlm_result = None
+
+                            if vlm_result:
+                                item_result_data["vlm_analysis"] = vlm_result
+                                vlm_output_text = vlm_result.get("description", "")
+                        except Exception as e_vlm:
+                            logger.error(f"Error during VLM processing for item '{item_id}': {e_vlm}", exc_info=True)
+                            item_result_data["violations"].append(f"VLM processing failed for item '{item_id}'.")
+                            item_result_data["vlm_analysis"] = {"error": str(e_vlm)}
+                        
+                        # Derived Text Checks on VLM output
+                        derived_checks_config = matching_rule.get("derived_text_checks", {})
+                        if derived_checks_config and vlm_output_text:
+                            if derived_checks_config.get("colbert_sensitivity", False) and self.colbert_reranker:
+                                try:
+                                    derived_sensitivity = self.colbert_reranker.classify_text(vlm_output_text)
+                                    item_result_data["derived_text_sensitivity"] = derived_sensitivity
+                                    derived_class = derived_sensitivity.get("predicted_class")
+                                    disallowed_derived = derived_checks_config.get("disallowed_classes", [])
+                                    if derived_class in disallowed_derived:
+                                        item_result_data["violations"].append(f"VLM-derived text for item '{item_id}' classified as disallowed sensitivity: '{derived_class}'.")
+                                except Exception as e_colbert_derived:
+                                    logger.error(f"ColBERT on derived text for '{item_id}' failed: {e_colbert_derived}", exc_info=True)
+                                    item_result_data["violations"].append(f"Sensitivity check on VLM output for '{item_id}' failed.")
+                                    item_result_data["derived_text_sensitivity"] = {"error": str(e_colbert_derived)}
+                            
+                            blocked_keywords = derived_checks_config.get("blocked_keywords", [])
+                            if blocked_keywords:
+                                found_kws = [kw for kw in blocked_keywords if kw.lower() in vlm_output_text.lower()]
+                                if found_kws:
+                                    item_result_data["violations"].append(f"VLM-derived text for item '{item_id}' contains blocked keywords: {', '.join(found_kws)}.")
+                                    item_result_data["blocked_keywords_found"] = found_kws
+                
+                # ... other item-specific checks based on matching_rule could go here ...
+
+            except Exception as e_item:
+                logger.error(f"Error processing item '{item_id}': {e_item}", exc_info=True)
+                item_result_data["violations"].append(f"General error processing item '{item_id}'.")
+            
+            response_data["item_processing_results"][item_id] = item_result_data
+            violations.extend(item_result_data["violations"]) # Add item-specific violations to main list
+        
+        return violations
+
+    def _handle_additional_policy_checks(self, payload: Dict, policy: Dict, response_data: Dict) -> List[str]:
+        """Handle additional policy-specific checks (custom rules, rate limiting placeholder)."""
+        violations = []
+        
+        try:
+            custom_rules = policy.get("custom_validation_rules", [])
+            if not isinstance(custom_rules, list):
+                violations.append("Invalid 'custom_validation_rules' format in policy.")
+                return violations # Stop if rules are malformed
+
+            for rule_idx, rule in enumerate(custom_rules):
+                if not isinstance(rule, dict):
+                    violations.append(f"Custom rule at index {rule_idx} is not a valid object.")
+                    continue
+
+                rule_type = rule.get("type")
+                
+                if rule_type == "text_length_limit":
+                    max_length = rule.get("max_length")
+                    text_fields = rule.get("text_fields", []) # Expects a list
+                    if not isinstance(max_length, int) or not isinstance(text_fields, list):
+                         violations.append(f"Invalid 'text_length_limit' rule config at index {rule_idx}.")
+                         continue
+                    for field in text_fields:
+                        text_value = payload.get(field, "")
+                        if isinstance(text_value, str) and len(text_value) > max_length:
+                            violations.append(f"Field '{field}' (length {len(text_value)}) exceeds maximum length of {max_length} characters.")
+                
+                elif rule_type == "required_fields":
+                    required_field_names = rule.get("fields", [])
+                    if not isinstance(required_field_names, list):
+                        violations.append(f"Invalid 'required_fields' rule config at index {rule_idx}.")
+                        continue
+                    for field_name in required_field_names:
+                        if field_name not in payload or not payload[field_name]: # Checks for presence and non-empty
+                            violations.append(f"Required field '{field_name}' is missing or empty.")
+                
+                elif rule_type == "format_validation":
+                    field_to_validate = rule.get("field")
+                    regex_pattern = rule.get("pattern")
+                    if not field_to_validate or not regex_pattern:
+                        violations.append(f"Invalid 'format_validation' rule config at index {rule_idx}.")
+                        continue
+                    if field_to_validate in payload:
+                        try:
+                            if not re.match(regex_pattern, str(payload[field_to_validate])):
+                                violations.append(f"Field '{field_to_validate}' does not match required format pattern.")
+                        except re.error as re_e:
+                             violations.append(f"Invalid regex pattern in 'format_validation' for field '{field_to_validate}': {re_e}")
+                # ... other custom rule types ...
+            
+            # Rate limiting check (placeholder)
+            if policy.get("rate_limiting", {}).get("enabled", False):
+                # In a real implementation, this would involve checking against a rate limiter store.
+                # For this script, it's a conceptual check.
+                logger.debug(f"Rate limiting check (conceptual) for policy with max_requests: {policy['rate_limiting'].get('max_requests_per_minute')}")
+            
+        except Exception as e:
+            logger.error(f"Error during additional policy checks: {e}", exc_info=True)
+            violations.append(f"Additional policy validation error: {str(e)}")
+        
+        return violations
+
+    def _generate_help_queries(self, violation_reasons: List[str], policy: Dict[str, Any]) -> List[str]:
+        """Generate help queries based on violation reasons for RAG."""
+        help_queries: Set[str] = set() # Use a set to avoid duplicate queries
+        
+        common_terms_map = {
+            "pii": ["handling PII", "sensitive data policy", "data privacy"],
+            "sensitive": ["data sensitivity levels", "confidential information rules"],
+            "modernbert i/o": ["input output validation", "API request format", "model validation"],
+            "colbert": ["content sensitivity classification", "text analysis policy"],
+            "vlm": ["image content policy", "video analysis rules", "multimodal validation"],
+            "length limit": ["text length restrictions", "payload size limits"],
+            "required field": ["mandatory fields", "API data requirements"],
+            "format validation": ["data format rules", "pattern matching requirements"]
+        }
+
+        for violation in violation_reasons:
+            violation_lower = violation.lower()
+            found_term_query = False
+            for term, queries in common_terms_map.items():
+                if term in violation_lower:
+                    help_queries.update(queries)
+                    found_term_query = True
+            if not found_term_query: # Generic fallback
+                 # Try to extract keywords from the violation reason itself
+                 # This is very basic, could be improved with NLP
+                keywords = re.findall(r'\b[a-zA-Z]{4,}\b', violation_lower) # Words of 4+ chars
+                if keywords:
+                    help_queries.add("how to fix " + " ".join(list(set(keywords))[:3])) # Use up to 3 unique keywords
+                else:
+                    help_queries.add(f"guidelines for '{violation_lower[:30]}...'")
+
+
+        if policy.get("description"):
+            help_queries.add(f"understanding policy: {policy['description'][:50]}")
+        
+        return list(help_queries)
+
+    def _format_doc_suggestions(self, retrieved_docs: List[Dict[str, Any]], 
+                               violation_reasons: List[str]) -> List[Dict[str, Any]]:
+        """Format retrieved documentation as helpful suggestions."""
+        suggestions = []
+        if not retrieved_docs: return suggestions
+
+        for doc in retrieved_docs:
+            metadata = doc.get("metadata", {})
+            
+            suggestion_title = self._generate_suggestion_title(doc, metadata)
+            
+            suggestion = {
+                "title": suggestion_title,
+                "content_preview": doc["text"][:500] + "..." if len(doc["text"]) > 500 else doc["text"],
+                "full_content_available": True, # Implies client could request full doc by ID
+                "document_id": doc.get("id"),
+                "relevance_score": doc.get("score", 0.0),
+                "source_url": metadata.get("source_url", "N/A"),
+                "primary_section": metadata.get("h1_section", "Documentation"),
+                "secondary_section": metadata.get("h2_section", ""),
+                "chunk_type": metadata.get("chunk_type", "content"),
+                "tags": {
+                    "is_code_example": metadata.get("is_code_block", False) or metadata.get("chunk_type") == "code",
+                    "contains_commands": metadata.get("contains_commands", False),
+                    "vlm_processed_doc": metadata.get("vlm_processed", False)
+                }
+            }
+            suggestions.append(suggestion)
+        
+        return suggestions
+
+    def _generate_suggestion_title(self, doc: Dict[str, Any], metadata: Dict[str, Any]) -> str:
+        """Generate a helpful title for a documentation suggestion."""
+        if metadata.get("h2_section"):
+            return f"{metadata.get('h1_section', 'Help')}: {metadata['h2_section']}"
+        elif metadata.get("h1_section"):
+            return metadata["h1_section"]
+        
+        # Fallback titles based on content type
+        if metadata.get("is_code_block", False) or metadata.get("chunk_type") == "code":
+            return "Relevant Code Example/Reference"
+        if metadata.get("contains_commands", False):
+            return "Relevant Command Reference"
+        if doc.get("id"):
+            return f"Documentation Snippet: {doc['id']}"
+        
+        return "General Documentation"
+
+    def _add_documentation_assistance(self, response_data: Dict[str, Any], 
+                                    policy: Dict[str, Any], violation_reasons: List[str]):
+        """Add documentation assistance to the response if violations occurred and configured."""
+        response_data["documentation_assistance_attempted"] = False
+        try:
+            docs_assist_config = policy.get("documentation_assistance", {})
+            if not docs_assist_config.get("enabled", False):
+                return # Not enabled for this policy
+            
+            response_data["documentation_assistance_attempted"] = True
+            docs_index_path_str = docs_assist_config.get("index_path")
+            if not docs_index_path_str:
+                logger.warning("Documentation assistance enabled but no RAG index_path configured in policy.")
+                response_data["documentation_suggestions"] = {"error": "Documentation RAG index path not configured."}
+                return
+            
+            # Use the cached RAG retriever method
+            # This retriever is specific to the documentation index defined in the policy
+            policy_docs_retriever = self._get_cached_rag_retriever(docs_index_path_str)
+            
+            if not policy_docs_retriever or not policy_docs_retriever._is_loaded:
+                logger.warning(f"Could not load documentation RAG index from {docs_index_path_str} for policy assistance.")
+                response_data["documentation_suggestions"] = {"error": f"Documentation RAG index at '{docs_index_path_str}' not available or failed to load."}
+                return
+            
+            # Generate queries from violations
+            help_queries = self._generate_help_queries(violation_reasons, policy)
+            if not help_queries:
+                response_data["documentation_suggestions"] = {"message": "No specific help queries generated for violations."}
+                return
+            
+            all_retrieved_docs_map: Dict[str, Dict[str, Any]] = {} # Use dict to store unique docs by ID, keeping best score
+            max_suggestions_per_query = docs_assist_config.get("max_suggestions_per_query", 2)
+            min_threshold = docs_assist_config.get("min_similarity_threshold", 0.1)
+            
+            # Query RAG for each generated help query (limit number of queries to avoid excessive RAG calls)
+            for query_idx, query_text in enumerate(help_queries[:docs_assist_config.get("max_help_queries_to_use", 3)]):
+                retrieved_for_query = policy_docs_retriever.retrieve(query_text, top_k=max_suggestions_per_query)
+                for doc in retrieved_for_query:
+                    if doc.get("score", 0.0) >= min_threshold:
+                        doc_id = str(doc.get("id", ""))
+                        if doc_id not in all_retrieved_docs_map or doc["score"] > all_retrieved_docs_map[doc_id]["score"]:
+                            all_retrieved_docs_map[doc_id] = doc
+            
+            if not all_retrieved_docs_map:
+                response_data["documentation_suggestions"] = {
+                    "message": "No relevant documentation found for these violations.",
+                    "queries_used": help_queries[:docs_assist_config.get("max_help_queries_to_use", 3)]
+                }
+                return
+            
+            # Sort unique documents by relevance score, descending
+            sorted_unique_docs = sorted(all_retrieved_docs_map.values(), key=lambda x: x["score"], reverse=True)
+            
+            # Limit total suggestions
+            final_suggestions_count = docs_assist_config.get("max_total_suggestions", 5)
+            top_docs_for_response = sorted_unique_docs[:final_suggestions_count]
+            
+            formatted_suggestions = self._format_doc_suggestions(top_docs_for_response, violation_reasons)
+            
+            response_data["documentation_suggestions"] = {
+                "suggestions": formatted_suggestions,
+                "help_queries_used": help_queries[:docs_assist_config.get("max_help_queries_to_use", 3)],
+                "total_relevant_chunks_found": len(sorted_unique_docs),
+                "showing_top_n": len(top_docs_for_response)
+            }
+            
+        except Exception as e:
+            logger.error(f"Error adding documentation assistance: {e}", exc_info=True)
+            response_data["documentation_suggestions"] = {"error": f"Failed to provide documentation assistance: {str(e)}"}
+
+    def _get_cached_rag_retriever(self, index_path_str: str) -> Optional[RAGRetriever]:
+        """Get a cached RAG retriever or load a new one. Caches per index_path_str."""
+        global RAG_COMPONENT_CACHE
+        # Normalize path for consistent caching key
+        normalized_path_key = str(Path(index_path_str).resolve())
+
+        if normalized_path_key in RAG_COMPONENT_CACHE:
+            logger.debug(f"Using cached RAGRetriever for {normalized_path_key}")
+            return RAG_COMPONENT_CACHE[normalized_path_key]
+        
+        logger.info(f"Attempting to load RAGRetriever for {normalized_path_key} (not found in cache).")
+        try:
+            retriever = RAGRetriever(normalized_path_key) # Use normalized path
+            if retriever.load_index():
+                RAG_COMPONENT_CACHE[normalized_path_key] = retriever
+                logger.info(f"Successfully loaded and cached RAGRetriever for {normalized_path_key}.")
+                return retriever
+            else:
+                logger.error(f"Failed to load RAGRetriever for {normalized_path_key}.")
+                return None
+        except Exception as e:
+            logger.error(f"Exception initializing or loading RAGRetriever for {normalized_path_key}: {e}", exc_info=True)
+            return None
+
+    def setup(self, **kwargs):
+        """Setup the classification API with all components."""
         logger.info("Setting up ClassificationAPI...")
-        logger.debug(f"API Setup Params: serve_io_validator={serve_modernbert}, serve_colbert={serve_colbert}, "
-                     f"colbert_model_id_or_dir='{colbert_model_id_or_dir}', "
-                     f"colbert_custom_ref_jsonl='{colbert_custom_ref_jsonl}', "
-                     f"colbert_cache_dir='{colbert_cache_dir}'")
-
+        
+        # Load policy configuration
         if self.policy_config_path:
             policy_file = Path(self.policy_config_path)
-            logger.debug(f"Attempting to load API policy from: {policy_file}")
-            if policy_file.exists():
+            if policy_file.exists() and policy_file.is_file():
                 try:
                     with open(policy_file, 'r', encoding='utf-8') as f:
                         self.api_policy_config = json.load(f)
-                    logger.info(f"Loaded API policy configuration from {self.policy_config_path}")
-                    logger.debug(f"Loaded policy config (first 200 chars): {str(self.api_policy_config)[:200]}")
-                except json.JSONDecodeError as e:
-                    logger.error(f"Invalid JSON in policy config file {self.policy_config_path}: {e}", exc_info=True)
-                    logger.warning("Running without API policies due to load error.")
+                    logger.info(f"Loaded API policy configuration from {self.policy_config_path} with {len(self.api_policy_config)} policies.")
+                except json.JSONDecodeError as e_json:
+                    logger.error(f"Failed to parse policy config JSON from {self.policy_config_path}: {e_json}", exc_info=True)
                 except Exception as e:
                     logger.error(f"Failed to load policy config from {self.policy_config_path}: {e}", exc_info=True)
-                    logger.warning("Running without API policies due to load error.")
             else:
-                logger.warning(f"Policy config file not found: {self.policy_config_path}. No API policies loaded.")
+                 logger.warning(f"Policy config path {self.policy_config_path} does not exist or is not a file. No policies loaded.")
         else:
-            logger.warning("No policy config path provided. API policies will not be enforced by /service/validate.")
+            logger.warning("No policy_config_path provided. API will operate without defined policies.")
 
-        if serve_modernbert and self.modernbert_model_dir: # serve_modernbert flag enables the I/O validator
-            logger.info(f"I/O Validator serving enabled. Attempting to load from: {self.modernbert_model_dir}")
-            try:
+        # Setup models (using placeholders for now)
+        try:
+            if self.modernbert_model_dir: # If a specific dir is given for a real model
                 self.modernbert_classifier = ModernBERTClassifier.load(self.modernbert_model_dir)
-                logger.info("I/O Validator API model loaded successfully.")
-            except FileNotFoundError:
-                 logger.error(f"I/O Validator model directory not found: {self.modernbert_model_dir}. I/O Validator API will not be available.")
-                 serve_modernbert=False
-            except Exception as e:
-                logger.error(f"Failed to load I/O Validator for API from {self.modernbert_model_dir}: {e}", exc_info=True)
-                serve_modernbert=False
-        elif serve_modernbert and not self.modernbert_model_dir:
-            logger.warning("Serve I/O Validator requested but no model_dir provided. I/O Validator API will not be available.")
-            serve_modernbert = False
+            else: # Default placeholder setup
+                self.modernbert_classifier = ModernBERTClassifier().setup()
+        except Exception as e_mb:
+            logger.error(f"Failed to initialize ModernBERT classifier: {e_mb}", exc_info=True)
+        
+        try:
+            # model_id for ColBERT is illustrative, actual model loading would be more complex
+            self.colbert_reranker = ColBERTReranker(model_id="placeholder_colbert_model")
+        except Exception as e_colbert:
+            logger.error(f"Failed to initialize ColBERT reranker: {e_colbert}", exc_info=True)
 
-        if serve_colbert:
-            logger.info(f"ColBERT sensitivity serving enabled. Model ID/Dir: '{colbert_model_id_or_dir}'")
-            try:
-                colbert_path_obj = Path(colbert_model_id_or_dir) if colbert_model_id_or_dir else None
-
-                if colbert_path_obj and colbert_path_obj.is_dir():
-                    logger.info(f"Attempting to load fine-tuned ColBERT from directory: {colbert_path_obj}")
-                    self.colbert_reranker = ColBERTReranker.load_from_directory(colbert_path_obj)
-                else:
-                    base_id = colbert_model_id_or_dir or ColBERTReranker.DEFAULT_MODEL_ID
-                    logger.info(f"Initializing ColBERT with base model ID: {base_id}")
-                    self.colbert_reranker = ColBERTReranker(base_id)
-
-                    if colbert_custom_ref_jsonl:
-                        custom_ref_path = Path(colbert_custom_ref_jsonl)
-                        logger.debug(f"Custom ColBERT reference JSONL provided: {custom_ref_path}")
-                        if custom_ref_path.exists():
-                            self.colbert_reranker._load_custom_references_from_jsonl(custom_ref_path)
-                        else:
-                            logger.warning(f"ColBERT custom reference JSONL not found: {custom_ref_path}. Using defaults or built-in if available.")
-                    else: logger.debug("No custom ColBERT reference JSONL provided for API setup.")
-
-                    cache_p = Path(colbert_cache_dir) if colbert_cache_dir else Path.home()/".cache"/"classifier_tool"/"api_colbert_cache"
-                    model_name_for_cache = "".join(c if c.isalnum() or c in ['-','_','.'] else '_' for c in Path(base_id).name)
-                    final_cache_dir_for_model = cache_p / model_name_for_cache
-                    final_cache_dir_for_model.mkdir(parents=True, exist_ok=True)
-                    logger.debug(f"ColBERT (non-fine-tuned) cache directory for API: {final_cache_dir_for_model}")
-                    self.colbert_reranker.setup_model_and_references(cache_dir=final_cache_dir_for_model)
-
-                logger.info(f"ColBERT API model setup complete. Fine-tuned: {self.colbert_reranker.is_fine_tuned if self.colbert_reranker else 'N/A'}.")
-            except FileNotFoundError as e:
-                 logger.error(f"ColBERT model file/directory not found: {e}. ColBERT API will not be available.", exc_info=True)
-                 serve_colbert=False
-            except Exception as e:
-                logger.error(f"Failed to setup ColBERT for API: {e}", exc_info=True)
-                serve_colbert=False
-        else: logger.debug("ColBERT sensitivity serving not enabled for API.")
-
-        @self.app.route('/health', methods=['GET'])
-        def health():
-            logger.debug("Health check endpoint hit.")
-            io_validator_ok = self.modernbert_classifier is not None and self.modernbert_classifier.model is not None
-            colbert_ok = self.colbert_reranker is not None and self.colbert_reranker.model is not None
-
-            status_details = {
-                "io_validator_loaded": io_validator_ok, # Changed key name
-                "colbert_loaded": colbert_ok,
-                "colbert_is_fine_tuned": self.colbert_reranker.is_fine_tuned if colbert_ok else None,
-                "colbert_reference_classes": list(self.colbert_reranker.reference_texts_for_model.keys()) if colbert_ok and self.colbert_reranker.reference_texts_for_model else []
-            }
-            logger.debug(f"Health status details: {status_details}")
-
-            overall_status = "ok"
-            policy_readiness = {"status": "not_applicable_no_policies" if not self.api_policy_config else "ok", "issues": []}
-
-            if self.api_policy_config:
-                all_policies_runnable = True
-                for policy_name, policy_rules in self.api_policy_config.items():
-                    if policy_rules.get("modernbert_io_validation") and not io_validator_ok: # Check io_validator_ok
-                        all_policies_runnable = False; msg = f"Policy '{policy_name}' requires I/O Validator, which is not loaded."
-                        policy_readiness["issues"].append(msg); logger.debug(f"Health check policy issue: {msg}")
-                    if policy_rules.get("colbert_input_sensitivity") or policy_rules.get("colbert_output_sensitivity"):
-                        if not colbert_ok:
-                            all_policies_runnable = False; msg = f"Policy '{policy_name}' requires ColBERT, which is not loaded."
-                            policy_readiness["issues"].append(msg); logger.debug(f"Health check policy issue: {msg}")
-                        elif policy_rules.get("require_colbert_fine_tuned") and (not self.colbert_reranker or not self.colbert_reranker.is_fine_tuned):
-                            all_policies_runnable = False; msg = f"Policy '{policy_name}' requires fine-tuned ColBERT, but current ColBERT is not fine-tuned or not loaded."
-                            policy_readiness["issues"].append(msg); logger.debug(f"Health check policy issue: {msg}")
-
-                if not all_policies_runnable and (io_validator_ok or colbert_ok):
-                    overall_status = "degraded"; policy_readiness["status"] = "degraded"
-                elif not all_policies_runnable and not io_validator_ok and not colbert_ok:
-                    overall_status = "error"; policy_readiness["status"] = "error_models_unavailable"
-                elif not (io_validator_ok or colbert_ok) and self.api_policy_config :
-                    overall_status = "error"; policy_readiness["status"] = "error_models_unavailable"
-            logger.debug(f"Health check final: overall_status='{overall_status}', policy_readiness='{policy_readiness['status']}'")
-
-            return jsonify({
-                "status": overall_status,
-                "model_availability": status_details,
-                "policy_config_loaded": bool(self.api_policy_config),
-                "policy_model_readiness": policy_readiness
-            })
-
-        if serve_modernbert and self.modernbert_classifier : # serve_modernbert enables I/O Validator endpoint
-            logger.debug("I/O Validator /modernbert/classify endpoint will be available.") # Endpoint name kept for consistency
-            @self.app.route('/modernbert/classify', methods=['POST'])
-            def mb_classify(): # Function name kept
-                logger.debug(f"I/O Validator /modernbert/classify endpoint hit. Request Remote Addr: {request.remote_addr}")
-                if not self.modernbert_classifier or not self.modernbert_classifier.model:
-                    logger.error("/modernbert/classify called but I/O Validator model not loaded.")
-                    return jsonify({"error":"I/O Validator model not loaded or available"}),503
-
-                data = request.get_json()
-                if not data: logger.debug("Request to /modernbert/classify is not JSON."); return jsonify({"error": "Request body must be JSON"}), 400
-                logger.debug(f"Received data for /modernbert/classify: {str(data)[:200]}")
-
-                input_text = data.get('input_text')
-                output_text = data.get('output_text')
-
-                if input_text is None:
-                    logger.debug("/modernbert/classify: 'input_text' is missing.")
-                    return jsonify({"error":"'input_text' is required"}),400
-
-                try:
-                    result = self.modernbert_classifier.classify_input_output_pair(input_text, output_text if output_text is not None else "")
-                    logger.debug(f"/modernbert/classify result for I/O Validator: {result}")
-                    return jsonify(result)
-                except Exception as e:
-                    logger.error(f"Error in /modernbert/classify (I/O Validator): {e}", exc_info=True)
-                    return jsonify({"error":str(e)}),500
-        elif serve_modernbert: logger.warning("I/O Validator serving was requested but classifier is not available. Endpoint /modernbert/classify will not be functional.")
-
-        if serve_colbert and self.colbert_reranker and self.colbert_reranker.model:
-            logger.debug("ColBERT /colbert/classify_sensitivity endpoint will be available.")
-            @self.app.route('/colbert/classify_sensitivity', methods=['POST'])
-            def cb_classify():
-                logger.debug(f"ColBERT /classify_sensitivity endpoint hit. Request Remote Addr: {request.remote_addr}")
-                if not self.colbert_reranker or not self.colbert_reranker.model :
-                    logger.error("/colbert/classify_sensitivity called but model not loaded.")
-                    return jsonify({"error":"ColBERT model not loaded or available"}),503
-
-                data=request.get_json()
-                if not data: logger.debug("Request to /colbert/classify_sensitivity is not JSON."); return jsonify({"error": "Request body must be JSON"}), 400
-                logger.debug(f"Received data for /colbert/classify_sensitivity: {str(data)[:200]}")
-
-                txt=data.get('text')
-                if txt is None: logger.debug("/colbert/classify_sensitivity: 'text' field missing."); return jsonify({"error":"'text' field required"}),400
-                if not isinstance(txt, str): logger.debug("/colbert/classify_sensitivity: 'text' field not a string."); return jsonify({"error": "'text' field must be a string"}), 400
-
-                try:
-                    result = self.colbert_reranker.classify_text(txt)
-                    logger.debug(f"/colbert/classify_sensitivity result: {result}")
-                    return jsonify(result)
-                except Exception as e:
-                    logger.error(f"Error in /colbert/classify_sensitivity: {e}", exc_info=True)
-                    return jsonify({"error":str(e)}),500
-        elif serve_colbert: logger.warning("ColBERT serving was requested but reranker is not available. Endpoint /colbert/classify_sensitivity will not be functional.")
-
-        logger.debug("/service/validate endpoint will be available (if policies are configured).")
+        try:
+            # vlm_for_item_processing_id_or_dir is for the VLM used by policies (e.g. LLaVA)
+            # Not to be confused with the GGUF model for markdown document processing.
+            self.vision_language_processor = VisionLanguageProcessor(model_id_or_dir=self.vlm_for_item_processing_id_or_dir).setup()
+        except Exception as e_vlp:
+            logger.error(f"Failed to initialize VisionLanguageProcessor for items: {e_vlp}", exc_info=True)
+        
+        # Setup global RAG retriever if path is provided (e.g., for a direct /rag/query endpoint)
+        if self.global_rag_retriever_index_path:
+            logger.info(f"Attempting to load global RAG retriever from: {self.global_rag_retriever_index_path}")
+            # This retriever is separate from policy-specific documentation retrievers
+            self.documentation_rag_retriever = self._get_cached_rag_retriever(self.global_rag_retriever_index_path)
+            if self.documentation_rag_retriever:
+                logger.info("Global RAG retriever loaded successfully.")
+            else:
+                logger.warning("Failed to load global RAG retriever.")
+        
+        # --- Flask Routes ---
         @self.app.route('/service/validate', methods=['POST'])
         def service_validate():
             self.request_count += 1
-            logger.debug(f"/service/validate endpoint hit (request #{self.request_count}). Request Remote Addr: {request.remote_addr}")
-            payload = request.get_json()
-            if not payload:
-                logger.debug("Request to /service/validate is not JSON.")
-                return jsonify({"error": "Request body must be JSON"}), 400
-            logger.debug(f"Received payload for /service/validate: {str(payload)[:300]}")
-
-            api_class = payload.get("api_class")
-            input_text = payload.get("input_text")
-            output_text = payload.get("output_text")
-
-            if not api_class or input_text is None:
-                logger.debug(f"/service/validate: Missing 'api_class' ('{api_class}') or 'input_text' (present: {input_text is not None}).")
-                return jsonify({"error": "'api_class' and 'input_text' are required fields"}), 400
-
-            response_data = {"request_id": f"req_{time.time_ns()}", "request_summary": {"api_class": api_class, "input_text_len": len(input_text), "output_text_len": len(output_text) if output_text else 0}}
-            current_overall_status = "PASS"
-            violations = []
-            error_message_detail = None
-
-            policy = self.api_policy_config.get(api_class)
-            if not policy:
-                logger.warning(f"/service/validate: API class '{api_class}' not found in policy configuration.")
-                response_data["overall_status"] = "REJECT_INVALID_POLICY"
-                response_data["error_message"] = f"API class '{api_class}' not found in policy configuration."
-                return jsonify(response_data), 400
-            logger.debug(f"Applying policy for API class '{api_class}': {str(policy)[:200]}")
-            response_data["policy_applied_summary"] = {k:v for k,v in policy.items() if "classes" not in k} 
-
-            # --- I/O Validation (formerly ModernBERT) ---
-            if policy.get("modernbert_io_validation"): # Key name kept for policy file consistency
-                logger.debug("Performing I/O validation as per policy.")
-                if output_text is None:
-                    current_overall_status = "ERROR"; error_message_detail = "output_text is required for I/O validation."
-                    logger.debug(f"Policy error: {error_message_detail}")
-                    response_data["modernbert_io_validation"] = {"status": "error_missing_output_text", "message": error_message_detail}
-                elif not self.modernbert_classifier or not self.modernbert_classifier.model:
-                    current_overall_status = "ERROR"; error_message_detail = "I/O Validator model required by policy is not loaded."
-                    logger.error(f"Policy error: {error_message_detail}")
-                    response_data["modernbert_io_validation"] = {"status": "error_model_not_loaded", "message": error_message_detail}
-                else:
-                    try:
-                        io_result = self.modernbert_classifier.classify_input_output_pair(input_text, output_text)
-                        logger.debug(f"I/O validation result: {io_result}")
-                        response_data["modernbert_io_validation"] = io_result
-                        if io_result.get("prediction") == 0: 
-                            violation_msg = "IO_Validation: Predicted as inappropriate pair."
-                            violations.append(violation_msg); logger.debug(f"Policy violation: {violation_msg}")
-                    except Exception as e:
-                        logger.error(f"Error during I/O validation for policy '{api_class}': {e}", exc_info=True)
-                        current_overall_status = "ERROR"; error_message_detail = f"I/O Validator exception: {str(e)}"
-                        response_data["modernbert_io_validation"] = {"status": "error_exception_in_model", "message": error_message_detail}
-
-            if current_overall_status == "ERROR": 
-                response_data["overall_status"] = "ERROR"; response_data["error_message"] = error_message_detail
-                logger.error(f"/service/validate returning ERROR due to: {error_message_detail}")
-                return jsonify(response_data), 500
-
-            # --- ColBERT Input Sensitivity ---
-            if policy.get("colbert_input_sensitivity"):
-                logger.debug("Performing ColBERT Input Sensitivity validation as per policy.")
-                if not self.colbert_reranker or not self.colbert_reranker.model:
-                    current_overall_status = "ERROR"; error_message_detail = "ColBERT model required by policy for input check is not loaded."
-                    logger.error(f"Policy error: {error_message_detail}")
-                    response_data["colbert_input_sensitivity"] = {"status": "error_model_not_loaded", "message": error_message_detail}
-                elif policy.get("require_colbert_fine_tuned") and not self.colbert_reranker.is_fine_tuned:
-                    current_overall_status = "ERROR"; error_message_detail = "Fine-tuned ColBERT model required by policy for input check, but loaded ColBERT is not fine-tuned."
-                    logger.error(f"Policy error: {error_message_detail}")
-                    response_data["colbert_input_sensitivity"] = {"status": "error_model_not_fine_tuned", "message": error_message_detail}
-                else:
-                    try:
-                        cb_input_result = self.colbert_reranker.classify_text(input_text)
-                        logger.debug(f"ColBERT input sensitivity result: {cb_input_result}")
-                        response_data["colbert_input_sensitivity"] = cb_input_result
-                        predicted_class = cb_input_result.get("predicted_class")
-                        allowed_classes = policy.get("allowed_colbert_input_classes")
-                        disallowed_classes = policy.get("disallowed_colbert_input_classes")
-
-                        if allowed_classes and predicted_class not in allowed_classes:
-                            violation_msg = f"ColBERT_Input_Sensitivity: Predicted class '{predicted_class}' not in allowed list: {allowed_classes}."
-                            violations.append(violation_msg); logger.debug(f"Policy violation: {violation_msg}")
-                        if disallowed_classes and predicted_class in disallowed_classes:
-                             violation_msg = f"ColBERT_Input_Sensitivity: Predicted class '{predicted_class}' is in disallowed list: {disallowed_classes}."
-                             violations.append(violation_msg); logger.debug(f"Policy violation: {violation_msg}")
-                    except Exception as e:
-                        err_str = str(e).lower()
-                        if "401" in err_str or "unauthorized" in err_str:
-                            logger.error(f"Authentication failed for Hugging Face resource. Please check your HF_TOKEN environment variable or login status (huggingface-cli login).")
-                            logger.error(f"Original error: {str(e)}", exc_info=logger.level <= logging.DEBUG)
-                        elif "404" in err_str or "not found" in err_str or "repositorynotfound" in err_str:
-                            logger.error(f"Model or resource not found on Hugging Face Hub or locally. Check spelling and availability.")
-                            logger.error(f"Original error: {str(e)}", exc_info=logger.level <= logging.DEBUG)
-                        else:
-                            logger.error(f"Error during ColBERT input sensitivity for policy '{api_class}': {e}", exc_info=True)
-                        current_overall_status = "ERROR"; error_message_detail = f"ColBERT input sensitivity exception: {str(e)}"
-                        response_data["colbert_input_sensitivity"] = {"status": "error_exception_in_model", "message": error_message_detail}
-
-            if current_overall_status == "ERROR": 
-                response_data["overall_status"] = "ERROR"; response_data["error_message"] = error_message_detail
-                logger.error(f"/service/validate returning ERROR due to: {error_message_detail}")
-                return jsonify(response_data), 500
-
-            # --- ColBERT Output Sensitivity ---
-            if policy.get("colbert_output_sensitivity"):
-                logger.debug("Performing ColBERT Output Sensitivity validation as per policy.")
-                if output_text is None or not output_text.strip() :
-                    violation_msg = "ColBERT_Output_Sensitivity: output_text is missing or empty, but required for this policy check."
-                    violations.append(violation_msg); logger.debug(f"Policy violation (or skip): {violation_msg}") # May not be a strict violation but a skip
-                    response_data["colbert_output_sensitivity"] = {"status": "skipped_missing_output_text", "message": "Non-empty output_text is required for colbert_output_sensitivity check."}
-                elif not self.colbert_reranker or not self.colbert_reranker.model:
-                    current_overall_status = "ERROR"; error_message_detail = "ColBERT model required by policy for output check is not loaded."
-                    logger.error(f"Policy error: {error_message_detail}")
-                    response_data["colbert_output_sensitivity"] = {"status": "error_model_not_loaded", "message": error_message_detail}
-                elif policy.get("require_colbert_fine_tuned") and not self.colbert_reranker.is_fine_tuned:
-                    current_overall_status = "ERROR"; error_message_detail = "Fine-tuned ColBERT model required by policy for output check, but loaded ColBERT is not fine-tuned."
-                    logger.error(f"Policy error: {error_message_detail}")
-                    response_data["colbert_output_sensitivity"] = {"status": "error_model_not_fine_tuned", "message": error_message_detail}
-                else:
-                    try:
-                        cb_output_result = self.colbert_reranker.classify_text(output_text)
-                        logger.debug(f"ColBERT output sensitivity result: {cb_output_result}")
-                        response_data["colbert_output_sensitivity"] = cb_output_result
-                        predicted_class = cb_output_result.get("predicted_class")
-                        allowed_classes = policy.get("allowed_colbert_output_classes")
-                        disallowed_classes = policy.get("disallowed_colbert_output_classes")
-
-                        if allowed_classes and predicted_class not in allowed_classes:
-                            violation_msg = f"ColBERT_Output_Sensitivity: Predicted class '{predicted_class}' not in allowed list: {allowed_classes}."
-                            violations.append(violation_msg); logger.debug(f"Policy violation: {violation_msg}")
-                        if disallowed_classes and predicted_class in disallowed_classes:
-                             violation_msg = f"ColBERT_Output_Sensitivity: Predicted class '{predicted_class}' is in disallowed list: {disallowed_classes}."
-                             violations.append(violation_msg); logger.debug(f"Policy violation: {violation_msg}")
-                    except Exception as e:
-                        logger.error(f"Error during ColBERT output sensitivity for policy '{api_class}': {e}", exc_info=True)
-                        current_overall_status = "ERROR"; error_message_detail = f"ColBERT output sensitivity exception: {str(e)}"
-                        response_data["colbert_output_sensitivity"] = {"status": "error_exception_in_model", "message": error_message_detail}
+            request_timestamp = time.time()
             
-            if current_overall_status == "ERROR":
-                response_data["overall_status"] = "ERROR"; response_data["error_message"] = error_message_detail
-                if violations: response_data["violations_detected_before_error"] = violations
-                logger.error(f"/service/validate returning ERROR due to: {error_message_detail}. Violations before error: {violations}")
-                return jsonify(response_data), 500
-            elif violations:
-                response_data["overall_status"] = "REJECT_POLICY_VIOLATION"; response_data["violation_reasons"] = violations
-                logger.info(f"/service/validate REJECT_POLICY_VIOLATION for '{api_class}'. Reasons: {violations}")
-                return jsonify(response_data), 200 # Still 200 OK, but with rejection status
+            is_multipart = request.content_type and 'multipart/form-data' in request.content_type.lower()
+            
+            payload: Optional[Dict] = None
+            files: Optional[Any] = None
+
+            if is_multipart:
+                if 'json_payload' not in request.form:
+                    return jsonify({"overall_status": "ERROR_BAD_REQUEST", "error_message": "Multipart request missing 'json_payload' form field."}), 400
+                try:
+                    payload = json.loads(request.form['json_payload'])
+                except json.JSONDecodeError as e_json_form:
+                    return jsonify({"overall_status": "ERROR_BAD_REQUEST", "error_message": f"Invalid JSON in 'json_payload': {e_json_form}"}), 400
+                files = request.files
+            else: # Assume application/json
+                try:
+                    payload = request.get_json()
+                    if payload is None: # get_json returns None if parsing fails or content-type mismatch
+                         return jsonify({"overall_status": "ERROR_BAD_REQUEST", "error_message": "Request body must be valid JSON and Content-Type 'application/json'."}), 400
+                except Exception as e_json_body: # Should be caught by Flask mostly
+                     return jsonify({"overall_status": "ERROR_BAD_REQUEST", "error_message": f"Failed to parse JSON request body: {e_json_body}"}), 400
+            
+            api_class_name = payload.get("api_class")
+            if not api_class_name:
+                return jsonify({"overall_status": "ERROR_BAD_REQUEST", "error_message": "'api_class' field is required in JSON payload."}), 400
+            
+            response_data = {
+                "request_id": payload.get("request_id", f"req_{int(request_timestamp)}_{self.request_count}"),
+                "api_class_requested": api_class_name,
+                "timestamp_utc": request_timestamp,
+                "processing_details": {} # To store model outputs etc.
+            }
+            
+            active_policy_rules = self.api_policy_config.get(api_class_name)
+            if not active_policy_rules:
+                response_data["overall_status"] = "REJECT_INVALID_POLICY"
+                response_data["error_message"] = f"Policy definition for API class '{api_class_name}' not found or not loaded."
+                return jsonify(response_data), 400 # Using 400 as it's a client error (bad api_class or server config issue)
+            
+            # Process policy using the complete implementation
+            violation_reasons = self._handle_request_policy(payload, active_policy_rules, files, response_data["processing_details"])
+            
+            if violation_reasons:
+                response_data["violation_reasons"] = violation_reasons
+                response_data["overall_status"] = "REJECT_POLICY_VIOLATION"
+                # Attempt to add documentation assistance if violations occurred and policy enables it
+                self._add_documentation_assistance(response_data, active_policy_rules, violation_reasons)
             else:
                 response_data["overall_status"] = "PASS"
-                logger.info(f"/service/validate PASS for '{api_class}'.")
-                return jsonify(response_data), 200
+                # Potentially, documentation_assistance could be triggered on PASS too, if configured
+                # For now, it's only on violation.
+            
+            response_data["processing_time_seconds"] = round(time.time() - request_timestamp, 3)
+            return jsonify(response_data)
 
-    def run(self, production: bool = True):
-        can_serve_anything = False
-        if self.modernbert_classifier and self.modernbert_classifier.model:
-            can_serve_anything = True; logger.info("I/O Validator direct endpoint (/modernbert/classify) will be available.")
-        if self.colbert_reranker and self.colbert_reranker.model:
-            can_serve_anything = True; logger.info("ColBERT direct endpoint (/colbert/classify_sensitivity) will be available.")
-        if self.api_policy_config:
-            can_serve_anything = True; logger.info("/service/validate endpoint will be available.")
+        @self.app.route('/modernbert/classify', methods=['POST'])
+        def modernbert_classify_endpoint():
+            if not self.modernbert_classifier:
+                return jsonify({"error": "ModernBERT classifier not available or not setup."}), 503
+            
+            payload = request.get_json()
+            if not payload: return jsonify({"error": "Request body must be JSON."}), 400
+            
+            input_text = payload.get("input_text", "")
+            output_text = payload.get("output_text", "")
+            
+            try:
+                result = self.modernbert_classifier.classify_input_output_pair(input_text, output_text)
+                return jsonify(result)
+            except Exception as e:
+                logger.error(f"Error in /modernbert/classify endpoint: {e}", exc_info=True)
+                return jsonify({"error": f"ModernBERT classification failed: {str(e)}"}), 500
 
-        if not can_serve_anything:
-            logger.error("No models loaded and no policies configured for the API. Nothing to serve. Exiting.")
-            sys.exit(1)
+        @self.app.route('/colbert/classify_sensitivity', methods=['POST'])
+        def colbert_classify_sensitivity_endpoint():
+            if not self.colbert_reranker:
+                return jsonify({"error": "ColBERT reranker not available."}), 503
+            
+            payload = request.get_json()
+            if not payload: return jsonify({"error": "Request body must be JSON."}), 400
+            
+            text_to_classify = payload.get("text", "")
+            if not text_to_classify: return jsonify({"error": "'text' field required."}), 400
 
-        logger.info(f"Starting API server on http://{self.host}:{self.port}")
-        if production:
-            logger.info("Running in production mode with Waitress (threads=8).")
-            serve(self.app, host=self.host, port=self.port, threads=8)
+            try:
+                result = self.colbert_reranker.classify_text(text_to_classify)
+                return jsonify(result)
+            except Exception as e:
+                logger.error(f"Error in /colbert/classify_sensitivity endpoint: {e}", exc_info=True)
+                return jsonify({"error": f"ColBERT sensitivity classification failed: {str(e)}"}), 500
+
+        @self.app.route('/rag/query', methods=['POST']) # Generic RAG query endpoint (uses global_rag_retriever)
+        def rag_query_endpoint():
+            if not self.documentation_rag_retriever or not self.documentation_rag_retriever._is_loaded:
+                # This endpoint uses the 'global_rag_retriever_index_path' one.
+                return jsonify({"error": "Global RAG retriever not available or not loaded."}), 503
+            
+            payload = request.get_json()
+            if not payload: return jsonify({"error": "Request body must be JSON."}), 400
+            
+            query_text = payload.get("query", "")
+            top_k_results = payload.get("top_k", 5)
+            if not query_text: return jsonify({"error": "'query' field required."}), 400
+
+            try:
+                results = self.documentation_rag_retriever.retrieve(query_text, top_k=top_k_results)
+                return jsonify({"query": query_text, "results": results})
+            except Exception as e:
+                logger.error(f"Error in /rag/query endpoint: {e}", exc_info=True)
+                return jsonify({"error": f"RAG query failed: {str(e)}"}), 500
+        
+        @self.app.route('/status', methods=['GET'])
+        def status_endpoint():
+            policy_status = "Not loaded"
+            if self.api_policy_config:
+                policy_status = f"{len(self.api_policy_config)} policies loaded"
+            elif self.policy_config_path and not Path(self.policy_config_path).exists():
+                policy_status = f"Config file not found at {self.policy_config_path}"
+            elif self.policy_config_path:
+                 policy_status = f"Config file found at {self.policy_config_path} but failed to load policies (check logs)"
+
+
+            return jsonify({
+                "service_status": "running",
+                "total_requests_processed": self.request_count,
+                "policy_configuration_status": policy_status,
+                "component_status": {
+                    "modernbert_classifier_available": self.modernbert_classifier is not None and self.modernbert_classifier.is_setup,
+                    "colbert_reranker_available": self.colbert_reranker is not None,
+                    "vision_language_processor_available": self.vision_language_processor is not None and self.vision_language_processor.is_setup,
+                    "global_documentation_rag_retriever_loaded": self.documentation_rag_retriever is not None and self.documentation_rag_retriever._is_loaded,
+                    "global_documentation_rag_details": self.documentation_rag_retriever.get_status() if self.documentation_rag_retriever else {"status": "not_initialized"}
+                },
+                "cached_rag_retrievers": {path: retriever.get_status() for path, retriever in RAG_COMPONENT_CACHE.items()}
+            })
+
+    def run(self, **kwargs):
+        """Run the API server."""
+        self.setup(**kwargs) # Ensure setup is called before running
+        logger.info(f"Starting Enhanced Classification API server on http://{self.host}:{self.port}")
+        logger.info(f"CORS enabled for all origins on this server.")
+        logger.info(f"Number of policies loaded: {len(self.api_policy_config)}")
+        
+        # Log status of key components after setup
+        logger.info(f"ModernBERT Classifier: {'Available' if self.modernbert_classifier and self.modernbert_classifier.is_setup else 'Not Available'}")
+        logger.info(f"ColBERT Reranker: {'Available' if self.colbert_reranker else 'Not Available'}")
+        logger.info(f"Vision Language Processor (for items): {'Available' if self.vision_language_processor and self.vision_language_processor.is_setup else 'Not Available'}")
+        if self.documentation_rag_retriever and self.documentation_rag_retriever._is_loaded:
+             logger.info(f"Global Documentation RAG Retriever: Loaded with {self.documentation_rag_retriever.get_status().get('num_documents')} documents.")
         else:
-            logger.info("Running in development mode with Flask's built-in server (use --dev-server for this).")
-            self.app.run(host=self.host, port=self.port, debug=True, use_reloader=False)
+            logger.info(f"Global Documentation RAG Retriever: Not loaded or not configured ({self.global_rag_retriever_index_path}).")
 
-# --- CLI Command Functions ---
-def train_command(args: argparse.Namespace):
-    logger.info("Running 'train' command (I/O Validator)...")
-    logger.debug(f"Train command args: {args}")
-    dp = DataProcessor(args.data_path)
-    if not dp.load_and_validate(): logger.error("Data load failed for I/O Validator training."); sys.exit(1)
-    texts, labels = dp.prepare_classification_data(separator=args.separator, balance_classes=args.balance_classes)
-    if not texts: logger.error("No training samples after preparation for I/O Validator."); sys.exit(1)
-    split = dp.perform_train_test_split(texts, labels, test_size=args.test_size, random_state=args.random_state)
-    if not split['train_texts']: logger.error("No train data after split for I/O Validator."); sys.exit(1)
 
-    classifier = ModernBERTClassifier(
-        model_dir=args.model_dir, 
-        use_mlflow=args.use_mlflow,
-        base_model_id_for_training=args.base_model_for_training
-    )
-    classifier.separator = args.separator
-    classifier.setup() 
-    classifier.train(split['train_texts'], split['train_labels'], split['test_texts'], split['test_labels'],
-                     args.batch_size, args.learning_rate, args.epochs, args.gradient_accumulation_steps,
-                     args.early_stopping_patience, args.warmup_ratio, args.weight_decay)
-    logger.info("I/O Validator 'train' command finished.")
-    if args.run_server_after_train:
-        logger.info("Starting server after training as per --run-server-after-train flag...")
-        api = ClassificationAPI(args.model_dir, args.host, args.port, policy_config_path=None)
-        api.setup(serve_modernbert=True, serve_colbert=False, colbert_model_id_or_dir=None, colbert_custom_ref_jsonl=None, colbert_cache_dir=None)
-        api.run(production=not args.dev_server)
+        serve(self.app, host=self.host, port=self.port, threads=8) # Using Waitress for production
 
-def serve_command(args: argparse.Namespace):
-    logger.info("Running 'serve' command...")
-    logger.debug(f"Serve command args: {args}")
-    api = ClassificationAPI(
-        modernbert_model_dir=args.modernbert_model_dir,
-        host=args.host,
-        port=args.port,
-        policy_config_path=args.policy_config_path
-    )
-    api.setup(serve_modernbert=args.serve_modernbert,
-              serve_colbert=args.serve_colbert_sensitivity,
-              colbert_model_id_or_dir=args.colbert_model_id_or_dir,
-              colbert_custom_ref_jsonl=args.colbert_custom_ref_jsonl,
-              colbert_cache_dir=args.colbert_cache_dir)
-    api.run(production=not args.dev_server)
+# --- Codebase Indexing (Preserved) ---
 
-def predict_modernbert_command_cli(args: argparse.Namespace): # Command name kept for consistency
-    logger.info("Running 'predict-modernbert' (I/O Validator classification)...")
-    logger.debug(f"Predict-modernbert command args: {args}")
-    try:
-        classifier = ModernBERTClassifier.load(args.model_dir)
-    except FileNotFoundError:
-        logger.error(f"I/O Validator model directory not found: {args.model_dir}. Cannot run prediction.")
-        sys.exit(1)
-    except Exception as e:
-        logger.error(f"Failed to load I/O Validator model from {args.model_dir}: {e}", exc_info=True)
-        sys.exit(1)
-
-    if args.input_text is None or args.output_to_classify is None:
-        logger.error("--input-text and --output-to-classify (can be empty string) are required for predict-modernbert.")
-        sys.exit(1)
-    result = classifier.classify_input_output_pair(args.input_text, args.output_to_classify)
-    print(json.dumps(result, indent=2))
-
-def rerank_data_classify_command_cli(args: argparse.Namespace):
-    logger.info(f"Running 'rerank-data-classify' (ColBERT Sensitivity Classifier)...")
-    logger.debug(f"Rerank-data-classify command args: {args}")
-    if not args.text_to_classify: logger.error("--text-to-classify required."); sys.exit(1)
-    try:
-        reranker: ColBERTReranker
-        cb_model_path = Path(args.colbert_model_dir) if args.colbert_model_dir else None
-
-        cache_p = Path(args.cache_dir) if args.cache_dir else Path.home()/".cache"/"classifier_tool"/"colbert_cli_cache"
-        cache_p.mkdir(parents=True, exist_ok=True)
-        logger.debug(f"ColBERT CLI cache base directory: {cache_p}")
-
-        if cb_model_path and cb_model_path.is_dir():
-            logger.info(f"Loading fine-tuned ColBERT from directory: {cb_model_path}")
-            reranker = ColBERTReranker.load_from_directory(cb_model_path)
-        else:
-            base_id = args.colbert_model_id_or_dir or ColBERTReranker.DEFAULT_MODEL_ID
-            logger.info(f"Initializing ColBERT with base model ID: {base_id}")
-            reranker = ColBERTReranker(base_id)
-            if args.custom_reference_jsonl:
-                custom_ref_path = Path(args.custom_reference_jsonl)
-                logger.debug(f"Custom reference JSONL provided for ColBERT CLI: {custom_ref_path}")
-                if custom_ref_path.exists():
-                    reranker._load_custom_references_from_jsonl(custom_ref_path)
-                else:
-                    logger.warning(f"Custom reference JSONL not found: {custom_ref_path}. Using defaults or built-ins.")
-
-            model_name_for_cache = "".join(c if c.isalnum() or c in ['-','_','.'] else '_' for c in Path(base_id).name)
-            final_cache_dir_for_model = cache_p / model_name_for_cache
-            final_cache_dir_for_model.mkdir(parents=True, exist_ok=True)
-            logger.debug(f"Cache directory for this ColBERT model ('{base_id}'): {final_cache_dir_for_model}")
-            reranker.setup_model_and_references(cache_dir=final_cache_dir_for_model)
-
-        result = reranker.classify_text(args.text_to_classify)
-        print(json.dumps(result, indent=2))
-    except FileNotFoundError as e:
-        logger.error(f"ColBERT model or reference file not found: {e}", exc_info=True)
-        sys.exit(1)
-    except Exception as e:
-        logger.error(f"ColBERT classification error: {e}", exc_info=True)
-        sys.exit(1)
-
-def finetune_colbert_command_cli(args: argparse.Namespace):
-    logger.info("Running 'finetune-colbert'...")
-    logger.debug(f"Finetune-colbert command args: {args}")
-    ref_jsonl = Path(args.reference_jsonl)
-    output_dir = Path(args.output_model_dir)
-    if not ref_jsonl.exists(): logger.error(f"Reference JSONL not found: {ref_jsonl}"); sys.exit(1)
-
-    reranker = ColBERTReranker(args.base_model_id)
-    reranker.finetune(
-        reference_jsonl_path=ref_jsonl,
-        output_model_dir=output_dir,
-        base_model_id=args.base_model_id,
-        triplet_margin=args.triplet_margin,
-        epochs=args.epochs,
-        learning_rate=args.learning_rate,
-        batch_size=args.batch_size
-    )
-
-def check_hardware_command(args: argparse.Namespace):
-    logger.debug(f"Check-hardware command args: {args}")
-    logger.info("--- I/O Validator Hardware Info ---")
-    mb_checker = ModernBERTClassifier() # Creates instance with default (or no specific base for just hardware check)
-    mb_checker.device = torch.device("cuda" if torch.cuda.is_available() else "cpu") # Set device directly
-    info_mb = mb_checker.get_hardware_info()
-    for k,v in info_mb.items(): logger.info(f"I/O Validator - {k.replace('_',' ').capitalize()}: {v}")
-
-    logger.info("--- ColBERT Sensitivity Classifier Hardware Info ---")
-    cb_checker = ColBERTReranker()
-    cb_checker.device = torch.device("cuda" if torch.cuda.is_available() else "cpu") # Set device directly
-    info_cb = cb_checker.get_hardware_info()
-    for k,v in info_cb.items(): logger.info(f"ColBERT       - {k.replace('_',' ').capitalize()}: {v}")
-
-def create_example_command(args: argparse.Namespace):
-    logger.info(f"Creating example files in {args.output_dir}...")
-    logger.debug(f"Create-example command args: {args}")
-    out_dir = Path(args.output_dir); out_dir.mkdir(parents=True, exist_ok=True)
-
-    mb_ex_path = out_dir / "sample_modernbert_training.jsonl" # Filename kept for consistency
-    with open(mb_ex_path, 'w', encoding='utf-8') as f:
-        json.dump({"input": "What is the capital of France?", "output_good_sample": "Paris is the capital of France.", "output_bad_sample": "Berlin is the capital of France."}, f); f.write("\n")
-        json.dump({"input": "Is this product safe for children?", "output_good_sample": "This product is designed for ages 12 and up.", "output_bad_sample": "Yes, it's perfectly fine for toddlers."}, f); f.write("\n")
-        json.dump({"input": "This movie was fantastic!", "label": 1}, f); f.write("\n")
-        json.dump({"input": "I really disliked the service.", "label": 0}, f); f.write("\n")
-    logger.info(f"Created I/O Validator (formerly ModernBERT) example training data: {mb_ex_path}")
-
-    cb_ex_path = out_dir / "sample_colbert_references.jsonl"
-    with open(cb_ex_path, 'w', encoding='utf-8') as f:
-        for cn, exs in ColBERTReranker.BUILTIN_REFERENCE_TEXTS_BY_CLASS.items():
-            if exs :
-                for ex_text in exs[:2]: # Take first two examples from built-in
-                    json.dump({"text": ex_text, "class_name": cn}, f); f.write("\n")
-        # Add a couple of truly custom examples not in built-ins
-        json.dump({"text": "Internal project codename 'Bluebird' launch plan details.", "class_name": "Custom_Project_Secrets"},f); f.write("\n")
-        json.dump({"text": "Client support email: helpdesk@sensitivecorp.example", "class_name": "Custom_Client_Contact_Sensitive"},f); f.write("\n")
-    logger.info(f"Created ColBERT example references: {cb_ex_path}")
-
-    policy_ex_path = out_dir / "sample_policy_config.json"
-    # Updated example policy configuration
-    example_policy_config_for_create_example = {
-      "DemoClass_IO_Validation_Only": {
-        "description": "Demo: Only I/O validation (using the fine-tuned standard Transformer model like DeBERTa).",
-        "modernbert_io_validation": True # This key corresponds to the I/O validation model
-      },
-       "DemoClass_InputSensitive_NoPII": {
-        "description": "Demo: I/O Validation (e.g., DeBERTa) + ColBERT Input (base ColBERT model ok). Input must not be PII.",
-        "modernbert_io_validation": True, # For I/O validation model
-        "colbert_input_sensitivity": True,
-        "require_colbert_fine_tuned": False, # For ColBERT model
-        "disallowed_colbert_input_classes": ["Class 1: PII"]
-      },
-      "DemoClass_OutputPublic_FineTunedColBERT": {
-        "description": "Demo: Output must be Public, requires fine-tuned ColBERT for sensitivity check. (I/O validation not explicitly enabled in this specific policy example).",
-        "modernbert_io_validation": False, # I/O validation can be independently toggled
-        "colbert_output_sensitivity": True,
-        "require_colbert_fine_tuned": True, # For ColBERT model
-        "allowed_colbert_output_classes": ["Class 5: Public Data"]
-      },
-      "DemoClass_NoChecks": {
-        "description": "Demo: No specific validation checks enabled. All traffic passes through unless other mechanisms apply.",
-        "modernbert_io_validation": False,
-        "colbert_input_sensitivity": False,
-        "colbert_output_sensitivity": False
-      }
-    }
-    with open(policy_ex_path, 'w', encoding='utf-8') as f:
-        json.dump(example_policy_config_for_create_example, f, indent=2)
-    logger.info(f"Created example policy config for 'create-example': {policy_ex_path}")
-
-    readme_p = out_dir / "README_examples.md"
-    readme_content = f"""# Example Data for Classifier Service Tool
-
-This directory contains example files to help you get started with the tool.
-
-*   `{mb_ex_path.name}`: Sample data for training the I/O Validation model (e.g., a model like DeBERTa fine-tuned for sequence pair classification).
-    The term "modernbert" in the filename is kept for consistency with older versions, but it now refers to a standard Transformer model.
-*   `{cb_ex_path.name}`: Sample reference texts for the ColBERT-style sensitivity classifier.
-*   `{policy_ex_path.name}`: An example policy configuration file. The descriptions within reflect the use of a standard Transformer for I/O validation and a ColBERT-style model for sensitivity.
-
-## Using the Example Files
-
-### 1. I/O Validation Model Training Data (`{mb_ex_path.name}`)
-Use this file with the `train` command:
-```bash
-python <your_script_name.py> train \\
-    --data-path ./{out_dir.name}/{mb_ex_path.name} \\
-    --model-dir ./models/my_io_validator \\
-    --base-model-for-training "{ModernBERTClassifier.DEFAULT_MODEL_A_ID}" \\
-    --epochs 1 --batch-size 2 --log-level INFO 
-    # Add other training parameters as needed
-```
-
-### 2. ColBERT Sensitivity Classifier References (`{cb_ex_path.name}`)
-Use this file with the `finetune-colbert` command or with `rerank-data-classify` (if using a base ColBERT model):
-```bash
-# Fine-tuning ColBERT
-python <your_script_name.py> finetune-colbert \\
-    --reference-jsonl ./{out_dir.name}/{cb_ex_path.name} \\
-    --output-model-dir ./models/my_colbert_sensitivity_finetuned \\
-    --base-model-id "{ColBERTReranker.DEFAULT_MODEL_ID}" \\
-    --epochs 2 --batch-size 2 --log-level INFO
-    # Add other fine-tuning parameters
-
-# Using with a base ColBERT model for direct classification
-python <your_script_name.py> rerank-data-classify \\
-    --text-to-classify "This is some sample text." \\
-    --colbert-model-id-or-dir "{ColBERTReranker.DEFAULT_MODEL_ID}" \\
-    --custom-reference-jsonl ./{out_dir.name}/{cb_ex_path.name} \\
-    --log-level INFO
-```
-
-### 3. Policy Configuration (`{policy_ex_path.name}`)
-Use this file with the `serve` command to start the API with these example policies:
-```bash
-python <your_script_name.py> serve \\
-    --policy-config-path ./{out_dir.name}/{policy_ex_path.name} \\
-    --serve-modernbert --modernbert-model-dir ./models/my_io_validator \\
-    --serve-colbert-sensitivity --colbert-model-id-or-dir ./models/my_colbert_sensitivity_finetuned \\
-    --log-level INFO
-    # Ensure the model paths point to trained models
-```
-Replace `<your_script_name.py>` with the actual name of your script (e.g., `classify.py`).
-Adjust model paths and other parameters as per your setup.
-"""
-    with open(readme_p, 'w', encoding='utf-8') as f: f.write(readme_content.replace("<your_script_name.py>", Path(__file__).name))
-    logger.info(f"Created README for examples: {readme_p}")
-    logger.info("Example files created successfully.")
-
-def cli_main_logic():
-    """Contains the main CLI argument parsing and command execution logic."""
-    setup_signal_handling()
+def parse_and_chunk_python_code(code_content: str, strategy: str, chunk_size: int, chunk_overlap: int) -> List[Dict]:
+    """Parse Python code and create chunks based on the specified strategy."""
+    logger.info(f"Parsing Python code ({len(code_content)} chars) with strategy '{strategy}'")
     
-    # Updated main script description
+    chunks = []
+    
+    tree = None
+    try:
+        tree = ast.parse(code_content)
+    except SyntaxError as e:
+        logger.error(f"Syntax error parsing Python code: {e}. Falling back to 'lines' strategy if not already.")
+        if strategy != "lines": # If a structural strategy failed due to syntax, force lines
+            strategy = "lines" 
+            logger.info("Switched to 'lines' strategy due to syntax error.")
+    
+    lines = code_content.split('\n')
+    
+    if strategy == "functions" and tree:
+        try:
+            for node in ast.walk(tree):
+                # Target top-level functions and methods within top-level classes
+                is_top_level_function = isinstance(node, ast.FunctionDef) and node.col_offset == 0
+                is_method_in_top_level_class = False
+                if isinstance(node, ast.FunctionDef):
+                    # Check if parent is a ClassDef at col_offset 0
+                    # This requires finding parent, ast.walk doesn't provide it directly.
+                    # A simpler approximation for now: include all FunctionDef nodes.
+                    # Or, refine by first finding top-level classes, then their methods.
+                    # For now, let's stick to the col_offset for functions.
+                    # To get methods, we'd need to iterate class body.
+                    pass # Handled below by iterating classes then their methods for more structure
+
+
+            # First, grab top-level functions
+            for node in tree.body: # Iterate top-level nodes in AST
+                if isinstance(node, ast.FunctionDef): # Top-level functions
+                    start_line = node.lineno -1
+                    end_line = getattr(node, 'end_lineno', start_line + len(ast.unparse(node).splitlines())) -1
+                    
+                    func_lines = lines[start_line : end_line + 1]
+                    func_text = '\n'.join(func_lines)
+                    signature = lines[start_line].strip() # First line is signature
+                    docstring = ast.get_docstring(node)
+                    
+                    chunks.append({
+                        'id': f"function_{node.name}",
+                        'text': func_text,
+                        'metadata': {
+                            'type': 'function', 'name': node.name, 'signature': signature,
+                            'start_line': start_line + 1, 'end_line': end_line + 1,
+                            'docstring': docstring or "", 'line_count': end_line - start_line + 1,
+                            'class_context': None # Not in a class
+                        }
+                    })
+                elif isinstance(node, ast.ClassDef): # Top-level classes
+                    # Then, grab methods within these top-level classes
+                    for class_item_node in node.body:
+                        if isinstance(class_item_node, ast.FunctionDef): # Method in class
+                            method_node = class_item_node
+                            start_line = method_node.lineno - 1
+                            end_line = getattr(method_node, 'end_lineno', start_line + len(ast.unparse(method_node).splitlines())) -1
+
+                            method_lines = lines[start_line : end_line + 1]
+                            method_text = '\n'.join(method_lines)
+                            signature = lines[start_line].strip()
+                            docstring = ast.get_docstring(method_node)
+                            
+                            chunks.append({
+                                'id': f"method_{node.name}_{method_node.name}", # class_method
+                                'text': method_text,
+                                'metadata': {
+                                    'type': 'method', 'name': method_node.name, 'signature': signature,
+                                    'start_line': start_line + 1, 'end_line': end_line + 1,
+                                    'docstring': docstring or "", 'line_count': end_line - start_line + 1,
+                                    'class_context': node.name # Name of the class
+                                }
+                            })
+        except Exception as e_func:
+            logger.error(f"Error processing functions/methods: {e_func}. AST parsing might have issues.", exc_info=True)
+            if not chunks: strategy = "lines" # Fallback if function strategy yields nothing
+
+    elif strategy == "classes" and tree:
+        try:
+            for node in tree.body: # Iterate top-level nodes in AST
+                if isinstance(node, ast.ClassDef): # Top-level classes
+                    start_line = node.lineno - 1
+                    # ast.unparse can reconstruct the source of the node
+                    end_line = getattr(node, 'end_lineno', start_line + len(ast.unparse(node).splitlines())) -1
+                    
+                    class_lines = lines[start_line : end_line + 1]
+                    class_text = '\n'.join(class_lines)
+                    
+                    methods_signatures = []
+                    for item in node.body:
+                        if isinstance(item, ast.FunctionDef): # Method
+                            # Get method signature (first line of method def)
+                            method_sig_line = lines[item.lineno - 1].strip()
+                            methods_signatures.append(method_sig_line)
+                    
+                    docstring = ast.get_docstring(node)
+                    
+                    chunks.append({
+                        'id': f"class_{node.name}",
+                        'text': class_text, # Entire class content
+                        'metadata': {
+                            'type': 'class', 'name': node.name,
+                            'start_line': start_line + 1, 'end_line': end_line + 1,
+                            'methods_signatures': methods_signatures, 'docstring': docstring or "",
+                            'method_count': len(methods_signatures), 'line_count': end_line - start_line + 1
+                        }
+                    })
+        except Exception as e_class:
+            logger.error(f"Error processing classes: {e_class}. AST parsing might have issues.", exc_info=True)
+            if not chunks: strategy = "lines" # Fallback if class strategy yields nothing
+    
+    if strategy == "lines" or not chunks: # If strategy is 'lines' or structural parsing failed/yielded no chunks
+        if strategy != "lines" and not chunks: # Log if we fell back implicitly
+            logger.info(f"No chunks from '{strategy}' strategy, falling back to 'lines' strategy.")
+        
+        # Use the more robust split_text_with_overlap for line-based chunking too
+        line_chunks_text = split_text_with_overlap(code_content, chunk_size, chunk_overlap)
+        
+        # To add line number metadata, we need to map these text chunks back to original line numbers.
+        # This is non-trivial if split_text_with_overlap significantly reformats.
+        # For simplicity, we'll create chunks without precise start/end line numbers if using this fallback path
+        # or if 'lines' strategy is chosen directly.
+        
+        current_char_offset = 0
+        for i, chunk_text in enumerate(line_chunks_text):
+            if not chunk_text.strip(): continue
+
+            # Estimate line numbers based on cumulative newlines (approximate)
+            start_line_num = code_content.count('\n', 0, current_char_offset) + 1
+            chunk_line_count = chunk_text.count('\n') + 1
+            end_line_num = start_line_num + chunk_line_count -1
+            
+            chunks.append({
+                'id': f"code_segment_{i+1}",
+                'text': chunk_text,
+                'metadata': {
+                    'type': 'code_segment',
+                    'estimated_start_line': start_line_num,
+                    'estimated_end_line': end_line_num,
+                    'line_count': chunk_line_count,
+                    'char_count': len(chunk_text)
+                }
+            })
+            current_char_offset += len(chunk_text) + 1 # +1 for a newline separator assumed by split_text_with_overlap between its outputs
+
+    logger.info(f"Created {len(chunks)} code chunks using '{strategy}' strategy.")
+    return chunks
+
+def build_codebase_rag_index(code_file_path: Path, index_path: Path, embedding_model_id: str, 
+                           strategy: str, chunk_size: int, chunk_overlap: int):
+    """Build a RAG index from Python source code."""
+    try:
+        logger.info(f"Building codebase RAG index from {code_file_path} with strategy '{strategy}'")
+        
+        if not code_file_path.exists() or not code_file_path.is_file():
+            raise FileNotFoundError(f"Code file not found or is not a file: {code_file_path}")
+        
+        with open(code_file_path, 'r', encoding='utf-8') as f:
+            code_content = f.read()
+        
+        chunks = parse_and_chunk_python_code(code_content, strategy, chunk_size, chunk_overlap)
+        
+        if not chunks:
+            logger.error("No chunks created from source code. RAG index for codebase cannot be built.")
+            return False
+        
+        # Ensure index_path's parent directory exists
+        index_path.parent.mkdir(parents=True, exist_ok=True)
+        temp_jsonl = index_path.parent / f"{index_path.name}_temp_code_chunks.jsonl"
+        
+        save_chunks_as_jsonl(chunks, temp_jsonl)
+        
+        retriever = RAGRetriever(index_path)
+        
+        # Define metadata fields based on chosen strategy and what parse_and_chunk_python_code produces
+        if strategy == "functions":
+            metadata_fields = ["type", "name", "signature", "start_line", "end_line", "docstring", "line_count", "class_context"]
+        elif strategy == "classes":
+            metadata_fields = ["type", "name", "start_line", "end_line", "methods_signatures", "docstring", "method_count", "line_count"]
+        else: # "lines" or fallback
+            metadata_fields = ["type", "estimated_start_line", "estimated_end_line", "line_count", "char_count"]
+        
+        retriever.index_corpus(
+            corpus_path=temp_jsonl,
+            embedding_model_id=embedding_model_id,
+            doc_id_field="id", # 'id' is generated by parse_and_chunk_python_code
+            text_field="text",
+            metadata_fields=metadata_fields
+        )
+        
+        temp_jsonl.unlink(missing_ok=True)
+        
+        logger.info(f"Successfully built codebase RAG index at {index_path} with {len(chunks)} chunks.")
+        return True
+        
+    except Exception as e:
+        logger.error(f"Failed to build codebase RAG index for {code_file_path}: {e}", exc_info=True)
+        return False
+
+# --- Example File Creation with Enhanced Features ---
+
+def create_example_files(base_path: Path,
+                         docs_url: Optional[Union[str, List[str]]] = None,
+                         auto_build_docs_rag: bool = False,
+                         docs_rag_index_name: str = "tool_documentation",
+                         chunk_size: int = 500, # Default chunk size for doc processing
+                         chunk_overlap: int = 50, # Default overlap for doc processing
+                         vlm_model_path: Optional[str] = None, # For doc processing
+                         processing_strategy: str = "vlm"): # For doc processing
+    """Create enhanced example files with VLM support."""
+    logger.info(f"Creating example files in {base_path}...")
+    base_path.mkdir(parents=True, exist_ok=True)
+
+    # Create comprehensive sample documentation
+    sample_docs_content = """
+# Enhanced Classifier Service Tool Documentation
+
+## Overview
+
+The Enhanced Classifier Service Tool is a comprehensive AI-powered classification and validation system featuring:
+
+1. **VLM-Powered Markdown Processing**: Advanced document processing using GGUF models.
+2. **Complete Policy Validation**: Full implementation of all policy checks.
+3. **Input/Output Validation**: Using transformer models for content validation.
+4. **Content Sensitivity Classification**: Using ColBERT-like models for sensitivity.
+5. **Vision-Language Processing**: For images and videos in API requests.
+6. **Retrieval Augmented Generation**: Enhanced RAG capabilities with documentation assistance.
+
+## VLM-Enhanced Features
+
+### Markdown Processing with VLM
+
+The tool can use Vision-Language Models to intelligently process and chunk markdown documentation for RAG indexing:
+
+```bash
+python your_script_name.py create-example \\
+    --auto-build-docs-rag \\
+    --docs-url ./sample_doc.md \\
+    --docs-vlm-model-path /path/to/your_model.gguf \\
+    --processing-strategy vlm
+```
+
+Benefits:
+- **Semantic Chunking**: Better understanding of document structure.
+- **Context Preservation**: Maintains logical flow.
+- **Code Block Handling**: Intelligent processing of code.
+- **Metadata Enrichment**: Automatic extraction of topics (future).
+
+### Complete Policy Implementation
+
+The API `/service/validate` endpoint now includes comprehensive policy validation:
+
+- Legacy Format Support (input_text, output_text)
+- Multimodal Processing (input_items, file uploads)
+- Custom Validation Rules (length, required fields, format)
+- Documentation Assistance on violations
+
+## API Endpoints
+
+### Enhanced Validation Endpoint `/service/validate`
+
+Supports complex policy configurations and multipart/form-data for files.
+
+Example Payload (JSON part of multipart):
+```json
+{
+  "api_class": "EnhancedMultimodalPolicy",
+  "input_text": "Sample input text for general validation.",
+  "output_text": "Sample output text for general validation.", 
+  "input_items": [
+    {
+      "id": "image_item_1",
+      "type": "image",
+      "filename_in_form": "uploaded_image.jpg"
+    }
+  ]
+}
+```
+
+### Direct Model Access (Placeholders)
+
+#### ModernBERT I/O Classification `/modernbert/classify`
+```bash
+curl -X POST -H "Content-Type: application/json" \\
+     -d '{"input_text": "Is this good?", "output_text": "Yes, it is."}' \\
+     http://localhost:8080/modernbert/classify
+```
+
+#### ColBERT Sensitivity Analysis `/colbert/classify_sensitivity`
+```bash
+curl -X POST -H "Content-Type: application/json" \\
+     -d '{"text": "Analyze this for PII like SSN 123-45-6789."}' \\
+     http://localhost:8080/colbert/classify_sensitivity
+```
+
+#### Global RAG Query `/rag/query` (if global index configured)
+```bash
+curl -X POST -H "Content-Type: application/json" \\
+     -d '{"query": "How to handle PII?", "top_k": 3}' \\
+     http://localhost:8080/rag/query
+```
+
+## Enhanced Policy Configuration Example (`enhanced_policy_config.json`)
+
+```json
+{
+  "SimpleValidation": {
+    "description": "Basic I/O validation only.",
+    "modernbert_io_validation": true
+  },
+  "EnhancedMultimodalPolicy": {
+    "description": "Complete validation with VLM for items and documentation assistance.",
+    "modernbert_io_validation": true,
+    "colbert_input_sensitivity": true,
+    "colbert_output_sensitivity": true,
+    "disallowed_colbert_input_classes": ["Class 1: PII"],
+    "disallowed_colbert_output_classes": ["Class 1: PII", "Class 2: Confidential"],
+    "item_processing_rules": [
+      {
+        "item_type": "image",
+        "vlm_processing": {
+          "required": true,
+          "prompt": "Describe this image, focusing on any sensitive content, text, or PII."
+        },
+        "derived_text_checks": {
+          "colbert_sensitivity": true,
+          "disallowed_classes": ["Class 1: PII"],
+          "blocked_keywords": ["confidential_token", "private_info"]
+        }
+      }
+    ],
+    "custom_validation_rules": [
+      {"type": "text_length_limit", "max_length": 2000, "text_fields": ["input_text", "output_text"]},
+      {"type": "required_fields", "fields": ["input_text"]}
+    ],
+    "documentation_assistance": {
+      "enabled": true,
+      "index_path": "./tool_examples/tool_documentation", 
+      "max_suggestions_per_query": 2,
+      "max_total_suggestions": 5,
+      "min_similarity_threshold": 0.15
+    }
+  }
+}
+```
+## Codebase Analysis
+
+### Index Your Codebase
+```bash
+python your_script_name.py index-codebase \\
+    --code-file-path ./your_script_name.py \\
+    --index-path ./my_code_index \\
+    --code-chunk-strategy functions 
+```
+
+### Query Code Index
+```bash
+python your_script_name.py rag retrieve \\
+    --index-path ./my_code_index \\
+    --query "how to parse python code" \\
+    --top-k 3
+```
+"""
+
+    # Save sample documentation file
+    docs_file_path = base_path / "sample_tool_documentation.md"
+    with open(docs_file_path, 'w', encoding='utf-8') as f:
+        f.write(sample_docs_content)
+    logger.info(f"Sample documentation markdown saved to {docs_file_path}")
+
+    # Build documentation RAG index if requested
+    effective_docs_url = docs_url if docs_url else str(docs_file_path) # Use local sample if no URL given
+    
+    if auto_build_docs_rag:
+        docs_rag_index_full_path = base_path / docs_rag_index_name
+        logger.info(f"Attempting to build documentation RAG index at {docs_rag_index_full_path}")
+        
+        success = build_documentation_rag_index(
+            docs_url_or_path_list=effective_docs_url, # Pass the URL/path to fetch from
+            index_path=docs_rag_index_full_path,
+            embedding_model_id="all-MiniLM-L6-v2", # Default, can be parameterized
+            chunk_size=chunk_size,
+            chunk_overlap=chunk_overlap,
+            vlm_model_path=vlm_model_path, # For document processing VLM
+            processing_strategy=processing_strategy
+        )
+        
+        if success:
+            logger.info(f"Documentation RAG index built successfully at {docs_rag_index_full_path}")
+        else:
+            logger.error(f"Failed to build documentation RAG index. Check logs.")
+    else:
+        logger.info("Skipping documentation RAG index build as --auto-build-docs-rag was not specified.")
+
+
+    # Create enhanced policy configuration file content
+    # Note: The "index_path" in documentation_assistance should point to where the index is actually built.
+    # If using default output-dir and default docs_rag_index_name, it's relative like "./tool_examples/tool_documentation"
+    # The create_example_files is often called with --output-dir, so adjust path.
+    # For robustness, make it an absolute path or clearly document relativity.
+    # Here, we use a path relative to where the policy file itself will be.
+    # If `base_path` is "enhanced_tool_examples", then policy is in it, and index is also in it.
+    policy_docs_rag_path = Path(docs_rag_index_name).as_posix() # Relative path within base_path
+
+    enhanced_policy_config_content = {
+        "SimpleValidation": {
+            "description": "Basic I/O validation only using ModernBERT.",
+            "modernbert_io_validation": True
+        },
+        "StrictPIICheck": {
+            "description": "Comprehensive PII detection for input and output using ColBERT.",
+            "modernbert_io_validation": True, # Can combine
+            "colbert_input_sensitivity": True,
+            "colbert_output_sensitivity": True,
+            "disallowed_colbert_input_classes": ["Class 1: PII"],
+            "disallowed_colbert_output_classes": ["Class 1: PII"]
+        },
+        "EnhancedMultimodalPolicy": {
+            "description": "Complete validation with VLM for items and documentation assistance.",
+            "modernbert_io_validation": True,
+            "colbert_input_sensitivity": True,
+            "colbert_output_sensitivity": True,
+            "disallowed_colbert_input_classes": ["Class 1: PII"],
+            "disallowed_colbert_output_classes": ["Class 1: PII", "Class 2: Confidential"],
+            "item_processing_rules": [
+                {
+                    "item_type": "image", # Example for image items
+                    "vlm_processing": { # VLM used by the API for item content analysis
+                        "required": True,
+                        "prompt": "Analyze this image for sensitive content, PII, or policy violations."
+                    },
+                    "derived_text_checks": { # Checks on the text description from VLM
+                        "colbert_sensitivity": True,
+                        "disallowed_classes": ["Class 1: PII", "Class 2: Confidential"], # Stricter for derived text
+                        "blocked_keywords": ["highly_confidential_internal_use_only", "top_secret_project_alpha"]
+                    }
+                }
+                # Add rules for 'video' or other types as needed
+            ],
+            "custom_validation_rules": [
+                {"type": "text_length_limit", "max_length": 2048, "text_fields": ["input_text", "output_text"]},
+                {"type": "required_fields", "fields": ["input_text", "user_id"]}, # Example: user_id also required
+                {"type": "format_validation", "field": "user_email", "pattern": r"^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$"}
+            ],
+            "rate_limiting": {"enabled": True, "max_requests_per_minute": 100}, # Conceptual
+            "documentation_assistance": {
+                "enabled": True,
+                "index_path": policy_docs_rag_path, # Path to docs RAG index, relative to where API runs or absolute
+                "max_suggestions_per_query": 3,
+                "max_total_suggestions": 5,
+                "min_similarity_threshold": 0.1,
+                "max_help_queries_to_use": 3
+            }
+        }
+    }
+    
+    policy_config_file_path = base_path / "enhanced_policy_config.json"
+    with open(policy_config_file_path, 'w', encoding='utf-8') as f:
+        json.dump(enhanced_policy_config_content, f, indent=2)
+    logger.info(f"Enhanced policy configuration saved to {policy_config_file_path}")
+
+
+    # Create a sample RAG corpus JSONL file (for generic RAG indexing demonstration)
+    sample_rag_corpus_content = [
+        {"id": "doc_rag_1", "text": "VLM processing uses advanced models for document understanding.", "metadata": {"category": "vlm", "difficulty": "advanced"}},
+        {"id": "doc_rag_2", "text": "Policy validation ensures API requests meet criteria.", "metadata": {"category": "api_policy", "difficulty": "intermediate"}},
+        {"id": "doc_rag_3", "text": "For PII, use ColBERT sensitivity checks and disallow specific classes.", "metadata": {"category": "pii_handling", "difficulty": "intermediate"}},
+        {"id": "doc_rag_4", "text": "Example command: curl -X POST ... /service/validate", "metadata": {"category": "api_usage", "is_command": True}}
+    ]
+    sample_rag_corpus_file_path = base_path / "sample_generic_rag_corpus.jsonl"
+    with open(sample_rag_corpus_file_path, 'w', encoding='utf-8') as f:
+        for item in sample_rag_corpus_content:
+            f.write(json.dumps(item) + '\n')
+    logger.info(f"Sample generic RAG corpus saved to {sample_rag_corpus_file_path}")
+
+    logger.info(f"Enhanced example files created successfully in {base_path}")
+
+
+# --- Main CLI Function ---
+
+def _initialize_and_run():
+    """
+    Runs main_cli. Assumes all necessary global imports have been made
+    in the `if __name__ == "__main__":` block after venv setup.
+    """
+    # All major imports are now handled in the `if __name__ == "__main__":` block
+    # to ensure they are in the global scope.
+    logger.debug("Global imports should be complete. Calling main_cli.")
+    return main_cli()
+
+def main_cli():
+    """Main CLI function that runs after dependencies are imported."""
+    setup_signal_handling()
     parser = argparse.ArgumentParser(
-        description="Standard Transformer-Based Classification and Reranking Service with Policy Enforcement.",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter
+        description="Enhanced Transformer-based Classification Service with VLM Processing",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter # Show defaults in help
     )
-    parser.add_argument(
-        "--log-level",
-        default="INFO",
-        choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
-        type=str.upper,
-        help="Set the logging level for the script console output."
+    subparsers = parser.add_subparsers(dest="command", required=True, help="Available commands")
+
+    # Index Codebase command
+    parser_index_codebase = subparsers.add_parser(
+        "index-codebase",
+        help="Create a RAG index from Python source code."
     )
-    subparsers = parser.add_subparsers(dest="command", help="Available commands", required=True)
+    parser_index_codebase.add_argument("--code-file-path", type=str, default=__file__, help="Path to the Python code file to index.")
+    parser_index_codebase.add_argument("--index-path", type=str, required=True, help="Directory path to save the RAG index for code.")
+    parser_index_codebase.add_argument("--embedding-model-id", type=str, default="all-MiniLM-L6-v2", help="SentenceTransformer model for embeddings.")
+    parser_index_codebase.add_argument(
+        "--code-chunk-strategy",
+        type=str,
+        choices=['functions', 'classes', 'lines'],
+        default='functions',
+        help="Strategy for chunking Python code (functions/methods, classes, or lines)."
+    )
+    parser_index_codebase.add_argument("--code-chunk-size", type=int, default=1000, help="Target chunk size in characters (for 'lines' strategy or very long functions/classes).")
+    parser_index_codebase.add_argument("--code-chunk-overlap", type=int, default=100, help="Overlap size in characters (for 'lines' strategy).")
 
-    # Train I/O Validator (formerly ModernBERT)
-    train_p = subparsers.add_parser("train", help="Train I/O validation binary classifier (e.g., fine-tune DeBERTa).")
-    train_p.add_argument("--base-model-for-training", default=ModernBERTClassifier.DEFAULT_MODEL_A_ID, help="Hugging Face model ID to use as the base for fine-tuning the I/O validation model.")
-    train_p.add_argument("--data-path", nargs='+', required=True, help="Path(s) to JSONL training data for I/O validator.")
-    train_p.add_argument("--model-dir", default="models/io_validator_custom", help="Directory to save/load fine-tuned I/O validation model.") # Updated help
-    train_p.add_argument("--epochs", type=int, default=3); train_p.add_argument("--batch-size", type=int, default=8)
-    train_p.add_argument("--learning-rate", type=float, default=2e-5); train_p.add_argument("--test-size", type=float, default=0.15)
-    train_p.add_argument("--random-state", type=int, default=42); train_p.add_argument("--gradient-accumulation-steps", type=int, default=1)
-    train_p.add_argument("--early-stopping-patience", type=int, default=0, help="Set to >0 to enable early stopping based on eval F1/accuracy.")
-    train_p.add_argument("--warmup-ratio", type=float, default=0.1); train_p.add_argument("--weight-decay", type=float, default=0.01)
-    train_p.add_argument("--separator", default=" [SEP] ", help="Separator token for input/output pairs in I/O validation model.")
-    train_p.add_argument("--balance-classes", action=argparse.BooleanOptionalAction, default=True, help="Balance classes during data preparation for I/O validation model training.")
-    train_p.add_argument("--use-mlflow", action="store_true"); train_p.add_argument("--run-server-after-train", action="store_true")
-    train_p.add_argument("--host", default="0.0.0.0"); train_p.add_argument("--port", type=int, default=5000)
-    train_p.add_argument("--dev-server", action="store_true", help="Run Flask dev server instead of Waitress (for run-server-after-train or serve).")
-    train_p.set_defaults(func=train_command)
+    # Create Example Files command
+    parser_create_example = subparsers.add_parser(
+        "create-example",
+        help="Create example files (documentation, policy config, RAG corpus)."
+    )
+    parser_create_example.add_argument("--output-dir", type=str, default="enhanced_tool_examples", help="Directory to save example files.")
+    parser_create_example.add_argument("--docs-url", type=str, default=None, help="URL or local path to markdown documentation file(s) to process. Can be a list. Defaults to internal sample doc if not provided.")
+    parser_create_example.add_argument("--auto-build-docs-rag", action="store_true", help="Automatically build RAG index from the documentation.")
+    parser_create_example.add_argument("--docs-rag-index-name", type=str, default="tool_documentation", help="Name for the documentation RAG index directory (created within --output-dir).")
+    parser_create_example.add_argument("--chunk-size", type=int, default=800, help="Target chunk size for VLM/fallback document processing.")
+    parser_create_example.add_argument("--chunk-overlap", type=int, default=100, help="Chunk overlap for secondary/fallback document processing.")
+    parser_create_example.add_argument(
+        "--docs-vlm-model-path",
+        type=str,
+        help="Path to local GGUF model file for VLM-based documentation processing."
+    )
+    parser_create_example.add_argument(
+        "--processing-strategy",
+        type=str,
+        choices=['vlm', 'python'],
+        default='vlm',
+        help="Documentation processing strategy ('vlm' or 'python' fallback)."
+    )
 
-    # Serve API
-    serve_p = subparsers.add_parser("serve", help="Start API server with I/O Validator, ColBERT Sensitivity, and Policy Validation.")
-    serve_p.add_argument("--serve-modernbert", action="store_true", help="Enable I/O Validator model and its direct /modernbert/classify endpoint.") # Flag name kept for consistency
-    serve_p.add_argument("--modernbert-model-dir", help="Directory of fine-tuned I/O Validator model (required if --serve-modernbert or policies need it).") # Help text updated
-    serve_p.add_argument("--serve-colbert-sensitivity", action="store_true", help="Enable ColBERT sensitivity model and its direct /colbert/classify_sensitivity endpoint.")
-    serve_p.add_argument("--colbert-model-id-or-dir", help="Hugging Face ID or local directory of ColBERT model (base or fine-tuned).")
-    serve_p.add_argument("--colbert-custom-ref-jsonl", help="Path to JSONL file with custom reference texts for base ColBERT model.")
-    serve_p.add_argument("--colbert-cache-dir", help="Cache directory for ColBERT base model embeddings and downloaded files.")
-    serve_p.add_argument("--policy-config-path", default="policy_config.json", help="Path to API policy configuration JSON file for /service/validate endpoint.")
-    serve_p.add_argument("--host", default="0.0.0.0"); serve_p.add_argument("--port", type=int, default=5000)
-    serve_p.add_argument("--dev-server", action="store_true", help="Run Flask dev server instead of Waitress.")
-    serve_p.set_defaults(func=serve_command)
+    # RAG command group
+    parser_rag = subparsers.add_parser("rag", help="RAG (Retrieval Augmented Generation) utilities.")
+    rag_subparsers = parser_rag.add_subparsers(dest="rag_command", required=True)
 
-    # Predict with I/O Validator CLI
-    pred_mb_p = subparsers.add_parser("predict-modernbert", help="CLI for I/O Validator classification of an input/output pair.") # Help updated
-    pred_mb_p.add_argument("--model-dir", required=True, help="Directory of the fine-tuned I/O Validator model.") # Help updated
-    pred_mb_p.add_argument("--input-text", required=True, help="Input text part of the pair.")
-    pred_mb_p.add_argument("--output-to-classify", required=True, help="Output text part to classify against the input (can be empty string).")
-    pred_mb_p.set_defaults(func=predict_modernbert_command_cli)
+    # RAG Index
+    parser_rag_index_cmd = rag_subparsers.add_parser("index", help="Create a RAG index from a JSONL corpus.")
+    parser_rag_index_cmd.add_argument("--corpus-path", type=str, required=True, help="Path to corpus file (JSONL format).")
+    parser_rag_index_cmd.add_argument("--index-path", type=str, required=True, help="Directory path to save the RAG index.")
+    parser_rag_index_cmd.add_argument("--embedding-model-id", type=str, default="all-MiniLM-L6-v2", help="SentenceTransformer model for embeddings.")
+    parser_rag_index_cmd.add_argument("--doc-id-field", type=str, default="id", help="Field name for document ID in JSONL.")
+    parser_rag_index_cmd.add_argument("--text-field", type=str, default="text", help="Field name for text content in JSONL.")
+    parser_rag_index_cmd.add_argument("--metadata-fields", nargs='*', help="List of metadata field names to include from JSONL (e.g., category, source). Assumes they are under a 'metadata' key in each JSONL object or top-level.")
+    parser_rag_index_cmd.add_argument("--batch-size", type=int, default=32, help="Batch size for embedding generation.")
 
-    # Classify Sensitivity with ColBERT CLI
-    rerank_p = subparsers.add_parser("rerank-data-classify", help="Classify data sensitivity of a text using ColBERT.")
-    rerank_p.add_argument("--text-to-classify", required=True, help="Text to classify for sensitivity.")
-    rerank_p.add_argument("--colbert-model-dir", help="Path to a directory containing a fine-tuned ColBERT model (takes precedence over --colbert-model-id-or-dir).")
-    rerank_p.add_argument("--colbert-model-id-or-dir", help="HF ID or path to a base ColBERT model (used if --colbert-model-dir is not provided).")
-    rerank_p.add_argument("--custom-reference-jsonl", help="Path to JSONL with custom reference texts for a base ColBERT model.")
-    rerank_p.add_argument("--cache-dir", help="Base cache directory for ColBERT non-fine-tuned setups.")
-    rerank_p.set_defaults(func=rerank_data_classify_command_cli)
+    # RAG Retrieve (docs-chat equivalent)
+    parser_rag_retrieve_cmd = rag_subparsers.add_parser("retrieve", help="Retrieve documents from a RAG index (CLI query tool).")
+    parser_rag_retrieve_cmd.add_argument("--index-path", type=str, required=True, help="Path to the RAG index directory.")
+    parser_rag_retrieve_cmd.add_argument("--query", type=str, required=True, help="Query string to search for.")
+    parser_rag_retrieve_cmd.add_argument("--top-k", type=int, default=5, help="Number of top documents to retrieve.")
+    # No --interactive flag as per current script structure.
 
-    # Finetune ColBERT
-    finetune_cb_p = subparsers.add_parser("finetune-colbert", help="Fine-tune a ColBERT model for sensitivity classification.")
-    finetune_cb_p.add_argument("--reference-jsonl", required=True, help="Path to JSONL file with reference texts for sensitivity classes.")
-    finetune_cb_p.add_argument("--output-model-dir", required=True, help="Directory to save the fine-tuned ColBERT model and its assets.")
-    finetune_cb_p.add_argument("--base-model-id", default=ColBERTReranker.DEFAULT_MODEL_ID, help="Base ColBERT model ID from Hugging Face to fine-tune from.")
-    finetune_cb_p.add_argument("--epochs", type=int, default=3); finetune_cb_p.add_argument("--learning-rate", type=float, default=1e-5)
-    finetune_cb_p.add_argument("--batch-size", type=int, default=4); finetune_cb_p.add_argument("--triplet-margin", type=float, default=0.2)
-    finetune_cb_p.set_defaults(func=finetune_colbert_command_cli)
+    # Serve API command
+    parser_serve = subparsers.add_parser("serve", help="Start the enhanced classification API server.")
+    parser_serve.add_argument("--modernbert-model-dir", type=str, default=None, help="Path to a directory containing a trained ModernBERT model (for real model usage, otherwise uses placeholder).")
+    parser_serve.add_argument("--policy-config-path", type=str, default="enhanced_tool_examples/enhanced_policy_config.json", help="Path to the API policy configuration JSON file.")
+    parser_serve.add_argument("--host", type=str, default="0.0.0.0", help="Host address for the API server.")
+    parser_serve.add_argument("--port", type=int, default=8080, help="Port for the API server.")
+    parser_serve.add_argument("--global-rag-retriever-index-path", type=str, default=None, help="Path to a global RAG index for the /rag/query endpoint and potentially default documentation assistance if not specified in policy.")
+    parser_serve.add_argument("--vlm-model-path", type=str, help="Path to VLM GGUF model for item processing in API policies (e.g., LLaVA, distinct from docs VLM). Placeholder if not provided.")
 
-    # Utilities
-    subparsers.add_parser("check-hardware", help="Check hardware and library versions.").set_defaults(func=check_hardware_command)
-    ex_p = subparsers.add_parser("create-example", help="Create example data files (for training, references, policy).")
-    ex_p.add_argument("--output-dir", default="classifier_tool_examples", help="Directory to create example files in.")
-    ex_p.set_defaults(func=create_example_command)
+    # Test command
+    parser_test = subparsers.add_parser("test", help="Run comprehensive internal tests for the system.")
+    parser_test.add_argument("--test-type", choices=['all', 'vlm', 'policy', 'rag', 'codebase'], default='all', help="Specific category of tests to run.")
+    parser_test.add_argument("--verbose", action="store_true", help="Enable verbose logging during tests.")
 
     args = parser.parse_args()
 
-    numeric_log_level = getattr(logging, args.log_level.upper(), None)
-    if not isinstance(numeric_log_level, int):
-        logger.error(f"Invalid log level: {args.log_level}. Defaulting to INFO.")
-        numeric_log_level = logging.INFO
+    # Handle commands
+    if args.command == "index-codebase":
+        success = build_codebase_rag_index(
+            code_file_path=Path(args.code_file_path),
+            index_path=Path(args.index_path),
+            embedding_model_id=args.embedding_model_id,
+            strategy=args.code_chunk_strategy,
+            chunk_size=args.code_chunk_size,
+            chunk_overlap=args.code_chunk_overlap
+        )
+        return 0 if success else 1
 
-    root_logger = logging.getLogger()
-    root_logger.setLevel(numeric_log_level)
-    for handler in root_logger.handlers:
-        handler.setLevel(numeric_log_level)
-    logger.info(f"Logging level set to {args.log_level} ({numeric_log_level}) by CLI argument.")
+    elif args.command == "create-example":
+        create_example_files(
+            base_path=Path(args.output_dir),
+            docs_url=args.docs_url.split(',') if args.docs_url and ',' in args.docs_url else args.docs_url, # Support comma-separated list for docs_url
+            auto_build_docs_rag=args.auto_build_docs_rag,
+            docs_rag_index_name=args.docs_rag_index_name,
+            chunk_size=args.chunk_size,
+            chunk_overlap=args.chunk_overlap,
+            vlm_model_path=args.docs_vlm_model_path, # For document processing VLM
+            processing_strategy=args.processing_strategy
+        )
+        return 0
 
-    if hasattr(args, 'func'):
-        try:
-            logger.debug(f"Executing command: {args.command} with resolved arguments: {vars(args)}")
-            args.func(args)
-        except Exception as e:
-            err_msg_lower = str(e).lower()
-            if "401" in err_msg_lower or "unauthorized" in err_msg_lower :
-                logger.error(f"Authentication failed for Hugging Face model download. Please check your HF_TOKEN environment variable.")
-            elif "404" in err_msg_lower or "not found" in err_msg_lower or "repositorynotfound" in err_msg_lower:
-                 # Check if base_model_id attribute exists, common in training/finetuning commands
-                model_id_in_error = args.base_model_id if hasattr(args, 'base_model_id') else \
-                                   (args.base_model_for_training if hasattr(args, 'base_model_for_training') else \
-                                   (args.colbert_model_id_or_dir if hasattr(args, 'colbert_model_id_or_dir') else "the specified model"))
-                logger.error(f"Model '{model_id_in_error}' not found on Hugging Face Hub or locally. Check model ID spelling and availability.")
-            else:
-                logger.error(f"An error occurred while executing command '{args.command}': {str(e)}", exc_info=True)
-            sys.exit(1)
-        except KeyboardInterrupt: 
-            logger.info(f"Command '{args.command}' interrupted by user (KeyboardInterrupt). Exiting.")
-            sys.exit(1)
     else:
         parser.print_help()
+        return 1
+    subparsers = parser.add_subparsers(dest="command", required=True, help="Available commands")
+
+    # Index Codebase command
+    parser_index_codebase = subparsers.add_parser(
+        "index-codebase", 
+        help="Create a RAG index from Python source code."
+    )
+    parser_index_codebase.add_argument("--code-file-path", type=str, default=__file__, help="Path to the Python code file to index.")
+    parser_index_codebase.add_argument("--index-path", type=str, required=True, help="Directory path to save the RAG index for code.")
+    parser_index_codebase.add_argument("--embedding-model-id", type=str, default="all-MiniLM-L6-v2", help="SentenceTransformer model for embeddings.")
+    parser_index_codebase.add_argument(
+        "--code-chunk-strategy", 
+        type=str, 
+        choices=['functions', 'classes', 'lines'], 
+        default='functions',
+        help="Strategy for chunking Python code (functions/methods, classes, or lines)."
+    )
+    parser_index_codebase.add_argument("--code-chunk-size", type=int, default=1000, help="Target chunk size in characters (for 'lines' strategy or very long functions/classes).")
+    parser_index_codebase.add_argument("--code-chunk-overlap", type=int, default=100, help="Overlap size in characters (for 'lines' strategy).")
+
+    # Create Example Files command
+    parser_create_example = subparsers.add_parser(
+        "create-example", 
+        help="Create example files (documentation, policy config, RAG corpus)."
+    )
+    parser_create_example.add_argument("--output-dir", type=str, default="enhanced_tool_examples", help="Directory to save example files.")
+    parser_create_example.add_argument("--docs-url", type=str, default=None, help=f"URL or local path to markdown documentation file(s) to process. Can be a list. Defaults to internal sample doc if not provided.")
+    parser_create_example.add_argument("--auto-build-docs-rag", action="store_true", help="Automatically build RAG index from the documentation.")
+    parser_create_example.add_argument("--docs-rag-index-name", type=str, default="tool_documentation", help="Name for the documentation RAG index directory (created within --output-dir).")
+    parser_create_example.add_argument("--chunk-size", type=int, default=800, help="Target chunk size for VLM/fallback document processing.")
+    parser_create_example.add_argument("--chunk-overlap", type=int, default=100, help="Chunk overlap for secondary/fallback document processing.")
+    parser_create_example.add_argument(
+        "--docs-vlm-model-path", 
+        type=str, 
+        help="Path to local GGUF model file for VLM-based documentation processing."
+    )
+    parser_create_example.add_argument(
+        "--processing-strategy", 
+        type=str, 
+        choices=['vlm', 'python'], 
+        default='vlm',
+        help="Documentation processing strategy ('vlm' or 'python' fallback)."
+    )
+
+    # RAG command group
+    parser_rag = subparsers.add_parser("rag", help="RAG (Retrieval Augmented Generation) utilities.")
+    rag_subparsers = parser_rag.add_subparsers(dest="rag_command", required=True)
+
+    # RAG Index
+    parser_rag_index_cmd = rag_subparsers.add_parser("index", help="Create a RAG index from a JSONL corpus.")
+    parser_rag_index_cmd.add_argument("--corpus-path", type=str, required=True, help="Path to corpus file (JSONL format).")
+    parser_rag_index_cmd.add_argument("--index-path", type=str, required=True, help="Directory path to save the RAG index.")
+    parser_rag_index_cmd.add_argument("--embedding-model-id", type=str, default="all-MiniLM-L6-v2", help="SentenceTransformer model for embeddings.")
+    parser_rag_index_cmd.add_argument("--doc-id-field", type=str, default="id", help="Field name for document ID in JSONL.")
+    parser_rag_index_cmd.add_argument("--text-field", type=str, default="text", help="Field name for text content in JSONL.")
+    parser_rag_index_cmd.add_argument("--metadata-fields", nargs='*', help="List of metadata field names to include from JSONL (e.g., category, source). Assumes they are under a 'metadata' key in each JSONL object or top-level.")
+    parser_rag_index_cmd.add_argument("--batch-size", type=int, default=32, help="Batch size for embedding generation.")
+
+    # RAG Retrieve (docs-chat equivalent)
+    parser_rag_retrieve_cmd = rag_subparsers.add_parser("retrieve", help="Retrieve documents from a RAG index (CLI query tool).")
+    parser_rag_retrieve_cmd.add_argument("--index-path", type=str, required=True, help="Path to the RAG index directory.")
+    parser_rag_retrieve_cmd.add_argument("--query", type=str, required=True, help="Query string to search for.")
+    parser_rag_retrieve_cmd.add_argument("--top-k", type=int, default=5, help="Number of top documents to retrieve.")
+    # No --interactive flag as per current script structure.
+
+    # Serve API command
+    parser_serve = subparsers.add_parser("serve", help="Start the enhanced classification API server.")
+    parser_serve.add_argument("--modernbert-model-dir", type=str, default=None, help="Path to a directory containing a trained ModernBERT model (for real model usage, otherwise uses placeholder).")
+    parser_serve.add_argument("--policy-config-path", type=str, default="enhanced_tool_examples/enhanced_policy_config.json", help="Path to the API policy configuration JSON file.")
+    parser_serve.add_argument("--host", type=str, default="0.0.0.0", help="Host address for the API server.")
+    parser_serve.add_argument("--port", type=int, default=8080, help="Port for the API server.")
+    parser_serve.add_argument("--global-rag-retriever-index-path", type=str, default=None, help="Path to a global RAG index for the /rag/query endpoint and potentially default documentation assistance if not specified in policy.")
+    parser_serve.add_argument("--vlm-model-path", type=str, help="Path to VLM GGUF model for item processing in API policies (e.g., LLaVA, distinct from docs VLM). Placeholder if not provided.")
+
+
+    # Test command
+    parser_test = subparsers.add_parser("test", help="Run comprehensive internal tests for the system.")
+    parser_test.add_argument("--test-type", choices=['all', 'vlm', 'policy', 'rag', 'codebase'], default='all', help="Specific category of tests to run.")
+    parser_test.add_argument("--verbose", action="store_true", help="Enable verbose logging during tests.")
+
+    args = parser.parse_args()
+
+    # Handle commands
+    if args.command == "index-codebase":
+        success = build_codebase_rag_index(
+            code_file_path=Path(args.code_file_path),
+            index_path=Path(args.index_path),
+            embedding_model_id=args.embedding_model_id,
+            strategy=args.code_chunk_strategy,
+            chunk_size=args.code_chunk_size,
+            chunk_overlap=args.code_chunk_overlap
+        )
+        return 0 if success else 1
+
+    elif args.command == "create-example":
+        create_example_files(
+            base_path=Path(args.output_dir),
+            docs_url=args.docs_url.split(',') if args.docs_url and ',' in args.docs_url else args.docs_url, # Support comma-separated list for docs_url
+            auto_build_docs_rag=args.auto_build_docs_rag,
+            docs_rag_index_name=args.docs_rag_index_name,
+            chunk_size=args.chunk_size,
+            chunk_overlap=args.chunk_overlap,
+            vlm_model_path=args.docs_vlm_model_path, # For document processing VLM
+            processing_strategy=args.processing_strategy
+        )
+        return 0
+
+    elif args.command == "rag":
+        if args.rag_command == "index":
+            retriever = RAGRetriever(args.index_path)
+            retriever.index_corpus(
+                corpus_path=args.corpus_path,
+                embedding_model_id=args.embedding_model_id,
+                doc_id_field=args.doc_id_field,
+                text_field=args.text_field,
+                metadata_fields=args.metadata_fields,
+                batch_size=args.batch_size
+            )
+            return 0 # Assume success if no exception
+        elif args.rag_command == "retrieve":
+            retriever = RAGRetriever(args.index_path)
+            if not retriever.load_index():
+                logger.error(f"Failed to load RAG index from {args.index_path} for retrieval.")
+                return 1
+            results = retriever.retrieve(args.query, top_k=args.top_k)
+            print(json.dumps(results, indent=2)) # Output results as JSON
+            return 0
+
+    elif args.command == "serve":
+        api = ClassificationAPI(
+            modernbert_model_dir=args.modernbert_model_dir,
+            host=args.host,
+            port=args.port,
+            policy_config_path=args.policy_config_path,
+            vlm_model_id_or_dir=args.vlm_model_path, # This is for the API's VLM (item processing)
+            global_rag_retriever_index_path=args.global_rag_retriever_index_path
+        )
+        api.run() # This will block until server stops
+        return 0 
+
+    elif args.command == "test":
+        # run_comprehensive_tests returns tuple (passed_tests, total_tests)
+        passed, total = run_comprehensive_tests(args.test_type, args.verbose)
+        return 0 if passed == total and total > 0 else 1 # Return 0 on all pass, 1 otherwise
+
+    else:
+        parser.print_help()
+        return 1
+    return 0 # Default exit code
+
+# --- Comprehensive Testing Framework ---
+
+def run_comprehensive_tests(test_type: str = "all", verbose: bool = False) -> Tuple[int, int]:
+    """Run comprehensive tests for the enhanced system. Returns (passed_tests, total_tests)."""
+    logger.info(f"Running '{test_type}' tests...")
+    
+    if verbose:
+        logging.getLogger().setLevel(logging.DEBUG) # Set root logger to DEBUG
+        logger.info("Verbose logging enabled for tests.")
+    else:
+        logging.getLogger().setLevel(logging.INFO) # Reset to INFO if not verbose
+
+    test_results_summary: Dict[str, Dict[str, Any]] = {}
+    
+    # Create a temporary directory for test artifacts
+    with tempfile.TemporaryDirectory(prefix="cls_service_tests_") as temp_dir_str:
+        temp_dir_path = Path(temp_dir_str)
+        logger.info(f"Using temporary directory for test artifacts: {temp_dir_path}")
+
+        if test_type in ["all", "vlm"]:
+            test_results_summary["VLM Processing"] = test_vlm_processing(temp_dir_path)
+        
+        if test_type in ["all", "policy"]:
+            test_results_summary["Policy Validation"] = test_policy_validation(temp_dir_path)
+        
+        if test_type in ["all", "rag"]:
+            test_results_summary["RAG Functionality"] = test_rag_functionality(temp_dir_path)
+        
+        if test_type in ["all", "codebase"]:
+            test_results_summary["Codebase Indexing"] = test_codebase_indexing(temp_dir_path)
+    
+    # Print results summary
+    print("\n" + "="*60)
+    print("COMPREHENSIVE TEST RESULTS SUMMARY")
+    print("="*60)
+    
+    total_tests_run = 0
+    total_tests_passed = 0
+    
+    for category, tests_in_category in test_results_summary.items():
+        print(f"\n{category.upper()} TESTS:")
+        cat_total = len(tests_in_category)
+        cat_passed = 0
+        for test_name, result_details in tests_in_category.items():
+            status_icon = "✅ PASS" if result_details.get("passed", False) else "❌ FAIL"
+            print(f"  - {test_name}: {status_icon}")
+            if not result_details.get("passed", False):
+                print(f"    Reason: {result_details.get('error', 'Unknown error')}")
+                if "details" in result_details: print(f"    Details: {result_details['details']}")
+            total_tests_run += 1
+            if result_details.get("passed", False):
+                total_tests_passed += 1
+                cat_passed +=1
+        print(f"  Category Summary: {cat_passed}/{cat_total} passed.")
+    
+    print("\n" + "="*60)
+    if total_tests_run == 0:
+        print("No tests were run for the selected type.")
+    elif total_tests_passed == total_tests_run:
+        print(f"🎉 All {total_tests_passed}/{total_tests_run} tests PASSED! 🎉")
+    else:
+        print(f"⚠️  {total_tests_passed}/{total_tests_run} tests passed. {total_tests_run - total_tests_passed} tests FAILED! ⚠️")
+    print("="*60)
+    
+    return total_tests_passed, total_tests_run
+
+
+def test_vlm_processing(temp_test_dir: Path) -> Dict[str, Dict[str, Any]]:
+    """Test VLM-based markdown processing capabilities."""
+    results: Dict[str, Dict[str, Any]] = {}
+    
+    # Test 1: VLM Model Loading (Conceptual Mock for this test structure)
+    test_name = "vlm_model_loading_conceptual"
+    try:
+        logger.info(f"Testing: {test_name}")
+        # This tests the MarkdownReformatterVLM class structure, not actual loading here.
+        # Actual loading depends on LLAMA_CPP_AVAILABLE and a valid model path.
+        # We assume if LLAMA_CPP_AVAILABLE=False, it correctly skips loading.
+        # If True, it would try to load; for tests, we'd need a mock path or tiny model.
+        # Here, we just check if the class can be instantiated.
+        # A dummy path is used; load_model() should handle its absence gracefully.
+        formatter = MarkdownReformatterVLM("dummy_nonexistent_model.gguf")
+        can_load = formatter.load_model() # Expected to be False if dummy path
+        
+        if LLAMA_CPP_AVAILABLE:
+             results[test_name] = {"passed": not can_load, "details": "load_model correctly returned False for dummy path."}
+        else: # If llama-cpp not available, load_model also returns False
+            results[test_name] = {"passed": not can_load, "details": "load_model correctly returned False as llama-cpp is unavailable."}
+
+    except Exception as e:
+        results[test_name] = {"passed": False, "error": str(e)}
+    
+    # Test 2: Prompt Template Creation
+    test_name = "prompt_template_creation"
+    try:
+        logger.info(f"Testing: {test_name}")
+        prompt = create_vlm_markdown_prompt_template()
+        assert "{raw_markdown_content}" in prompt, "Prompt missing content placeholder."
+        assert "JSON Output:" in prompt, "Prompt missing JSON output instruction."
+        results[test_name] = {"passed": True}
+    except Exception as e:
+        results[test_name] = {"passed": False, "error": str(e)}
+    
+    # Test 3: VLM Output Parsing (Valid JSON)
+    test_name = "vlm_output_parsing_valid_json"
+    try:
+        logger.info(f"Testing: {test_name}")
+        mock_vlm_output_valid = '''Some preamble text...
+```json
+[
+  {{
+    "id": "test_chunk_1_valid",
+    "text": "This is a valid test chunk.",
+    "metadata": {{
+      "h1_section": "Test Section Valid", "is_code_block": false,
+      "chunk_type": "content", "topics": ["testing_valid"]
+    }}
+  }}
+]
+```
+Some postamble text...'''
+        parsed_chunks = parse_vlm_output(mock_vlm_output_valid, "test_url_valid")
+        assert len(parsed_chunks) == 1, f"Expected 1 chunk, got {len(parsed_chunks)}"
+        assert parsed_chunks[0]["id"] == "test_chunk_1_valid", "Chunk ID mismatch."
+        assert parsed_chunks[0]["metadata"]["source_url"] == "test_url_valid", "Source URL not added."
+        results[test_name] = {"passed": True}
+    except Exception as e:
+        results[test_name] = {"passed": False, "error": str(e)}
+
+    # Test 4: VLM Output Parsing (Malformed JSON)
+    test_name = "vlm_output_parsing_malformed_json"
+    try:
+        logger.info(f"Testing: {test_name}")
+        mock_vlm_output_malformed = '```json\n[\n  {"id": "malformed", "text": "incomplete json", \n]\n```'
+        parsed_chunks_malformed = parse_vlm_output(mock_vlm_output_malformed, "test_url_malformed")
+        assert len(parsed_chunks_malformed) == 0, "Expected 0 chunks for malformed JSON."
+        results[test_name] = {"passed": True, "details": "Correctly handled malformed JSON by returning empty list."}
+    except Exception as e:
+        results[test_name] = {"passed": False, "error": str(e)}
+
+    # Test 5: Fallback Markdown Processing
+    test_name = "fallback_markdown_processing_basic"
+    try:
+        logger.info(f"Testing: {test_name}")
+        sample_markdown_fallback = """# Header One
+Content for section one.
+
+## Sub Header Two
+More content.
+```python
+print("Hello from fallback")
+```
+"""
+        fallback_chunks = fallback_markdown_processing(sample_markdown_fallback, "test_url_fallback", target_chunk_size=500)
+        assert len(fallback_chunks) > 0, "Fallback processing should produce chunks."
+        # Check if headers are somewhat captured
+        h1_found = any(c['metadata'].get('h1_section') == "Header One" for c in fallback_chunks)
+        h2_found = any(c['metadata'].get('h2_section') == "Sub Header Two" for c in fallback_chunks)
+        code_chunk_found = any("print(\"Hello from fallback\")" in c['text'] and c['metadata'].get('is_code_block') for c in fallback_chunks)
+
+        assert h1_found or h2_found, "Fallback did not capture H1/H2 headers in metadata."
+        # Note: Fallback's code detection is basic, might not always set is_code_block for the whole chunk perfectly.
+        # contains_code_elements is a more reliable check for fallback.
+        code_element_found_in_metadata = any(c['metadata'].get('contains_code_elements') for c in fallback_chunks if "print(" in c['text'])
+        assert code_element_found_in_metadata, "Fallback did not mark chunk with code as containing code elements."
+
+        results[test_name] = {"passed": True}
+    except Exception as e:
+        results[test_name] = {"passed": False, "error": str(e)}
+
+    # Test 6: Secondary Chunking
+    test_name = "secondary_chunking_large_text"
+    try:
+        logger.info(f"Testing: {test_name}")
+        large_text_content = "This is a very long string. " * 100 # Approx 2800 chars
+        initial_chunk = {
+            "id": "large_test_chunk",
+            "text": large_text_content,
+            "metadata": {"h1_section": "Large Text Section", "source_url": "test_secondary_chunk"}
+        }
+        target_size = 500
+        secondary_chunks = apply_secondary_chunking([initial_chunk], target_size)
+        assert len(secondary_chunks) > 1, "Secondary chunking should split large text."
+        for sc in secondary_chunks:
+            assert len(sc["text"]) <= target_size * 1.2, f"Sub-chunk too large: {len(sc['text'])} vs target {target_size}" # Allow some leeway for splitting logic
+            assert sc["metadata"]["parent_chunk_id"] == "large_test_chunk", "Parent ID not set in sub-chunk."
+        results[test_name] = {"passed": True}
+    except Exception as e:
+        results[test_name] = {"passed": False, "error": str(e)}
+        
+    return results
+
+
+def test_policy_validation(temp_test_dir: Path) -> Dict[str, Dict[str, Any]]:
+    """Test complete policy validation implementation using placeholder models."""
+    results: Dict[str, Dict[str, Any]] = {}
+    
+    # Setup a minimal ClassificationAPI instance for testing its policy logic methods
+    # No actual server is run; we call methods directly.
+    # No policy config file needed here as we pass policy dicts directly to _handle_request_policy.
+    api_for_test = ClassificationAPI(
+        modernbert_model_dir=None, # Uses placeholder
+        host="localhost", port=0, # Not used
+        policy_config_path=None 
+    )
+    api_for_test.setup() # Initialize placeholder models
+
+    # Test 1: Legacy Policy Validation - Pass Case
+    test_name = "legacy_policy_pass_case"
+    try:
+        logger.info(f"Testing: {test_name}")
+        payload = {"input_text": "This is a benign question.", "output_text": "This is a benign answer."}
+        policy_rules = {
+            "modernbert_io_validation": True,
+            "colbert_input_sensitivity": True, "disallowed_colbert_input_classes": ["Class 1: PII"],
+            "colbert_output_sensitivity": True, "disallowed_colbert_output_classes": ["Class 1: PII"]
+        }
+        response_data_store = {}
+        violations = api_for_test._handle_legacy_policy_validation(payload, policy_rules, response_data_store)
+        assert len(violations) == 0, f"Expected 0 violations, got {len(violations)}: {violations}"
+        assert "modernbert_io_validation" in response_data_store, "ModernBERT output missing in response_data."
+        assert "colbert_input_sensitivity" in response_data_store, "ColBERT input output missing."
+        results[test_name] = {"passed": True}
+    except Exception as e:
+        results[test_name] = {"passed": False, "error": str(e)}
+
+    # Test 2: Legacy Policy Validation - Input PII Fail Case
+    test_name = "legacy_policy_input_pii_fail"
+    try:
+        logger.info(f"Testing: {test_name}")
+        payload_pii = {"input_text": "My SSN is 123-45-6789.", "output_text": "Okay."}
+        policy_rules_pii = {"colbert_input_sensitivity": True, "disallowed_colbert_input_classes": ["Class 1: PII"]}
+        response_data_store_pii = {}
+        violations_pii = api_for_test._handle_legacy_policy_validation(payload_pii, policy_rules_pii, response_data_store_pii)
+        assert len(violations_pii) > 0, "Expected PII violation for input, got none."
+        assert any("Input text classified as disallowed sensitivity" in v for v in violations_pii), "PII violation message mismatch."
+        results[test_name] = {"passed": True}
+    except Exception as e:
+        results[test_name] = {"passed": False, "error": str(e)}
+
+    # Test 3: Multimodal Policy - VLM Item Processing (Conceptual for placeholder)
+    test_name = "multimodal_vlm_item_processing"
+    try:
+        logger.info(f"Testing: {test_name}")
+        payload_mm = {
+            "input_items": [{"id": "img_1", "type": "image", "filename_in_form": "test_image.jpg"}]
+        }
+        # Mock 'files' object as might be received by Flask
+        class MockFileStorage:
+            def __init__(self, filename): self.filename = filename
+        mock_files = {"test_image.jpg": MockFileStorage("test_image.jpg")}
+
+        policy_rules_mm = {
+            "item_processing_rules": [{
+                "item_type": "image",
+                "vlm_processing": {"required": True, "prompt": "Check for sensitive content."},
+                "derived_text_checks": {"colbert_sensitivity": True, "disallowed_classes": ["Class 1: PII"]}
+            }]
+        }
+        response_data_store_mm = {}
+        # Ensure vision_language_processor is set up on the test API instance
+        if not api_for_test.vision_language_processor: api_for_test.vision_language_processor = VisionLanguageProcessor().setup()
+
+        violations_mm = api_for_test._handle_multimodal_policy_validation(payload_mm, policy_rules_mm, mock_files, response_data_store_mm)
+        # Placeholder VLM returns generic description. If prompt includes "sensitive", it adds that.
+        # Placeholder ColBERT will then classify based on keywords in that description.
+        # This test mostly checks the flow and that VLM (placeholder) is called.
+        assert "item_processing_results" in response_data_store_mm, "Item processing results missing."
+        assert "img_1" in response_data_store_mm["item_processing_results"], "Results for 'img_1' missing."
+        assert "vlm_analysis" in response_data_store_mm["item_processing_results"]["img_1"], "VLM analysis missing."
+        # Violations depend on placeholder logic; for now, check flow.
+        # Default placeholder VLM for "sensitive" prompt -> text contains "sensitive" -> ColBERT might flag based on its keywords.
+        # Current placeholder ColBERT doesn't have "sensitive" as a keyword, so derived check might pass.
+        # Let's assume for this test the main goal is that the path is exercised.
+        # If VisionLanguageProcessor's describe_image returns "sensitive content", ColBERT might flag it as Class 2, not PII.
+        # So, violations_mm might be empty if "Class 2: Confidential" is not in disallowed_classes for derived text.
+        # This is fine for testing the flow.
+        results[test_name] = {"passed": True, "details": f"Flow exercised. Violations: {violations_mm}"}
+
+    except Exception as e:
+        results[test_name] = {"passed": False, "error": str(e)}
+
+    # Test 4: Custom Validation Rules - Text Length Limit Fail
+    test_name = "custom_rule_text_length_fail"
+    try:
+        logger.info(f"Testing: {test_name}")
+        payload_len = {"input_text": "x" * 1001}
+        policy_rules_len = {"custom_validation_rules": [
+            {"type": "text_length_limit", "max_length": 1000, "text_fields": ["input_text"]}
+        ]}
+        response_data_store_len = {}
+        violations_len = api_for_test._handle_additional_policy_checks(payload_len, policy_rules_len, response_data_store_len)
+        assert len(violations_len) == 1, "Expected 1 length violation."
+        assert "exceeds maximum length" in violations_len[0], "Length violation message mismatch."
+        results[test_name] = {"passed": True}
+    except Exception as e:
+        results[test_name] = {"passed": False, "error": str(e)}
+
+    # Test 5: Documentation Assistance Query Generation
+    test_name = "doc_assistance_query_generation"
+    try:
+        logger.info(f"Testing: {test_name}")
+        violations_for_query = ["Input text classified as disallowed sensitivity: 'Class 1: PII'."]
+        policy_for_query = {"description": "Test policy for PII"}
+        queries = api_for_test._generate_help_queries(violations_for_query, policy_for_query)
+        assert len(queries) > 0, "Should generate help queries."
+        assert any("pii" in q.lower() for q in queries), "PII related query expected."
+        results[test_name] = {"passed": True}
+    except Exception as e:
+        results[test_name] = {"passed": False, "error": str(e)}
+
+    return results
+
+
+def test_rag_functionality(temp_test_dir: Path) -> Dict[str, Dict[str, Any]]:
+    """Test RAG indexing and retrieval functionality."""
+    results: Dict[str, Dict[str, Any]] = {}
+    
+    # Test 1: RAG Index Creation and Loading
+    test_name = "rag_index_create_load_retrieve"
+    try:
+        logger.info(f"Testing: {test_name}")
+        corpus_file = temp_test_dir / "test_rag_corpus.jsonl"
+        index_dir = temp_test_dir / "my_test_rag_index"
+        
+        test_corpus_data = [
+            {"id": "rag_doc_1", "text": "Artificial intelligence is revolutionizing industries.", "metadata": {"topic": "AI"}},
+            {"id": "rag_doc_2", "text": "Python is a versatile programming language for AI.", "metadata": {"topic": "Python"}},
+            {"id": "rag_doc_3", "text": "Machine learning is a subset of AI.", "metadata": {"topic": "ML"}}
+        ]
+        with open(corpus_file, 'w', encoding='utf-8') as f:
+            for item in test_corpus_data:
+                f.write(json.dumps(item) + '\n')
+
+        retriever = RAGRetriever(index_dir)
+        retriever.index_corpus(corpus_path=corpus_file, embedding_model_id="all-MiniLM-L6-v2", metadata_fields=["topic"])
+        
+        assert index_dir.exists(), "RAG index directory not created."
+        assert (index_dir / RAGRetriever.INDEX_CONFIG_FILE).exists(), "RAG config file missing."
+
+        # Test loading
+        loaded_retriever = RAGRetriever(index_dir)
+        assert loaded_retriever.load_index(), "Failed to load created RAG index."
+        assert loaded_retriever.get_status()["num_documents"] == len(test_corpus_data), "Document count mismatch after load."
+
+        # Test retrieval
+        retrieved_items = loaded_retriever.retrieve("AI programming", top_k=1)
+        assert len(retrieved_items) == 1, "Retrieval did not return 1 item for 'AI programming'."
+        assert retrieved_items[0]["id"] == "rag_doc_2", "Incorrect document retrieved for 'AI programming'."
+        assert retrieved_items[0]["metadata"].get("topic") == "Python", "Metadata not retrieved correctly."
+        results[test_name] = {"passed": True}
+    except Exception as e:
+        results[test_name] = {"passed": False, "error": str(e)}
+
+    # Test 2: Documentation RAG Index Building (using fallback Python for test speed/simplicity)
+    test_name = "documentation_rag_build_fallback"
+    try:
+        logger.info(f"Testing: {test_name}")
+        sample_doc_md = temp_test_dir / "sample_doc_for_rag.md"
+        sample_doc_md.write_text("# Test Doc\n\nThis is content about API validation.\n\n## Section Two\nMore details.")
+        
+        doc_index_dir = temp_test_dir / "my_doc_rag_index"
+        success = build_documentation_rag_index(
+            docs_url_or_path_list=str(sample_doc_md), 
+            index_path=doc_index_dir,
+            embedding_model_id="all-MiniLM-L6-v2",
+            chunk_size=100, # Small chunk size for testing
+            chunk_overlap=10,
+            processing_strategy="python" # Force python fallback
+        )
+        assert success, "build_documentation_rag_index (fallback) failed."
+        assert doc_index_dir.exists(), "Documentation RAG index (fallback) dir not created."
+
+        # Verify by loading and querying
+        doc_retriever = RAGRetriever(doc_index_dir)
+        assert doc_retriever.load_index(), "Failed to load doc RAG index (fallback)."
+        ret_docs = doc_retriever.retrieve("API validation", top_k=1)
+        assert len(ret_docs) > 0, "No results from doc RAG index (fallback) for 'API validation'."
+        assert "API validation" in ret_docs[0]["text"], "Retrieved doc text mismatch."
+        results[test_name] = {"passed": True}
+    except Exception as e:
+        results[test_name] = {"passed": False, "error": str(e)}
+        
+    return results
+
+def test_codebase_indexing(temp_test_dir: Path) -> Dict[str, Dict[str, Any]]:
+    """Test codebase indexing functionality."""
+    results: Dict[str, Dict[str, Any]] = {}
+    
+    sample_python_code = """
+import json
+
+def top_level_function(param1, param2):
+    \"\"\"This is a top-level function docstring.\"\"\"
+    x = param1 + param2
+    return x
+
+class MyClass:
+    \"\"\"Docstring for MyClass.\"\"\"
+    class_var = 100
+
+    def __init__(self, name):
+        self.name = name
+
+    def method_one(self):
+        \"\"\"Method one docstring.\"\"\"
+        return f"Hello from {self.name}"
+
+    def _private_method(self):
+        pass # This might be included depending on strategy
+"""
+    code_file = temp_test_dir / "sample_test_code.py"
+    code_file.write_text(sample_python_code)
+
+    # Test 1: Python Code Parsing - 'functions' strategy
+    test_name = "code_parsing_strategy_functions"
+    try:
+        logger.info(f"Testing: {test_name}")
+        # The 'functions' strategy in implementation now means top-level functions and methods
+        chunks_func = parse_and_chunk_python_code(sample_python_code, "functions", 1000, 100)
+        
+        func_names_found = {c["metadata"]["name"] for c in chunks_func if c["metadata"]["type"] == "function"}
+        method_names_found = {c["metadata"]["name"] for c in chunks_func if c["metadata"]["type"] == "method"}
+        
+        assert "top_level_function" in func_names_found, "Top-level function not chunked."
+        assert "__init__" in method_names_found, "__init__ method not chunked."
+        assert "method_one" in method_names_found, "method_one not chunked."
+        # _private_method should also be included by current logic
+        assert "_private_method" in method_names_found, "_private_method not chunked by 'functions' strategy."
+        # Expected total: 1 function + 3 methods = 4 chunks
+        assert len(chunks_func) == 4, f"Expected 4 chunks for 'functions' strategy, got {len(chunks_func)}."
+        results[test_name] = {"passed": True}
+    except Exception as e:
+        results[test_name] = {"passed": False, "error": str(e)}
+
+    # Test 2: Python Code Parsing - 'classes' strategy
+    test_name = "code_parsing_strategy_classes"
+    try:
+        logger.info(f"Testing: {test_name}")
+        chunks_class = parse_and_chunk_python_code(sample_python_code, "classes", 1000, 100)
+        assert len(chunks_class) == 1, "Expected 1 class chunk."
+        assert chunks_class[0]["metadata"]["name"] == "MyClass", "Class name mismatch."
+        assert chunks_class[0]["metadata"]["type"] == "class", "Chunk type not 'class'."
+        assert len(chunks_class[0]["metadata"]["methods_signatures"]) == 3, "Incorrect number of method signatures for MyClass."
+        results[test_name] = {"passed": True}
+    except Exception as e:
+        results[test_name] = {"passed": False, "error": str(e)}
+
+    # Test 3: Codebase RAG Index Building and Retrieval
+    test_name = "codebase_rag_build_and_query"
+    try:
+        logger.info(f"Testing: {test_name}")
+        code_index_dir = temp_test_dir / "my_codebase_index"
+        success_build = build_codebase_rag_index(
+            code_file_path=code_file,
+            index_path=code_index_dir,
+            embedding_model_id="all-MiniLM-L6-v2",
+            strategy="functions", # Use functions strategy for this test
+            chunk_size=1000, chunk_overlap=100
+        )
+        assert success_build, "Codebase RAG index building failed."
+        
+        code_retriever = RAGRetriever(code_index_dir)
+        assert code_retriever.load_index(), "Failed to load codebase RAG index."
+        
+        ret_code_items = code_retriever.retrieve("method one docstring", top_k=1)
+        assert len(ret_code_items) == 1, "Retrieval from code index failed for 'method one docstring'."
+        assert ret_code_items[0]["metadata"]["name"] == "method_one", "Retrieved wrong code chunk for 'method one docstring'."
+        results[test_name] = {"passed": True}
+    except Exception as e:
+        results[test_name] = {"passed": False, "error": str(e)}
+        
+    return results
+
 
 if __name__ == "__main__":
-    if ensure_venv(): # Only proceed if we are in the correct venv or after re-execution
-        cli_main_logic()
+    is_venv_ok = ensure_venv()
+    exit_code = 1 # Default to error
+
+    if is_venv_ok:
+        # Venv is confirmed. Now it's safe to perform imports that rely on packages in the venv.
+        # These imports will populate the global scope.
+        logger.info("Virtual environment confirmed. Loading core dependencies globally...")
+        try:
+            # Assign to global 'np'
+            import numpy
+            np = numpy
+
+            # Other utilities that might be needed globally or by classes indirectly
+            from tqdm import tqdm
+            import ranx
+            from packaging import version # If any version checks happen at global or main_cli level
+
+            # For RAGRetriever and other SentenceTransformer uses
+            from sentence_transformers import SentenceTransformer as GlobalSentenceTransformer, util as st_util
+            SentenceTransformer = GlobalSentenceTransformer # Assign to global SentenceTransformer
+
+            # For ClassificationAPI and Flask server
+            from flask import Flask as GlobalFlask, request as GlobalRequest, jsonify as GlobalJsonify
+            from flask_cors import CORS as GlobalCORS
+            from waitress import serve as GlobalServe
+            Flask = GlobalFlask
+            request = GlobalRequest
+            jsonify = GlobalJsonify
+            CORS = GlobalCORS
+            serve = GlobalServe
+            
+            logger.info("Successfully imported core non-ML/LLM dependencies globally.")
+
+            # Conditionally import llama_cpp and update LLAMA_CPP_AVAILABLE
+            try:
+                import llama_cpp
+                LLAMA_CPP_AVAILABLE = True # Update the global flag
+                logger.info("llama-cpp-python is available globally for VLM processing.")
+            except ImportError:
+                # LLAMA_CPP_AVAILABLE remains False (its initial global value)
+                logger.warning("llama-cpp-python not available globally. VLM processing features will be limited.")
+
+            # Core ML libraries - PyTorch and base Transformers
+            import torch as global_torch # Assign to global torch
+            torch = global_torch
+            import transformers # Base import for transformers library
+            
+            logger.info("Successfully imported core ML/LLM dependencies (PyTorch, Transformers) globally.")
+
+            # Now that all necessary global imports are done, proceed with the main logic
+            exit_code = _initialize_and_run()
+        except SystemExit as e: # Allow SystemExit to propagate (e.g. from argparse --help)
+            exit_code = e.code if isinstance(e.code, int) else 1
+        except KeyboardInterrupt:
+            logger.info("Process interrupted by user (KeyboardInterrupt). Exiting.")
+            exit_code = 130 # Standard exit code for Ctrl+C
+        except ImportError as e_import:
+            logger.critical(f"A required dependency could not be imported globally even after venv setup: {e_import}", exc_info=True)
+            exit_code = 1
+        except Exception as e_main:
+            logger.critical(f"An unhandled exception occurred in _initialize_and_run: {e_main}", exc_info=True)
+            exit_code = 1 # General error
+    else:
+        logger.error("Failed to activate or confirm virtual environment. Exiting.")
+        exit_code = 1
+    
+    logger.info(f"Script finished with exit code {exit_code}.")
+    sys.exit(exit_code)
