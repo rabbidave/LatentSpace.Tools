@@ -1,489 +1,168 @@
-# Policy-Driven Classification Service with Transformers & ColBERT
 
-This document describes `classify.py`, a command-line interface (CLI) and RESTful API service designed to enforce data handling policies through **graduated controls**. It uses two specialized transformer models to validate and classify text data based on predefined API sensitivity levels defined in an external policy configuration file.
+# Data Classification & Monitoring Service
+###### (Policy-Driven, Local-First, etc)
+
+This document describes `classify.py`, a **Data Classification and Monitoring Service** that delivers plug-and-play policy-based validation for any application (read: JSON object). It orchestrates fine-tuned transformers, GGUF-based vision-language models (VLMs), and smart retrieval pipelines to provide a governance layer for multimodal content including text, image, and video.
+
+## Overview
+
+**Classification as a Service**: Integrate seamlessly using a single `/service/validate` endpoint that accepts content and policy specs. The service handles classification, policy enforcement, and contextual assistance.
+
+**Highlights:**
+
+* **Drop-in Integration**: One endpoint for all types of validation
+* **Multi-Modal Ready**: Supports text, image, video, and (soon) audio
+* **Policy-Driven**: Configurable via external JSON
+* **Context-Aware Help**: Built-in RAG-driven documentation assistant
+* **Enterprise-Focused**: Governance, observability, and compliance ready
+* **VLM-Aware Docs**: Enhances markdown for indexing and retrieval
 
 ## Core Components
 
-### 1. I/O Validator (Standard Transformer-Based Classification)
+### 1. I/O Validator
 
-- **Purpose**:
-  - Validate if `output_text` is an appropriate response for a given `input_text` (I/O Validation).
-  - Perform binary classification on a single `input_text` (e.g., determining if text is relevant/safe).
-- **Implementation**:
-  - Uses a fine-tuned standard Hugging Face Transformer model (e.g., `microsoft/deberta-v3-base` by default).
-  - Trained on pairs of (input, good_output) and (input, bad_output) for I/O validation, or (text, label 0/1) for single-text classification.
-  - *Note: This component was formerly referred to as "ModernBERT". The script maintains some internal naming (`ModernBERTClassifier` class, `/modernbert/classify` endpoint, `modernbert_io_validation` policy key) for consistency and easier transition, but the underlying model is a standard Transformer.*
+* **Use**: Ensures `output_text` aligns with `input_text`; binary classification of `input_text`.
+* **Model**: Transformer-based (e.g., DeBERTa v3); fine-tuned for response appropriateness.
 
-### 2. ColBERT-Style Sensitivity Classifier
+### 2. Sensitivity Classifier
 
-- **Purpose**: Classify text into predefined sensitivity categories (e.g., PII, Confidential, Public, or custom classes defined in reference data).
-- **Implementation**:
-  - Uses a ColBERT-style model (e.g., `sentence-transformers/msmarco-distilbert-base-tas-b` by default, or a fine-tuned version).
-  - Employs the **MaxSim** technique: Compares token embeddings of input text against reference examples for each sensitivity class, summing maximum similarity scores per token to determine the best matching class.
-- **Example Output**: See `example_colbert_output.json` (provided at the end of this document) for an example of ColBERT's classification output structure.
+* **Use**: Detect PII/confidentiality sensitivity.
+* **Model**: MaxSim-enabled ColBERT; compares against example classes.
 
-## Policy Enforcement Layer
+### 3. Vision-Language Processor
 
-The service's core strength lies in its **policy enforcement layer**, primarily accessed via the `/service/validate` endpoint. This layer intelligently combines checks based on:
+* **Use**: Image and video content analysis.
+* **Model**: LLaVA, PaliGemma, etc., via `llama-cpp-python`.
+* **Features**: Frame sampling, custom prompts, policy check on derived text.
 
-- An API's designated "API Class" (a string identifier).
-- Corresponding rules defined in an external `policy_config.json` file.
+### 4. VLM Markdown Processor
 
-Key features of this policy-driven approach:
+* **Use**: Chunk markdown intelligently for RAG.
+* **Model**: GGUF models (e.g., Pleias-RAG-1B).
+* **Fallback**: Python parser for environments without VLM support.
 
-- **Graduated Controls**: Implement precise validation policies tailored to the sensitivity and requirements of different APIs.
-- **Input-Output Coherence**: Ensures API responses are relevant and appropriate using the I/O Validator model.
-- **Data Sensitivity Detection**: Identifies potentially sensitive data in inputs or outputs using ColBERT-style classification.
-- **Externalized Policy Configuration**: Manage validation rules via the `policy_config.json` file, allowing updates without code changes.
-- **Extensible Model Framework**: Supports fine-tuning of both the I/O Validator and ColBERT-style models for domain-specific accuracy.
-- **Self-Contained Setup**: Auto-creates a Python virtual environment (`.venv_classifier_service_tool`) with all necessary dependencies on its first run.
+### 5. Policy-Driven RAG Framework
 
-### i.e. N-Granularity Monitoring of Gateways, VPCs, APIs, etc
+* **RAGRetriever**: Manages dense vector search using SentenceTransformers.
+    * Stores document texts, metadata, and their corresponding N-dimensional embedding vectors.
+    * Ensures index integrity by matching document counts with embedding array dimensions.
+* **Features**: Embedding cache for models, metadata filtering during retrieval.
 
-<details>
-<summary>Quickstart Guide</summary>
+### 6. Self-Documenting RAG System
 
-```bash
-# First time setup and create example files
-python classify.py create-example --output-dir ./classifier_tool_examples
+* **Function**: Builds searchable documentation index.
+* **Source**: Local or remote markdown docs.
+* **Purpose**: Contextual suggestions when validation fails.
 
-# Check hardware capabilities
-python classify.py check-hardware
+## Policy Enforcement
 
-# Train an I/O Validator model 
-python classify.py train \
-    --data-path ./classifier_tool_examples/sample_modernbert_training.jsonl \
-    --model-dir ./models/my_io_validator \
-    --epochs 3 --learning-rate 2e-5 --batch-size 8
+Driven via `/service/validate` and an external JSON file (`policy_config.json`).
 
-# Fine-tune a ColBERT model for sensitivity classification
-python classify.py finetune-colbert \
-    --reference-jsonl ./classifier_tool_examples/sample_colbert_references.jsonl \
-    --output-model-dir ./models/my_colbert_finetuned \
-    --epochs 3 --batch-size 4
+**Supports:**
 
-# Start the server with both models and policy enforcement
-python classify.py serve \
-    --serve-modernbert --modernbert-model-dir ./models/my_io_validator \
-    --serve-colbert-sensitivity --colbert-model-id-or-dir ./models/my_colbert_finetuned \
-    --policy-config-path ./classifier_tool_examples/sample_policy_config.json \
-    --host 0.0.0.0 --port 5000
+* Input-output coherence
+* Sensitivity detection
+* VLM media checks
+* Required fields & regex validation
+* Custom validation rules
+* Documentation hints
+* Self-contained env setup
+
+## Integration Examples
+
+### API Gateway
+
+```js
+// Pre-check user request
+const resp = await fetch('/service/validate', {...});
 ```
-</details>
 
-## Setup & Configuration
+### ETL Pipeline
 
-The script manages its own Python virtual environment. On its first run (or if not in the target venv), `classify.py` will:
-1. Create a virtual environment in `./.venv_classifier_service_tool`.
-2. Install all required Python packages (including PyTorch, Transformers, Flask, etc.) into this venv.
-3. Automatically re-execute itself within the newly prepared environment.
+```python
+for record in data:
+  result = requests.post('/service/validate', json={...})
+```
+
+### Content Moderation
 
 ```bash
-# First-run setup (auto-creates virtual environment and installs dependencies)
+curl -X POST /service/validate \
+  -F 'json_payload=...' -F 'uploaded_image=@img.jpg'
+```
+
+## Setup
+
+On first run:
+
+* Creates venv
+* Installs dependencies (Transformers, Flask, etc.)
+* Re-launches in venv
+
+```bash
 python classify.py --help
 ```
 
-### Environment Requirements:
-
-- **Hugging Face Token**: For downloading models from the Hugging Face Hub, ensure the `HUGGING_FACE_HUB_TOKEN` (or `HF_TOKEN`) environment variable is set with your valid token. This is crucial if the models specified (base models for training/inference or pre-trained models) are private or require authentication for download. The script does not store or hardcode this token.
-
-  - In PowerShell: `$env:HUGGING_FACE_HUB_TOKEN = "YOUR_TOKEN_HERE"` (or `$env:HF_TOKEN`)
-  - In bash/zsh: `export HUGGING_FACE_HUB_TOKEN="YOUR_TOKEN_HERE"` (or `export HF_TOKEN`)
-
-  Ensure the token is set in the same session where you run classify.py, especially if not using a system-wide environment variable. The script checks for both `HUGGING_FACE_HUB_TOKEN` and `HF_TOKEN`.
-
-- **Python 3.8+** is recommended.
-- **Sufficient RAM** (e.g., 8GB-16GB+) is advised, especially when loading multiple or large models. CUDA-enabled GPU is highly recommended for acceptable performance, especially for training and faster inference.
-
-### Windows Specifics:
-
-- **Symlinks**: You might see a warning from huggingface_hub about symlinks not being supported, suggesting to enable Developer Mode or run as Administrator. While the cache system will still function in a degraded mode, enabling Developer Mode (preferred) or running as Administrator might help with certain file system interactions, especially if encountering model download/loading issues.
-
-- **Administrator Privileges for Troubleshooting**: If you face stubborn model download issues (especially "model not found" errors after verifying the model ID and token), try running the command or script from an Administrator terminal as a troubleshooting step.
-
-- **Tokenizer Dependencies**: Some models (like microsoft/deberta-v3-base) require additional libraries for their tokenizers (e.g., protobuf, tiktoken). The script aims to install these automatically during the venv setup if they are listed in `REQUIRED_PACKAGES` in classify.py. If you encounter ImportErrors related to these during model loading, ensure they are correctly listed and recreate the virtual environment (see Dependency Management section).
-
-## Policy Configuration (`policy_config.json`)
-
-The behavior of the `/service/validate` endpoint is governed by an external JSON configuration file (default: `policy_config.json`). You must specify the path to this file using the `--policy-config-path` argument when starting the server with the `serve` command if it's not in the default location or named differently.
-
-Refer to `example_policy_config.json` (generated by `create-example` command, or see end of this document) for a comprehensive example of its structure and available rule keys.
-
-### Key Fields in a Policy Definition (within `policy_config.json`):
-
-The table below outlines the main configurable rules for an API class. An API class is identified by a unique string key in the `policy_config.json` file.
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `description` | string | Human-readable description of the policy. |
-| `modernbert_io_validation` | boolean | If true, validate the (input_text, output_text) pair using the loaded I/O Validator model. (Key name kept for consistency). |
-| `colbert_input_sensitivity` | boolean | If true, classify the input_text for sensitivity using the loaded ColBERT-style model. |
-| `colbert_output_sensitivity` | boolean | If true, classify the output_text for sensitivity using the loaded ColBERT-style model. |
-| `require_colbert_fine_tuned` | boolean | If true (and ColBERT checks are enabled), the policy demands a fine-tuned ColBERT-style model. |
-| `allowed_colbert_input_classes` | list[string] | Optional. If provided, the predicted ColBERT class for input_text must be in this list for the request to pass this specific check. |
-| `disallowed_colbert_input_classes` | list[string] | Optional. If provided, the predicted ColBERT class for input_text must not be in this list for the request to pass this specific check. |
-| `allowed_colbert_output_classes` | list[string] | Optional. If provided, the predicted ColBERT class for output_text must be in this list for the request to pass this specific check. |
-| `disallowed_colbert_output_classes` | list[string] | Optional. If provided, the predicted ColBERT class for output_text must not be in this list for the request to pass this specific check. |
-
-## API Endpoints
-
-### Primary Validation Endpoint: `/service/validate`
-
-**POST `/service/validate`** - This is the main interaction point for policy-based validation.
-
-**Request Body (JSON)**:
+## Policy File Example
 
 ```json
 {
-  "api_class": "YourAPINameOrClassID_v1", // Required. Identifier for the policy to apply from policy_config.json.
-  "input_text": "The user's input to the original API.", // Required.
-  "output_text": "The API's generated response." // Optional, but required if policy involves output checks or I/O validation.
-}
-```
-
-**Response Body (JSON)**:
-The response details the original request, the specific policy rules applied, the results of individual checks, and an overall status. The `overall_status` can be:
-
-- **"PASS"**: All required checks defined in the policy were performed and passed.
-- **"REJECT_POLICY_VIOLATION"**: A required check failed (e.g., I/O Validator predicted inappropriate, ColBERT detected a disallowed class). `violation_reasons` list will contain details.
-- **"REJECT_INVALID_POLICY"**: The provided `api_class` was not found in `policy_config.json`. `error_message` will contain details.
-- **"ERROR"**: An internal processing error occurred (e.g., a required model was not loaded but policy mandated its use, model inference error). `error_message` will contain details.
-
-Refer to `example_service_validate_pass_response.json` and `example_service_validate_reject_response.json` (provided at the end of this document) for detailed example response structures that match the new script's output.
-
-#### Testing the `/service/validate` Endpoint:
-
-Ensure the server is running (see "Starting the API Server" section). Use curl or a similar tool:
-
-```bash
-curl -X POST -H "Content-Type: application/json" \
--d '{
-  "api_class": "DemoClass_InputSensitive_NoPII",
-  "input_text": "User question about product features.",
-  "output_text": "This product has features A, B, and C."
-}' http://localhost:5000/service/validate
-```
-
-(Use an `api_class` defined in your `sample_policy_config.json` or your custom policy file)
-
-### Direct Model Endpoints
-
-These endpoints provide direct access to the underlying models, useful for testing or simpler use cases not requiring the full policy layer. They are available if the respective models are loaded via the `serve` command.
-
-**I/O Validator Classification**: **POST `/modernbert/classify`** (Endpoint name kept for consistency)
-
-**Request Body (JSON)**: `{"input_text": "...", "output_text": "..."}` (output_text can be an empty string if not applicable to the I/O model's task)
-
-**ColBERT-Style Sensitivity Check**: **POST `/colbert/classify_sensitivity`**
-
-**Request Body (JSON)**: `{"text": "..."}`
-
-### Health Check Endpoint
-
-**GET `/health`** - Provides the operational status of the service, including model availability and policy readiness.
-
-**Response (JSON Example - reflecting the new script's structure)**:
-
-```json
-{
-  "status": "ok", // "ok", "degraded", or "error"
-  "model_availability": {
-    "io_validator_loaded": true, // Updated key
-    "colbert_loaded": true,
-    "colbert_is_fine_tuned": false, // Example value
-    "colbert_reference_classes": ["Class 1: PII", "Class 2: Sensitive Personal Data", "Class 3: Confidential Personal Data", "Class 4: Internal Data", "Class 5: Public Data"] // Example list
-  },
-  "policy_config_loaded": true,
-  "policy_model_readiness": {
-    "status": "ok", // "ok", "degraded", "error_models_unavailable", or "not_applicable_no_policies"
-    "issues": []   // List of strings describing policy readiness issues, if any
+  "StrictPolicy": {
+    "modernbert_io_validation": true,
+    "colbert_input_sensitivity": true,
+    "item_processing_rules": [...],
+    "custom_validation_rules": [...]
   }
 }
 ```
 
-## CLI Commands for Model Operations & Fine-Tuning
+## Endpoints
 
-Global flags like `--log-level` should be placed before the subcommand (e.g., `python classify.py --log-level DEBUG train ...`). Use `python classify.py <command> --help` for detailed options for each command.
+* `POST /service/validate` — main validation
+* `POST /modernbert/classify` — I/O check
+* `POST /colbert/classify_sensitivity` — text classification
+* `POST /rag/query` — retrieve help docs
 
-### 1. I/O Validator Model Operations
+## CLI Examples
 
-#### Train an I/O Validator Model (`train`)
-Data format in JSONL:
-`{"input": "q", "output_good_sample": "good_a", "output_bad_sample": "bad_a"}` (for I/O validation)
-OR `{"input": "text", "label": 0/1}` (for general binary classification)
-
-```bash
-python classify.py train \
-    --data-path ./classifier_tool_examples/sample_modernbert_training.jsonl \
-    --model-dir ./models/my_io_validator \
-    --base-model-for-training "microsoft/deberta-v3-base" \
-    --epochs 3 --learning-rate 2e-5 --batch-size 8
-```
-
-#### Predict with I/O Validator via CLI (`predict-modernbert`) (Command name kept for consistency)
+### Start Server
 
 ```bash
-python classify.py predict-modernbert \
-    --model-dir ./models/my_io_validator \
-    --input-text "How do I reset my password?" \
-    --output-to-classify "Please contact support@example.com"
+python classify.py serve --policy-config-path ./policy.json
 ```
 
-### 2. ColBERT-Style Model Operations
-
-#### Classify Sensitivity with ColBERT via CLI (`rerank-data-classify`)
+### Create RAG Index
 
 ```bash
-# Using a fine-tuned model (references are part of the model package)
-python classify.py rerank-data-classify \
-    --text-to-classify "Patient ID: 12345, Diagnosis: XYZ" \
-    --colbert-model-dir ./models/my_colbert_sensitivity_finetuned
-
-# Using a base model with custom references
-python classify.py rerank-data-classify \
-    --text-to-classify "Order confirmation #98765 for user@example.com" \
-    --colbert-model-id-or-dir "sentence-transformers/msmarco-distilbert-base-tas-b" \
-    --custom-reference-jsonl ./classifier_tool_examples/sample_colbert_references.jsonl \
-    --cache-dir ./colbert_cache
+python classify.py rag index --corpus-path docs.jsonl
 ```
 
-#### Fine-tune a ColBERT-Style Model (`finetune-colbert`)
-Reference JSONL format: `{"text": "example of ClassA text", "class_name": "ClassA"}` (one per line)
+## Data Formats
 
-```bash
-python classify.py finetune-colbert \
-    --reference-jsonl ./classifier_tool_examples/sample_colbert_references.jsonl \
-    --output-model-dir ./models/my_colbert_sensitivity_finetuned \
-    --base-model-id "sentence-transformers/msmarco-distilbert-base-tas-b" \
-    --epochs 5 --batch-size 4
-```
-
-## Utility Commands
-
-### Create Example Files (`create-example`)
-Generates sample data files for I/O Validator training, ColBERT custom references, and a basic policy configuration, along with a README for using them.
-
-```bash
-python classify.py create-example --output-dir ./classifier_tool_examples
-```
-
-This creates:
-
-- `./classifier_tool_examples/sample_modernbert_training.jsonl` (For I/O Validator)
-- `./classifier_tool_examples/sample_colbert_references.jsonl`
-- `./classifier_tool_examples/sample_policy_config.json`
-- `./classifier_tool_examples/README_examples.md` (with usage instructions for these files, reflecting new model names)
-
-### Check Hardware (`check-hardware`)
-Displays information about detected hardware (CPU/GPU) and relevant library versions (PyTorch, Transformers, Flash Attention availability).
-
-```bash
-python classify.py check-hardware
-```
-
-## Starting the API Server (`serve` command)
-
-The `serve` command starts the Flask API server. The availability of `/service/validate` and direct model endpoints depends on the arguments provided and the loaded policy configuration.
-
-```bash
-# Example: Serve both I/O Validator (from a fine-tuned dir) and a fine-tuned ColBERT model
-python classify.py serve \
-    --serve-modernbert --modernbert-model-dir ./models/my_io_validator \
-    --serve-colbert-sensitivity --colbert-model-id-or-dir ./models/my_colbert_sensitivity_finetuned \
-    --policy-config-path ./classifier_tool_examples/sample_policy_config.json \
-    --host 0.0.0.0 --port 5000
-    # --dev-server  # Uncomment for development mode (uses Flask's built-in server)
-
-# Example: Serve I/O Validator and a BASE ColBERT model with custom references
-python classify.py serve \
-    --serve-modernbert --modernbert-model-dir ./models/my_io_validator \
-    --serve-colbert-sensitivity --colbert-model-id-or-dir "sentence-transformers/msmarco-distilbert-base-tas-b" \
-    --colbert-custom-ref-jsonl ./classifier_tool_examples/sample_colbert_references.jsonl \
-    --colbert-cache-dir ./colbert_model_cache \
-    --policy-config-path ./classifier_tool_examples/sample_policy_config.json \
-    --host 0.0.0.0 --port 5000
-```
-
-Adjust model paths and flags based on which services and policies you need to enable.
-
-If `--dev-server` is not used, the server runs in production mode using Waitress.
-
-## Development & Maintenance
-
-### Dependency Management:
-
-The script manages its Python packages within the `.venv_classifier_service_tool` virtual environment.
-To refresh, update, or if `REQUIRED_PACKAGES` in classify.py are changed:
-
-1. Modify classify.py if adding/changing `REQUIRED_PACKAGES`.
-
-2. Delete the old virtual environment:
-
-```bash
-# On Linux/macOS
-rm -rf .venv_classifier_service_tool
-# On Windows Command Prompt
-# rmdir /s /q .venv_classifier_service_tool
-# On Windows PowerShell
-# Remove-Item -Recurse -Force .venv_classifier_service_tool
-```
-
-3. Re-run any python classify.py command (e.g., `python classify.py --help`). This will trigger a fresh creation of the venv and installation of all listed dependencies.
-
-## Troubleshooting Common Issues
-
-### Model Not Found Errors:
-
-- **Check Model ID Spelling**: Ensure the Hugging Face model ID is correct and does not contain extra quotes if passed via intermediate scripts.
-
-- **HF Token**: Verify your `HUGGING_FACE_HUB_TOKEN` (or `HF_TOKEN`) is correctly set in your current terminal session (see "Environment Requirements" for shell-specific commands), is valid, and has "read" permissions.
-
-- **Network Connectivity**: Ensure you have a stable internet connection to Hugging Face Hub.
-
-- **Clear Cache**: For persistent issues with a specific model, try deleting its cache directory from `~/.cache/huggingface/hub/models--<org_name>--<model_name>` (path varies slightly by OS, e.g., `C:\Users\<user>\.cache\huggingface\hub` on Windows) and retry.
-
-- **Specific Tokenizer Dependencies**: Models like microsoft/deberta-v3-base need protobuf and tiktoken. If classify.py's `REQUIRED_PACKAGES` list was updated with these but the venv wasn't recreated, you might see ImportErrors. Recreate the venv after updating `REQUIRED_PACKAGES`.
-
-- **Run as Administrator (Windows)**: As a last resort for stubborn download/access issues on Windows, try running the command from an Administrator terminal.
-
-### PowerShell Argument Parsing for Global Flags:
-Global flags like `--log-level` should be placed before the subcommand.
-- Correct: `python classify.py --log-level DEBUG train ...`
-- Incorrect: `python classify.py train ... --log-level DEBUG`
-
-### Import-Module PoshCodex (or similar profile errors in new PowerShell windows):
-These are typically related to your personal PowerShell profile attempting to load modules incompatible with the current PowerShell session (e.g., an admin window running an older PowerShell version). They generally don't affect classify.py's execution but might clutter the console.
-
-## Example JSON Files (Referenced Above)
-
-These examples reflect the structure and terminology of the new script. The content of `sample_policy_config.json` is taken directly from the create_example command in the new script.
-
-### 1. example_policy_config.json (as generated by create-example)
+* I/O Validation:
 
 ```json
-{
-  "DemoClass_IO_Validation_Only": {
-    "description": "Demo: Only I/O validation (using the fine-tuned standard Transformer model like DeBERTa).",
-    "modernbert_io_validation": true
-  },
-  "DemoClass_InputSensitive_NoPII": {
-    "description": "Demo: I/O Validation (e.g., DeBERTa) + ColBERT Input (base ColBERT model ok). Input must not be PII.",
-    "modernbert_io_validation": true,
-    "colbert_input_sensitivity": true,
-    "require_colbert_fine_tuned": false,
-    "disallowed_colbert_input_classes": ["Class 1: PII"]
-  },
-  "DemoClass_OutputPublic_FineTunedColBERT": {
-    "description": "Demo: Output must be Public, requires fine-tuned ColBERT for sensitivity check. (I/O validation not explicitly enabled in this specific policy example).",
-    "modernbert_io_validation": false,
-    "colbert_output_sensitivity": true,
-    "require_colbert_fine_tuned": true,
-    "allowed_colbert_output_classes": ["Class 5: Public Data"]
-  },
-  "DemoClass_NoChecks": {
-    "description": "Demo: No specific validation checks enabled. All traffic passes through unless other mechanisms apply.",
-    "modernbert_io_validation": false,
-    "colbert_input_sensitivity": false,
-    "colbert_output_sensitivity": false
-  }
-}
+{"input": "Q?", "output_good_sample": "A"}
 ```
 
-### 2. example_colbert_output.json
-(Example of what the ColBERT `/colbert/classify_sensitivity` endpoint or internal classification might return. Class names and descriptions are from `ColBERTReranker.BUILTIN_REFERENCE_TEXTS_BY_CLASS` and `CLASS_DESCRIPTIONS`)
+* ColBERT Sensitivity:
 
 ```json
-{
-  "input_text": "My SSN is 123-45-6789 and I live at 1600 Pennsylvania Ave.",
-  "predicted_class": "Class 1: PII",
-  "class_description": "Most sensitive...",
-  "scores_by_class (avg_maxsim)": {
-    "Class 1: PII": 11.753210067749023,
-    "Class 2: Sensitive Personal Data": 9.012345671234567,
-    "Class 3: Confidential Personal Data": 9.876543210987654,
-    "Class 4: Internal Data": 8.543210987654321,
-    "Class 5: Public Data": 8.123456789012345
-  }
-}
+{"text": "SSN: 123-45-6789", "class_name": "PII"}
 ```
 
-### 3. example_service_validate_pass_response.json
-(Example of a successful `/service/validate` response, reflecting the new script's output structure)
 
-```json
-{
-  "request_id": "req_1678886400123456789",
-  "request_summary": {
-    "api_class": "DemoClass_InputSensitive_NoPII",
-    "input_text_len": 47,
-    "output_text_len": 39
-  },
-  "policy_applied_summary": {
-    "description": "Demo: I/O Validation (e.g., DeBERTa) + ColBERT Input (base ColBERT model ok). Input must not be PII.",
-    "modernbert_io_validation": true,
-    "colbert_input_sensitivity": true,
-    "require_colbert_fine_tuned": false
-  },
-  "modernbert_io_validation": {
-    "prediction": 1,
-    "probability_positive": 0.987654321,
-    "input_text": "User question about product features.",
-    "output_text": "This product has features A, B, and C."
-  },
-  "colbert_input_sensitivity": {
-    "input_text": "User question about product features.",
-    "predicted_class": "Class 5: Public Data",
-    "class_description": "Public data",
-    "scores_by_class (avg_maxsim)": {
-      "Class 1: PII": 7.5,
-      "Class 2: Sensitive Personal Data": 8.1,
-      "Class 3: Confidential Personal Data": 8.8,
-      "Class 4: Internal Data": 9.5,
-      "Class 5: Public Data": 10.2
-    }
-  },
-  "overall_status": "PASS"
-}
+## System Requirements
+
+* Python 3.8+
+* RAM: 16–32GB+ for VLMs
+* GPU: Optional, improves performance
+
+## Testing
+
+```bash
+python classify.py test --test-type all
 ```
 
-### 4. example_service_validate_reject_response.json
-(Example of a `/service/validate` response where a policy check failed, reflecting new script's structure)
+---
 
-```json
-{
-  "request_id": "req_1678886500987654321",
-  "request_summary": {
-    "api_class": "DemoClass_InputSensitive_NoPII",
-    "input_text_len": 48,
-    "output_text_len": 32
-  },
-  "policy_applied_summary": {
-    "description": "Demo: I/O Validation (e.g., DeBERTa) + ColBERT Input (base ColBERT model ok). Input must not be PII.",
-    "modernbert_io_validation": true,
-    "colbert_input_sensitivity": true,
-    "require_colbert_fine_tuned": false
-  },
-  "modernbert_io_validation": {
-    "prediction": 1,
-    "probability_positive": 0.951234567,
-    "input_text": "My SSN is 111-222-3333, help me.",
-    "output_text": "We have received your SSN details."
-  },
-  "colbert_input_sensitivity": {
-    "input_text": "My SSN is 111-222-3333, help me.",
-    "predicted_class": "Class 1: PII",
-    "class_description": "Most sensitive...",
-    "scores_by_class (avg_maxsim)": {
-      "Class 1: PII": 12.1,
-      "Class 2: Sensitive Personal Data": 9.3,
-      "Class 3: Confidential Personal Data": 9.5,
-      "Class 4: Internal Data": 8.2,
-      "Class 5: Public Data": 8.0
-    }
-  },
-  "overall_status": "REJECT_POLICY_VIOLATION",
-  "violation_reasons": [
-    "ColBERT_Input_Sensitivity: Predicted class 'Class 1: PII' is in disallowed list: ['Class 1: PII']."
-  ]
-}
-```
