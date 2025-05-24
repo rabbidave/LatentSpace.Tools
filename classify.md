@@ -3,9 +3,9 @@
 
 This document describes `classify.py`, a **Data Classification and Monitoring Service** that delivers plug-and-play policy-based validation for any application (read: JSON object). It orchestrates fine-tuned transformers, GGUF-based vision-language models (VLMs), and smart retrieval pipelines to provide a governance layer for multimodal content including text, image, and video.
 
-## Overview
+## **N-Granularity 'Validation Endpoint'**
 
-**Classification as a Service**: Integrate seamlessly using a single `/service/validate` endpoint that accepts content and policy specs. The service handles classification, policy enforcement, and contextual assistance.
+Integrate seamlessly using a single `/service/validate` endpoint that accepts content and policy specs. The service handles classification, policy enforcement, and contextual assistance.
 
 **Highlights:**
 
@@ -16,72 +16,56 @@ This document describes `classify.py`, a **Data Classification and Monitoring Se
 * **Enterprise-Focused**: Governance, observability, and compliance ready
 * **VLM-Aware Docs**: Enhances markdown for indexing and retrieval
 
-## Core Components
+---
 
-<summary>
+## 🛡️ PII Policy Example
 
-##### Key Concepts & Components:
+> **Note**: See `policy_config.md` for full schema and options.
 
-</summary>
+The following demonstrates a **strict PII detection policy** that focuses on identifying and rejecting personally identifiable information in input text:
 
+```json
+{
+  "StrictPIIPolicy": {
+    "description": "Focuses on identifying and rejecting PII in input text.",
+    "modernbert_io_validation": false,
+    "colbert_input_sensitivity": true,
+    "disallowed_colbert_input_classes": ["Class 1: PII"],
+    "documentation_assistance": {
+      "enabled": true,
+      "index_path": "./internal_data_handling_docs_rag",
+      "max_total_suggestions": 2
+    }
+  }
+}
+```
 
+### Key Policy Components:
+
+- **`colbert_input_sensitivity`**: Enables sensitivity analysis using ColBERT
+- **`disallowed_colbert_input_classes`**: Specifically blocks PII content
+- **`documentation_assistance`**: Provides contextual help when violations occur
+
+---
+
+## 🔌 API Endpoints
+
+* `POST /service/validate` — **main policy-driven validation endpoint**
+* `POST /modernbert/classify` — direct access to I/O Validator model
+* `POST /colbert/classify_sensitivity` — direct access to Sensitivity Classifier model
+* `POST /rag/query` — query a loaded RAG index (typically the global documentation index)
+* `GET /status` — check service and component health
+
+---
+
+## 🔗 Integration Examples
+
+### 1. API Gateway Integration
+
+**Scenario**: Pre-validate AI responses before returning them to users to prevent data leaks.
 
 <details>
-
-### 1. I/O Validator
-
-* **Use**: Ensures `output_text` aligns with `input_text`; binary classification of `input_text`.
-* **Model**: Transformer-based (e.g., DeBERTa v3); fine-tuned for response appropriateness.
-
-### 2. Sensitivity Classifier
-
-* **Use**: Detect PII/confidentiality sensitivity.
-* **Model**: MaxSim-enabled ColBERT; compares against example classes.
-
-### 3. Vision-Language Processor
-
-* **Use**: Image and video content analysis.
-* **Model**: LLaVA, PaliGemma, etc., via `llama-cpp-python`.
-* **Features**: Frame sampling, custom prompts, policy check on derived text.
-
-### 4. VLM Markdown Processor
-
-* **Use**: Chunk markdown intelligently for RAG.
-* **Model**: GGUF models (e.g., Pleias-RAG-1B).
-* **Fallback**: Python parser for environments without VLM support.
-
-### 5. Policy-Driven RAG Framework
-
-* **RAGRetriever**: Manages dense vector search using SentenceTransformers.
-    * Stores document texts, metadata, and their corresponding N-dimensional embedding vectors.
-    * Ensures index integrity by matching document counts with embedding array dimensions.
-* **Features**: Embedding cache for models, metadata filtering during retrieval.
-
-### 6. Self-Documenting RAG System
-
-* **Function**: Builds searchable documentation index (from this document or others).
-* **Source**: Local or remote markdown docs.
-* **Purpose**: Contextual suggestions when validation fails.
-
-</details>
-
-## Policy Enforcement
-
-Driven via `/service/validate` and an external JSON file (`policy_config.json`).
-
-**Supports:**
-
-* Input-output coherence
-* Sensitivity detection
-* VLM media checks
-* Required fields & regex validation
-* Custom validation rules
-* Documentation hints (via RAG if policy violations occur)
-* Self-contained env setup
-
-## Integration Examples
-
-### API Gateway
+<summary><strong>📋 Click to expand API Gateway example</strong></summary>
 
 ```javascript
 // Pre-check user request and AI-generated response
@@ -108,6 +92,7 @@ async function validateAIResponse(userQuery, aiResponse) {
 
         if (result.overall_status === 'REJECT_POLICY_VIOLATION') {
             console.error('Policy Violation:', result.violation_reasons);
+            
             // Use documentation suggestions to provide guidance
             const suggestions = result.documentation_suggestions?.suggestions || [];
             
@@ -122,7 +107,7 @@ async function validateAIResponse(userQuery, aiResponse) {
             };
         }
 
-        // Validation passed
+        // ✅ Validation passed
         return {
             success: true,
             response: aiResponse
@@ -139,26 +124,26 @@ async function validateAIResponse(userQuery, aiResponse) {
     }
 }
 
-// Example usage
+// 🎯 Example usage
 const userQuery = "Tell me about project X";
 const aiResponse = "Project X is a super secret initiative, details are classified.";
 
 const validationResult = await validateAIResponse(userQuery, aiResponse);
 
 if (!validationResult.success) {
-    // Handle policy violation or service error
+    // ❌ Handle policy violation or service error
     console.log('Cannot return response:', validationResult.error);
     if (validationResult.helpfulSuggestions) {
-        console.log('Helpful information:', validationResult.helpfulSuggestions);
+        console.log('💡 Helpful information:', validationResult.helpfulSuggestions);
     }
 } else {
-    // Safe to return the AI response
+    // ✅ Safe to return the AI response
     console.log('Approved response:', validationResult.response);
 }
 ```
 
+**🔧 Required Policy Configuration** (`UserInputHandlingPolicy` in `policy_config.json`):
 
-**Policy (`UserInputHandlingPolicy` in `policy_config.json`):**
 ```json
 {
   "UserInputHandlingPolicy": {
@@ -177,17 +162,24 @@ if (!validationResult.success) {
 }
 ```
 
-**How it works:**
-1. The API Gateway intercepts a user query and the AI's intended response.
-2. It sends both to `/service/validate` with the appropriate `api_class`.
-3. The service might use `ModernBERTClassifier` to check if the `output_text` is coherent with `input_text`.
-4. `ColBERTReranker` checks `input_text` to ensure it's not overly sensitive itself, and more importantly, checks `output_text` to prevent leaking PII or Confidential information.
-5. If `output_text` (e.g., "Project X is super secret") is classified as "Confidential" and this class is disallowed by the policy, a `REJECT_POLICY_VIOLATION` is returned.
-6. The `documentation_suggestions` in the response would then point to sections in this document (if indexed by RAG) about handling confidential data or specific project mentions.
+**🔄 How it works:**
+1. **Intercept**: API Gateway captures user query and AI's intended response
+2. **Validate**: Send both to `/service/validate` with appropriate `api_class`
+3. **I/O Check**: `ModernBERTClassifier` verifies output coherence with input
+4. **Sensitivity Scan**: `ColBERTReranker` checks for PII/confidential data leakage
+5. **Policy Enforcement**: If output contains "Confidential" class content → `REJECT_POLICY_VIOLATION`
+6. **Guidance**: `documentation_suggestions` provide remediation steps
 
 </details>
 
-### ETL Pipeline
+---
+
+### 2. ETL Pipeline Integration
+
+**Scenario**: Validate documents during processing to ensure compliance throughout the data pipeline.
+
+<details>
+<summary><strong>📋 Click to expand ETL Pipeline example</strong></summary>
 
 ```python
 # ETL pipeline for processing documents, with classification monitoring
@@ -246,16 +238,16 @@ class DocumentValidator:
             return False, {'error': str(e)}
     
     def _log_compliance_violation(self, doc_id, stage, validation_result):
-        """Log compliance violations with helpful context."""
+        """📝 Log compliance violations with helpful context."""
         violations = validation_result.get('violation_reasons', [])
-        logger.error(f"Compliance VIOLATION for doc {doc_id} at stage {stage}: {violations}")
+        logger.error(f"🚫 Compliance VIOLATION for doc {doc_id} at stage {stage}: {violations}")
         
         # Log any helpful suggestions
         suggestions = validation_result.get('documentation_suggestions', {}).get('suggestions', [])
         if suggestions:
-            logger.info(f"Remediation suggestions for {doc_id}: {[s['title'] for s in suggestions]}")
+            logger.info(f"💡 Remediation suggestions for {doc_id}: {[s['title'] for s in suggestions]}")
 
-# Example usage in an ETL pipeline
+# 🏭 Example usage in an ETL pipeline
 def process_financial_documents(documents):
     validator = DocumentValidator()
     processed_docs = []
@@ -264,7 +256,7 @@ def process_financial_documents(documents):
     for doc in documents:
         doc_id = str(uuid.uuid4())
         
-        # Stage 1: Ingestion validation
+        # 📥 Stage 1: Ingestion validation
         is_valid, result = validator.validate_document(
             doc_content=doc['content'],
             doc_id=doc_id,
@@ -283,10 +275,10 @@ def process_financial_documents(documents):
             })
             continue
             
-        # Stage 2: Additional processing...
+        # ⚙️ Stage 2: Document transformation
         processed_doc = transform_document(doc)
         
-        # Stage 3: Pre-storage validation
+        # 💾 Stage 3: Pre-storage validation
         is_valid, result = validator.validate_document(
             doc_content=processed_doc['content'],
             doc_id=doc_id,
@@ -305,27 +297,22 @@ def process_financial_documents(documents):
     return processed_docs, quarantined_docs
 
 def transform_document(doc):
-    """Placeholder for document transformation logic."""
+    """🔄 Placeholder for document transformation logic."""
     return doc
 
-# Example test
-if __name__ == "__main__": # This __main__ block is specific to the ETL example
-    # Configure basic logging for the ETL example if run directly
-    # logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-    
+# 🧪 Example test
+if __name__ == "__main__":
     test_docs = [
         {"content": "Q1 revenue was $1.2M with growth in key segments."},
-        {"content": "Employee SSN 123-45-6789 and salary $85,000."},
+        {"content": "Employee SSN 123-45-6789 and salary $85,000."},  # ⚠️ Contains PII
     ]
     
     # valid_docs, quarantined = process_financial_documents(test_docs)
-    # print(f"Processed: {len(valid_docs)}, Quarantined: {len(quarantined)}")
-    pass # Comment out actual execution for documentation purposes
+    # print(f"✅ Processed: {len(valid_docs)}, 🚫 Quarantined: {len(quarantined)}")
 ```
 
+**🔧 Required Policy Configuration** (`Pipeline_Ingestion_IntegrityPolicy` in `policy_config.json`):
 
-
-**Policy (`Pipeline_Ingestion_IntegrityPolicy` in `policy_config.json`):**
 ```json
 {
   "Pipeline_Ingestion_IntegrityPolicy": {
@@ -348,18 +335,119 @@ if __name__ == "__main__": # This __main__ block is specific to the ETL example
 }
 ```
 
-**How it works:**
-1. As documents flow through an ETL pipeline, specific stages can call `/service/validate`.
-2. The `api_class` can be dynamic based on the `pipeline_stage`.
-3. The `input_text` would be the content of the document/record being processed.
-4. Policies check for PII, formatting, size limits, etc.
-5. Violations result in logging, quarantine, or alerts.
-6. `documentation_suggestions` guide data stewards on remediation.
+**🔄 How it works:**
+1. **Stage-Based Validation**: Different pipeline stages use different `api_class` policies
+2. **Content Analysis**: `input_text` contains the document/record being processed
+3. **Multi-Layer Checks**: Policies verify PII, formatting, size limits, etc.
+4. **Compliance Tracking**: Violations trigger logging, quarantine, or alerts
+5. **Guided Remediation**: `documentation_suggestions` help data stewards fix issues
 
 </details>
 
+---
 
-**Policy (`UserGeneratedContentPolicy` in `policy_config.json`):**
+### 3. Content Moderation (Multimodal)
+
+**Scenario**: Moderate user-generated content including text and images for policy compliance.
+
+<details>
+<summary><strong>📋 Click to expand Content Moderation example</strong></summary>
+
+```bash
+# 🖼️ Example: Multipart form data with image upload
+curl -X POST http://classify-service:8080/service/validate \
+  -F 'json_payload={"api_class":"UserGeneratedContentPolicy","input_text":"Check out this cool image I found!","input_items":[{"id":"user_image_1","type":"image","filename_in_form":"uploaded_image"}]}' \
+  -F 'uploaded_image=@./test_image.jpg'
+```
+
+```python
+# 🐍 Python example for content moderation
+import requests
+
+def moderate_user_content(text_content, image_file_path=None):
+    """
+    Moderate user-generated content for policy compliance.
+    
+    Args:
+        text_content: User's text input
+        image_file_path: Optional path to uploaded image
+        
+    Returns:
+        dict: Moderation result with approval status
+    """
+    
+    # 📝 Prepare the JSON payload
+    payload = {
+        "api_class": "UserGeneratedContentPolicy",
+        "input_text": text_content,
+        "request_id": f"moderation-{int(time.time())}"
+    }
+    
+    # 🖼️ Add image item if provided
+    if image_file_path:
+        payload["input_items"] = [{
+            "id": "user_uploaded_image",
+            "type": "image", 
+            "filename_in_form": "user_image"
+        }]
+    
+    try:
+        if image_file_path:
+            # 📤 Multipart request with image
+            files = {'user_image': open(image_file_path, 'rb')}
+            data = {'json_payload': json.dumps(payload)}
+            
+            response = requests.post(
+                'http://classify-service:8080/service/validate',
+                data=data,
+                files=files,
+                timeout=45  # Longer timeout for image processing
+            )
+            files['user_image'].close()
+        else:
+            # 📤 JSON-only request
+            response = requests.post(
+                'http://classify-service:8080/service/validate',
+                json=payload,
+                timeout=30
+            )
+        
+        response.raise_for_status()
+        result = response.json()
+        
+        return {
+            'approved': result.get('overall_status') == 'PASS',
+            'violations': result.get('violation_reasons', []),
+            'suggestions': result.get('documentation_suggestions', {}),
+            'processing_details': result.get('processing_details', {})
+        }
+        
+    except requests.exceptions.RequestException as e:
+        return {
+            'approved': False,
+            'error': f'Moderation service error: {str(e)}',
+            'violations': ['Service unavailable']
+        }
+
+# 🎯 Example usage
+import json
+import time
+
+text = "Hey everyone, here's my personal info: email john@example.com"
+image_path = "./user_uploads/suspicious_image.jpg"
+
+moderation_result = moderate_user_content(text, image_path)
+
+if moderation_result['approved']:
+    print("✅ Content approved for publication")
+else:
+    print(f"❌ Content blocked: {moderation_result['violations']}")
+    if 'suggestions' in moderation_result:
+        print(f"💡 Guidelines: {moderation_result['suggestions']}")
+```
+
+**🔧 Required Policy Configuration** (`UserGeneratedContentPolicy` in `policy_config.json`):
+
 ```json
 {
   "UserGeneratedContentPolicy": {
@@ -396,17 +484,18 @@ if __name__ == "__main__": # This __main__ block is specific to the ETL example
 }
 ```
 
-**How it works:**
-1. User submits post with text and image.
-2. Backend sends multipart request to `/service/validate`.
-3. Text is checked for PII/profanity.
-4. Image is analyzed by VLM.
-5. VLM description is checked for policy violations.
-6. Violations trigger rejection with helpful suggestions.
+**🔄 How it works:**
+1. **Text Analysis**: User's text checked for PII, hate speech, violent content
+2. **Image Processing**: VLM analyzes uploaded images for policy violations
+3. **Multi-Modal Validation**: VLM description text also checked for violations
+4. **Keyword Filtering**: Blocked keywords provide additional safeguards
+5. **Contextual Help**: Violations trigger community guideline suggestions
 
 </details>
 
-## Setup
+---
+
+## 🚀 Setup
 
 On first run:
 
@@ -418,41 +507,10 @@ On first run:
 python classify.py --help
 ```
 
-## Policy File Example
-
-(Refer to detailed examples within each Integration Example section above or a separate `policy_config.md` for full schema and options.)
-```json
-{
-  "StrictPIIPolicy": {
-    "description": "Focuses on identifying and rejecting PII in input text.",
-    "modernbert_io_validation": false,
-    "colbert_input_sensitivity": true,
-    "disallowed_colbert_input_classes": ["Class 1: PII"],
-    "documentation_assistance": {
-      "enabled": true,
-      "index_path": "./internal_data_handling_docs_rag",
-      "max_total_suggestions": 2
-    }
-  }
-}
-```
-
-## Endpoints
-
-* `POST /service/validate` — main policy-driven validation endpoint
-* `POST /modernbert/classify` — direct access to I/O Validator model
-* `POST /colbert/classify_sensitivity` — direct access to Sensitivity Classifier model
-* `POST /rag/query` — query a loaded RAG index (typically the global documentation index)
-* `GET /status` — check service and component health
-
-## CLI Examples
-
-(For full CLI options, run `python classify.py [command] --help`)
-
 ### Start Server
 
 ```bash
-# Ensure HF_TOKEN is set in your environment if models need downloading
+# 🔑 Ensure HF_TOKEN is set in your environment if models need downloading
 # PowerShell: $env:HF_TOKEN="your_hf_token_here"
 # Bash: export HF_TOKEN="your_hf_token_here"
 
@@ -464,7 +522,7 @@ python classify.py serve \
 ### Create Example Files & Auto-Build Docs RAG
 
 ```bash
-# This will create sample files and build a RAG index from the specified docs
+# 📚 This will create sample files and build a RAG index from the specified docs
 # Ensure HF_TOKEN is set if the embedding model isn't cached
 
 python classify.py create-example \
@@ -484,7 +542,9 @@ python classify.py rag index \
   --embedding-model-id all-mpnet-base-v2
 ```
 
-## Data Formats
+---
+
+## 📊 Data Formats
 
 ### I/O Validation Training (Illustrative)
 
@@ -503,42 +563,48 @@ python classify.py rag index \
 {"text": "Public company earnings report", "class_name": "Class 4: Public"}
 ```
 
-## Markdown Intelligence
+---
+
+## 🧠 Markdown Intelligence
 
 The service leverages Vision-Language Models (VLMs) for advanced processing of markdown documentation when building RAG indexes. This offers significant advantages over traditional regex or basic text-splitting methods.
 
 **Why VLM Helps for RAG Indexing:**
 
-* **Semantic Chunking**: VLMs understand content and structure to create semantically coherent chunks. Related ideas stay grouped, improving retrieval context.
+* **🎯 Semantic Chunking**: VLMs understand content and structure to create semantically coherent chunks. Related ideas stay grouped, improving retrieval context.
 
-* **Structure Preservation**: VLMs identify and preserve document structure (headers, lists). This metadata enables targeted search/filtering.
+* **🏗️ Structure Preservation**: VLMs identify and preserve document structure (headers, lists). This metadata enables targeted search/filtering.
 
-* **Code Block Handling**: VLMs treat code blocks as complete units, preventing awkward splits. Metadata flags code-heavy chunks.
+* **💻 Code Block Handling**: VLMs treat code blocks as complete units, preventing awkward splits. Metadata flags code-heavy chunks.
 
-* **Contextual Metadata Extraction**: VLMs extract topics, keywords, audience, and difficulty level, enriching metadata for powerful queries.
+* **🏷️ Contextual Metadata Extraction**: VLMs extract topics, keywords, audience, and difficulty level, enriching metadata for powerful queries.
 
-* **Enhanced Fallback**: Python-based fallback processor respects headers and code blocks when VLM unavailable.
+* **🔄 Enhanced Fallback**: Python-based fallback processor respects headers and code blocks when VLM unavailable.
 
-* **Secondary Chunking**: Large chunks get split with overlap to respect embedding model limits.
+* **✂️ Secondary Chunking**: Large chunks get split with overlap to respect embedding model limits.
 
 **Benefits Over Traditional Processing:**
 
-* **Better Search Relevance**: Semantic chunks create better embeddings and more relevant retrieval.
+* **🔍 Better Search Relevance**: Semantic chunks create better embeddings and more relevant retrieval.
 
-* **Context-Aware Documentation Assistance**: More precise and relevant help for policy violations.
+* **💡 Context-Aware Documentation Assistance**: More precise and relevant help for policy violations.
 
-* **Improved Technical Content Handling**: Proper code block and technical jargon handling.
+* **⚙️ Improved Technical Content Handling**: Proper code block and technical jargon handling.
 
-* **Automatic Content Categorization**: Extracted metadata enables auto-tagging and categorization.
+* **🏷️ Automatic Content Categorization**: Extracted metadata enables auto-tagging and categorization.
 
-## System Requirements
+---
 
-* Python 3.8+
-* RAM: 16–32GB+ for VLMs (especially VLM Markdown Processor). Placeholder models and CPU-only operation require less.
-* GPU: Optional but recommended for performance
+## 💻 System Requirements
+
+* **Python 3.8+**
+* **RAM**: 16–32GB+ for VLMs (especially VLM Markdown Processor). Placeholder models and CPU-only operation require less.
+* **GPU**: Optional but recommended for performance
   * CUDA-enabled GPU for `llama-cpp-python` with `n_gpu_layers > 0`
 
-## Testing
+---
+
+## 🧪 Testing
 
 ```bash
 # Run all test categories
