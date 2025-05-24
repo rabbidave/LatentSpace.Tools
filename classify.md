@@ -22,7 +22,7 @@ Integrate seamlessly using a single `/service/validate` endpoint that accepts co
 
 ## 🛡️ PII Policy Example
 
-> **Note**: See `policy_config.md` for full schema and options.
+> `policy_config.md` for schema and options.
 
 The following demonstrates a **strict PII detection policy** that focuses on identifying and rejecting personally identifiable information in input text:
 
@@ -176,7 +176,7 @@ if (!validationResult.success) {
 
 ---
 
-### 2. ETL Pipeline Integration
+### 2. Data Pipeline Integration
 
 **Scenario**: Validate documents during processing to ensure compliance throughout the data pipeline.
 
@@ -348,7 +348,7 @@ if __name__ == "__main__":
 
 ---
 
-### 3. Content Moderation (Multimodal)
+### 3. Multimodal Moderation 
 
 **Scenario**: Moderate user-generated content including text and images for policy compliance.
 
