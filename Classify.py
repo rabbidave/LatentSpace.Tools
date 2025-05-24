@@ -1,11 +1,11 @@
 #!/usr/bin/env python
 """
-Transformer-Based Classification and Reranking Service 
-with VLM-Powered Markdown Processing and JSON Policy Validation
+Enhanced Standard Transformer-Based Classification and Reranking Service 
+with VLM-Powered Markdown Processing and Complete Policy Validation
 
 This enhanced version includes:
-1. VLM-based markdown processing 
-2. Comprehensive testing framework
+1. VLM-based Processing & RAG indexing
+2. Comprehensive Testing Framework
 """
 
 import os
@@ -773,7 +773,10 @@ class RAGRetriever:
             logger.debug(f"SentenceTransformer model '{model_id}' already loaded.")
             return
         try:
-            self.model = SentenceTransformer(model_id)
+            logger.debug(f"RAGRetriever._load_model: Attempting to load model_id='{model_id}'.")
+            logger.debug(f"RAGRetriever._load_model: HF_TOKEN from env: {os.environ.get('HF_TOKEN')}")
+            logger.debug(f"RAGRetriever._load_model: Explicit token arg being passed: {os.environ.get('HF_TOKEN')}")
+            self.model = SentenceTransformer(model_id, token=os.environ.get("HF_TOKEN"))
             logger.info(f"SentenceTransformer model '{model_id}' loaded.")
         except Exception as e:
             logger.error(f"Failed to load SentenceTransformer model '{model_id}': {e}")
@@ -1015,8 +1018,15 @@ class ModernBERTClassifier:
         
         try:
             logger.info(f"Loading ModernBERT model: {self.model_id}")
-            self.tokenizer = AutoTokenizer.from_pretrained(self.model_id, use_fast=True)
-            self.model = AutoModelForSequenceClassification.from_pretrained(self.model_id)
+            logger.debug(f"ModernBERTClassifier.setup: Attempting to load tokenizer for model_id='{self.model_id}'.")
+            logger.debug(f"ModernBERTClassifier.setup: HF_TOKEN from env: {os.environ.get('HF_TOKEN')}")
+            logger.debug(f"ModernBERTClassifier.setup: Explicit token arg being passed: {os.environ.get('HF_TOKEN')}")
+            logger.debug(f"ModernBERTClassifier.setup: use_fast=True")
+            self.tokenizer = AutoTokenizer.from_pretrained(self.model_id, use_fast=True, token=os.environ.get("HF_TOKEN"))
+            logger.debug(f"ModernBERTClassifier.setup: Attempting to load model for model_id='{self.model_id}'.")
+            logger.debug(f"ModernBERTClassifier.setup: HF_TOKEN from env (for model): {os.environ.get('HF_TOKEN')}")
+            logger.debug(f"ModernBERTClassifier.setup: Explicit token arg for model (if passed): {os.environ.get('HF_TOKEN')}")
+            self.model = AutoModelForSequenceClassification.from_pretrained(self.model_id, token=os.environ.get("HF_TOKEN"))
             self.is_setup = True
             logger.info("Model and tokenizer loaded successfully")
         except Exception as e:
@@ -1092,8 +1102,14 @@ class ColBERTReranker:
         import torch
         
         self.model_id = model_id # Example: "sebastian-hofstaetter/colbert-distilbert-margin_mse-T2-msmarco"
-        self.tokenizer = AutoTokenizer.from_pretrained(model_id, use_fast=True)
-        self.model = AutoModel.from_pretrained(model_id)
+        logger.debug(f"ColBERTReranker.__init__: Attempting to load tokenizer for model_id='{model_id}'.")
+        logger.debug(f"ColBERTReranker.__init__: HF_TOKEN from env: {os.environ.get('HF_TOKEN')}")
+        logger.debug(f"ColBERTReranker.__init__: Explicit token arg being passed: {os.environ.get('HF_TOKEN')}")
+        logger.debug(f"ColBERTReranker.__init__: use_fast=True")
+        self.tokenizer = AutoTokenizer.from_pretrained(model_id, use_fast=True, token=os.environ.get("HF_TOKEN"))
+        logger.debug(f"ColBERTReranker.__init__: Attempting to load model for model_id='{model_id}'.")
+        logger.debug(f"ColBERTReranker.__init__: HF_TOKEN from env (for model): {os.environ.get('HF_TOKEN')}")
+        self.model = AutoModel.from_pretrained(model_id, token=os.environ.get("HF_TOKEN"))
         self.reference_embeddings = {}
         
         # Load default reference examples if none provided
@@ -1202,12 +1218,15 @@ class VisionLanguageProcessor:
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         
         try:
-            self.processor = AutoProcessor.from_pretrained(self.model_id, trust_remote_code=True) # VLM models often need trust_remote_code
+            self.processor = AutoProcessor.from_pretrained(self.model_id, trust_remote_code=True, token=os.environ.get("HF_TOKEN")) # VLM models often need trust_remote_code
+            logger.debug(f"VisionLanguageProcessor.setup: Attempting to load pipeline for model='{self.model_id}'.")
+            logger.debug(f"VisionLanguageProcessor.setup: HF_TOKEN from env (for pipeline): {os.environ.get('HF_TOKEN')}")
             self.model = pipeline(
                 "image-to-text",
                 model=self.model_id,
                 device=self.device,
-                torch_dtype=torch.float16 if self.device == "cuda" else torch.float32
+                torch_dtype=torch.float16 if self.device == "cuda" else torch.float32,
+                token=os.environ.get("HF_TOKEN")
             )
             self.is_setup = True
             logger.info("VLM model loaded successfully")
@@ -3293,7 +3312,10 @@ class MyClass:
 
 
 if __name__ == "__main__":
+    logger.info(f"Script Start/Restart: HF_TOKEN from env: {os.environ.get('HF_TOKEN')}")
     is_venv_ok = ensure_venv()
+    # Log HF_TOKEN status before running main logic
+    logger.info(f"Global Scope: HF_TOKEN from env before _initialize_and_run: {os.environ.get('HF_TOKEN')}")
     exit_code = 1 # Default to error
 
     if is_venv_ok:
