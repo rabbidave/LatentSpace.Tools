@@ -11,8 +11,8 @@ Integrate seamlessly using a single `/service/validate` endpoint that accepts co
 
 **Highlights:**
 
-* **Drop-in Integration**: One endpoint for all types of validation
-* **Multi-Modal Ready**: Supports text, image, video, and (soon) audio
+* **Drop-in Integration**: Single-Endpoint Validation
+* **Natively Multi-Modal**: via [llama-cpp-python](https://github.com/abetlen/llama-cpp-python)
 * **Policy-Driven**: Configurable via external JSON
 * **Context-Aware Help**: Built-in RAG-driven documentation
 
