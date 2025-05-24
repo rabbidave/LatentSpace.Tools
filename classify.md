@@ -14,7 +14,7 @@ Integrate seamlessly using a single `/service/validate` endpoint that accepts co
 * **Drop-in Integration**: Single-Endpoint Validation
 * **Natively Multi-Modal**: via [llama-cpp-python](https://github.com/abetlen/llama-cpp-python)
 * **Policy-Driven**: Configurable via external JSON
-* **Context-Aware Help**: Built-in RAG-driven documentation
+* **Context-Aware Help**: Self-Documenting RAG
 
 ---
 
