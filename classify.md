@@ -546,7 +546,7 @@ python classify.py rag index \
 
 ## 📊 Data Formats
 
-### I/O Validation Training (Illustrative)
+### I/O Validation Format
 
 ```json
 {
@@ -556,7 +556,7 @@ python classify.py rag index \
 }
 ```
 
-### ColBERT Sensitivity Reference Examples (Illustrative)
+### Classification Format
 
 ```json
 {"text": "SSN: 123-45-6789", "class_name": "Class 1: PII"}
@@ -565,7 +565,7 @@ python classify.py rag index \
 
 ---
 
-## 🧠 Markdown Intelligence
+## 🧠 VLM-driven RAG
 
 The service leverages Vision-Language Models (VLMs) for advanced processing of markdown documentation when building RAG indexes. This offers significant advantages over traditional regex or basic text-splitting methods.
 
@@ -599,8 +599,7 @@ The service leverages Vision-Language Models (VLMs) for advanced processing of m
 
 * **Python 3.8+**
 * **RAM**: 16–32GB+ for VLMs (especially VLM Markdown Processor). Placeholder models and CPU-only operation require less.
-* **GPU**: Optional but recommended for performance
-  * CUDA-enabled GPU for `llama-cpp-python` with `n_gpu_layers > 0`
+* **GPU** CUDA-enabled GPU (optional) for `llama-cpp-python` with `n_gpu_layers > 0`
 
 ---
 
