@@ -14,9 +14,7 @@ Integrate seamlessly using a single `/service/validate` endpoint that accepts co
 * **Drop-in Integration**: One endpoint for all types of validation
 * **Multi-Modal Ready**: Supports text, image, video, and (soon) audio
 * **Policy-Driven**: Configurable via external JSON
-* **Context-Aware Help**: Built-in RAG-driven documentation assistant
-* **Enterprise-Focused**: Governance, observability, and compliance ready
-* **VLM-Aware Docs**: Enhances markdown for indexing and retrieval
+* **Context-Aware Help**: Built-in RAG-driven documentation
 
 ---
 
