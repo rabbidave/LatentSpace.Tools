@@ -565,7 +565,10 @@ python classify.py rag index \
 
 ---
 
-## 🧠 VLM-driven RAG
+## 🧠 VLM-driven RAG?
+
+<details>
+<summary><strong>📋 Click to expand RAG-specific examples</strong></summary>
 
 The service leverages Vision-Language Models (VLMs) for advanced processing of markdown documentation when building RAG indexes. This offers significant advantages over traditional regex or basic text-splitting methods.
 
@@ -592,8 +595,8 @@ The service leverages Vision-Language Models (VLMs) for advanced processing of m
 * **⚙️ Improved Technical Content Handling**: Proper code block and technical jargon handling.
 
 * **🏷️ Automatic Content Categorization**: Extracted metadata enables auto-tagging and categorization.
+</details>
 
----
 
 ## 💻 System Requirements
 
