@@ -1,7 +1,9 @@
 # Data Classification & Monitoring Service
 ###### (Policy-Driven, Local-First, etc)
 
-This document describes `classify.py`, a **Data Classification and Monitoring Service** that delivers plug-and-play policy-based validation for any application (read: JSON object). It orchestrates fine-tuned transformers, GGUF-based vision-language models (VLMs), and smart retrieval pipelines to provide a governance layer for multimodal content including text, image, and video.
+This document describes `classify.py`, a **Data Classification and Monitoring Service** that delivers plug-and-play policy-based validation for any application (read: JSON object).
+
+It orchestrates fine-tuned transformers, GGUF-based vision-language models (VLMs), and smart retrieval pipelines to provide a governance layer for multimodal content including text, image, and video.
 
 ## **N-Granularity 'Validation Endpoint'**
 
