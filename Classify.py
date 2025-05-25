@@ -1,11 +1,12 @@
 #!/usr/bin/env python
 """
-Enhanced Standard Transformer-Based Classification and Reranking Service 
-with VLM-Powered Markdown Processing and Complete Policy Validation
+Transformer-Based Classification and Reranking Service 
+w/ VLM-Powered RAG-Informed Policy Validation
 
 This enhanced version includes:
 1. VLM-based Processing & RAG indexing
 2. Comprehensive Testing Framework
+3. Self-Installing & Self-Documenting
 """
 
 import os
@@ -158,14 +159,34 @@ def ensure_venv():
 
     logger.info(f"Restarting script using Python from '{venv_path}'...")
     script_path = os.path.abspath(__file__)
-    exec_args = [python_executable, script_path] + sys.argv[1:]
+    
+    # Prepare arguments for re-execution with quoting for Windows
+    original_args = sys.argv[1:]
+    processed_args_for_exec = []
+
+    if sys.platform == "win32":
+        for arg in original_args:
+            # If argument contains a space and is not already "simply" quoted.
+            # This handles basic cases. Complex cases with internal quotes might need more.
+            if " " in arg and not (arg.startswith('"') and arg.endswith('"')):
+                processed_args_for_exec.append(f'"{arg}"')
+            else:
+                processed_args_for_exec.append(arg)
+    else:
+        # For non-Windows, pass arguments as they are.
+        processed_args_for_exec = original_args
+            
+    exec_args = [python_executable, script_path] + processed_args_for_exec
+    
+    logger.debug(f"ensure_venv: Re-executing with args: {exec_args}") # Log the exact args for os.execv
+
     try:
         os.execv(python_executable, exec_args)
     except OSError as e:
         logger.error(f"os.execv failed: {e}", exc_info=True)
         sys.exit(1)
     
-    return False
+    return False # Should not be reached if os.execv is successful
 
 
 # --- VLM-Based Markdown Processing ---
@@ -246,7 +267,7 @@ class MarkdownReformatterVLM:
             )
             
             if response and "choices" in response and response["choices"]:
-                output_text = response["choices"][0]["text"].strip()
+                output_text = response["choices"]["text"].strip()
                 logger.debug(f"VLM output length: {len(output_text)} characters")
                 return output_text
             else:
@@ -866,7 +887,7 @@ class RAGRetriever:
             "text_field": text_field,
             "metadata_fields": metadata_fields or [],
             "num_documents": len(parsed_documents),
-            "embedding_dimension": embeddings_array.shape,
+            "embedding_dimension": embeddings_array.shape, # Sentence embeddings are (num_sentences, dim)
             "index_timestamp": time.time()
         }
         
@@ -910,7 +931,7 @@ class RAGRetriever:
             self.embeddings = np.load(embed_file)
 
             if len(self.documents) != self.embeddings.shape[0]:
-                logger.error(f"Document count ({len(self.documents)}) and embedding count ({self.embeddings.shape}) mismatch. Index corrupt.")
+                logger.error(f"Document count ({len(self.documents)}) and embedding count's first dimension ({self.embeddings.shape[0]}) mismatch. Index corrupt. Full embeddings shape: {self.embeddings.shape}")
                 return False
             
             self._is_loaded = True
@@ -1053,7 +1074,7 @@ class ModernBERTClassifier:
             # Get model predictions
             outputs = self.model(**inputs)
             logits = outputs.logits
-            probabilities = logits.softmax(dim=-1).detach().numpy()[0]
+            probabilities = logits.softmax(dim=-1).detach().numpy()
             
             # Assuming binary classification: 0=invalid, 1=valid
             prediction = int(probabilities.argmax())
@@ -1061,7 +1082,7 @@ class ModernBERTClassifier:
             
             return {
                 "prediction": prediction,
-                "probability_positive": float(probabilities[1]),
+                "probability_positive": float(probabilities),
                 "confidence": confidence,
                 "details": f"Model: {self.model_id} | Input length: {len(input_text)} | Output length: {len(output_text)}"
             }
@@ -1273,7 +1294,7 @@ class VisionLanguageProcessor:
             with torch.no_grad():
                 outputs = self.model.generate(**inputs, max_new_tokens=200)
             
-            description = self.processor.decode(outputs[0], skip_special_tokens=True)
+            description = self.processor.decode(outputs, skip_special_tokens=True)
             
             return {
                 "description": description,
@@ -2569,10 +2590,13 @@ def _initialize_and_run():
     # to ensure they are in the global scope.
     logger.debug("Global imports should be complete. Calling main_cli.")
     return main_cli()
-
 def main_cli():
     """Main CLI function that runs after dependencies are imported."""
     setup_signal_handling()
+    
+    # ADD THIS DEBUG LINE:
+    logger.info(f"DEBUG: main_cli received sys.argv: {sys.argv}")
+    
     parser = argparse.ArgumentParser(
         description="Enhanced Transformer-based Classification Service with VLM Processing",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter # Show defaults in help
@@ -2650,116 +2674,6 @@ def main_cli():
     parser_serve.add_argument("--port", type=int, default=8080, help="Port for the API server.")
     parser_serve.add_argument("--global-rag-retriever-index-path", type=str, default=None, help="Path to a global RAG index for the /rag/query endpoint and potentially default documentation assistance if not specified in policy.")
     parser_serve.add_argument("--vlm-model-path", type=str, help="Path to VLM GGUF model for item processing in API policies (e.g., LLaVA, distinct from docs VLM). Placeholder if not provided.")
-
-    # Test command
-    parser_test = subparsers.add_parser("test", help="Run comprehensive internal tests for the system.")
-    parser_test.add_argument("--test-type", choices=['all', 'vlm', 'policy', 'rag', 'codebase'], default='all', help="Specific category of tests to run.")
-    parser_test.add_argument("--verbose", action="store_true", help="Enable verbose logging during tests.")
-
-    args = parser.parse_args()
-
-    # Handle commands
-    if args.command == "index-codebase":
-        success = build_codebase_rag_index(
-            code_file_path=Path(args.code_file_path),
-            index_path=Path(args.index_path),
-            embedding_model_id=args.embedding_model_id,
-            strategy=args.code_chunk_strategy,
-            chunk_size=args.code_chunk_size,
-            chunk_overlap=args.code_chunk_overlap
-        )
-        return 0 if success else 1
-
-    elif args.command == "create-example":
-        create_example_files(
-            base_path=Path(args.output_dir),
-            docs_url=args.docs_url.split(',') if args.docs_url and ',' in args.docs_url else args.docs_url, # Support comma-separated list for docs_url
-            auto_build_docs_rag=args.auto_build_docs_rag,
-            docs_rag_index_name=args.docs_rag_index_name,
-            chunk_size=args.chunk_size,
-            chunk_overlap=args.chunk_overlap,
-            vlm_model_path=args.docs_vlm_model_path, # For document processing VLM
-            processing_strategy=args.processing_strategy
-        )
-        return 0
-
-    else:
-        parser.print_help()
-        return 1
-    subparsers = parser.add_subparsers(dest="command", required=True, help="Available commands")
-
-    # Index Codebase command
-    parser_index_codebase = subparsers.add_parser(
-        "index-codebase", 
-        help="Create a RAG index from Python source code."
-    )
-    parser_index_codebase.add_argument("--code-file-path", type=str, default=__file__, help="Path to the Python code file to index.")
-    parser_index_codebase.add_argument("--index-path", type=str, required=True, help="Directory path to save the RAG index for code.")
-    parser_index_codebase.add_argument("--embedding-model-id", type=str, default="all-MiniLM-L6-v2", help="SentenceTransformer model for embeddings.")
-    parser_index_codebase.add_argument(
-        "--code-chunk-strategy", 
-        type=str, 
-        choices=['functions', 'classes', 'lines'], 
-        default='functions',
-        help="Strategy for chunking Python code (functions/methods, classes, or lines)."
-    )
-    parser_index_codebase.add_argument("--code-chunk-size", type=int, default=1000, help="Target chunk size in characters (for 'lines' strategy or very long functions/classes).")
-    parser_index_codebase.add_argument("--code-chunk-overlap", type=int, default=100, help="Overlap size in characters (for 'lines' strategy).")
-
-    # Create Example Files command
-    parser_create_example = subparsers.add_parser(
-        "create-example", 
-        help="Create example files (documentation, policy config, RAG corpus)."
-    )
-    parser_create_example.add_argument("--output-dir", type=str, default="enhanced_tool_examples", help="Directory to save example files.")
-    parser_create_example.add_argument("--docs-url", type=str, default=None, help=f"URL or local path to markdown documentation file(s) to process. Can be a list. Defaults to internal sample doc if not provided.")
-    parser_create_example.add_argument("--auto-build-docs-rag", action="store_true", help="Automatically build RAG index from the documentation.")
-    parser_create_example.add_argument("--docs-rag-index-name", type=str, default="tool_documentation", help="Name for the documentation RAG index directory (created within --output-dir).")
-    parser_create_example.add_argument("--chunk-size", type=int, default=800, help="Target chunk size for VLM/fallback document processing.")
-    parser_create_example.add_argument("--chunk-overlap", type=int, default=100, help="Chunk overlap for secondary/fallback document processing.")
-    parser_create_example.add_argument(
-        "--docs-vlm-model-path", 
-        type=str, 
-        help="Path to local GGUF model file for VLM-based documentation processing."
-    )
-    parser_create_example.add_argument(
-        "--processing-strategy", 
-        type=str, 
-        choices=['vlm', 'python'], 
-        default='vlm',
-        help="Documentation processing strategy ('vlm' or 'python' fallback)."
-    )
-
-    # RAG command group
-    parser_rag = subparsers.add_parser("rag", help="RAG (Retrieval Augmented Generation) utilities.")
-    rag_subparsers = parser_rag.add_subparsers(dest="rag_command", required=True)
-
-    # RAG Index
-    parser_rag_index_cmd = rag_subparsers.add_parser("index", help="Create a RAG index from a JSONL corpus.")
-    parser_rag_index_cmd.add_argument("--corpus-path", type=str, required=True, help="Path to corpus file (JSONL format).")
-    parser_rag_index_cmd.add_argument("--index-path", type=str, required=True, help="Directory path to save the RAG index.")
-    parser_rag_index_cmd.add_argument("--embedding-model-id", type=str, default="all-MiniLM-L6-v2", help="SentenceTransformer model for embeddings.")
-    parser_rag_index_cmd.add_argument("--doc-id-field", type=str, default="id", help="Field name for document ID in JSONL.")
-    parser_rag_index_cmd.add_argument("--text-field", type=str, default="text", help="Field name for text content in JSONL.")
-    parser_rag_index_cmd.add_argument("--metadata-fields", nargs='*', help="List of metadata field names to include from JSONL (e.g., category, source). Assumes they are under a 'metadata' key in each JSONL object or top-level.")
-    parser_rag_index_cmd.add_argument("--batch-size", type=int, default=32, help="Batch size for embedding generation.")
-
-    # RAG Retrieve (docs-chat equivalent)
-    parser_rag_retrieve_cmd = rag_subparsers.add_parser("retrieve", help="Retrieve documents from a RAG index (CLI query tool).")
-    parser_rag_retrieve_cmd.add_argument("--index-path", type=str, required=True, help="Path to the RAG index directory.")
-    parser_rag_retrieve_cmd.add_argument("--query", type=str, required=True, help="Query string to search for.")
-    parser_rag_retrieve_cmd.add_argument("--top-k", type=int, default=5, help="Number of top documents to retrieve.")
-    # No --interactive flag as per current script structure.
-
-    # Serve API command
-    parser_serve = subparsers.add_parser("serve", help="Start the enhanced classification API server.")
-    parser_serve.add_argument("--modernbert-model-dir", type=str, default=None, help="Path to a directory containing a trained ModernBERT model (for real model usage, otherwise uses placeholder).")
-    parser_serve.add_argument("--policy-config-path", type=str, default="enhanced_tool_examples/enhanced_policy_config.json", help="Path to the API policy configuration JSON file.")
-    parser_serve.add_argument("--host", type=str, default="0.0.0.0", help="Host address for the API server.")
-    parser_serve.add_argument("--port", type=int, default=8080, help="Port for the API server.")
-    parser_serve.add_argument("--global-rag-retriever-index-path", type=str, default=None, help="Path to a global RAG index for the /rag/query endpoint and potentially default documentation assistance if not specified in policy.")
-    parser_serve.add_argument("--vlm-model-path", type=str, help="Path to VLM GGUF model for item processing in API policies (e.g., LLaVA, distinct from docs VLM). Placeholder if not provided.")
-
 
     # Test command
     parser_test = subparsers.add_parser("test", help="Run comprehensive internal tests for the system.")
@@ -2959,8 +2873,8 @@ def test_vlm_processing(temp_test_dir: Path) -> Dict[str, Dict[str, Any]]:
 Some postamble text...'''
         parsed_chunks = parse_vlm_output(mock_vlm_output_valid, "test_url_valid")
         assert len(parsed_chunks) == 1, f"Expected 1 chunk, got {len(parsed_chunks)}"
-        assert parsed_chunks[0]["id"] == "test_chunk_1_valid", "Chunk ID mismatch."
-        assert parsed_chunks[0]["metadata"]["source_url"] == "test_url_valid", "Source URL not added."
+        assert parsed_chunks["id"] == "test_chunk_1_valid", "Chunk ID mismatch."
+        assert parsed_chunks["metadata"]["source_url"] == "test_url_valid", "Source URL not added."
         results[test_name] = {"passed": True}
     except Exception as e:
         results[test_name] = {"passed": False, "error": str(e)}
@@ -3129,7 +3043,7 @@ def test_policy_validation(temp_test_dir: Path) -> Dict[str, Dict[str, Any]]:
         response_data_store_len = {}
         violations_len = api_for_test._handle_additional_policy_checks(payload_len, policy_rules_len, response_data_store_len)
         assert len(violations_len) == 1, "Expected 1 length violation."
-        assert "exceeds maximum length" in violations_len[0], "Length violation message mismatch."
+        assert "exceeds maximum length" in violations_len, "Length violation message mismatch."
         results[test_name] = {"passed": True}
     except Exception as e:
         results[test_name] = {"passed": False, "error": str(e)}
@@ -3184,8 +3098,8 @@ def test_rag_functionality(temp_test_dir: Path) -> Dict[str, Dict[str, Any]]:
         # Test retrieval
         retrieved_items = loaded_retriever.retrieve("AI programming", top_k=1)
         assert len(retrieved_items) == 1, "Retrieval did not return 1 item for 'AI programming'."
-        assert retrieved_items[0]["id"] == "rag_doc_2", "Incorrect document retrieved for 'AI programming'."
-        assert retrieved_items[0]["metadata"].get("topic") == "Python", "Metadata not retrieved correctly."
+        assert retrieved_items["id"] == "rag_doc_2", "Incorrect document retrieved for 'AI programming'."
+        assert retrieved_items["metadata"].get("topic") == "Python", "Metadata not retrieved correctly."
         results[test_name] = {"passed": True}
     except Exception as e:
         results[test_name] = {"passed": False, "error": str(e)}
@@ -3214,7 +3128,7 @@ def test_rag_functionality(temp_test_dir: Path) -> Dict[str, Dict[str, Any]]:
         assert doc_retriever.load_index(), "Failed to load doc RAG index (fallback)."
         ret_docs = doc_retriever.retrieve("API validation", top_k=1)
         assert len(ret_docs) > 0, "No results from doc RAG index (fallback) for 'API validation'."
-        assert "API validation" in ret_docs[0]["text"], "Retrieved doc text mismatch."
+        assert "API validation" in ret_docs["text"], "Retrieved doc text mismatch."
         results[test_name] = {"passed": True}
     except Exception as e:
         results[test_name] = {"passed": False, "error": str(e)}
@@ -3277,9 +3191,9 @@ class MyClass:
         logger.info(f"Testing: {test_name}")
         chunks_class = parse_and_chunk_python_code(sample_python_code, "classes", 1000, 100)
         assert len(chunks_class) == 1, "Expected 1 class chunk."
-        assert chunks_class[0]["metadata"]["name"] == "MyClass", "Class name mismatch."
-        assert chunks_class[0]["metadata"]["type"] == "class", "Chunk type not 'class'."
-        assert len(chunks_class[0]["metadata"]["methods_signatures"]) == 3, "Incorrect number of method signatures for MyClass."
+        assert chunks_class["metadata"]["name"] == "MyClass", "Class name mismatch."
+        assert chunks_class["metadata"]["type"] == "class", "Chunk type not 'class'."
+        assert len(chunks_class["metadata"]["methods_signatures"]) == 3, "Incorrect number of method signatures for MyClass."
         results[test_name] = {"passed": True}
     except Exception as e:
         results[test_name] = {"passed": False, "error": str(e)}
@@ -3303,7 +3217,7 @@ class MyClass:
         
         ret_code_items = code_retriever.retrieve("method one docstring", top_k=1)
         assert len(ret_code_items) == 1, "Retrieval from code index failed for 'method one docstring'."
-        assert ret_code_items[0]["metadata"]["name"] == "method_one", "Retrieved wrong code chunk for 'method one docstring'."
+        assert ret_code_items["metadata"]["name"] == "method_one", "Retrieved wrong code chunk for 'method one docstring'."
         results[test_name] = {"passed": True}
     except Exception as e:
         results[test_name] = {"passed": False, "error": str(e)}
@@ -3383,3 +3297,4 @@ if __name__ == "__main__":
     
     logger.info(f"Script finished with exit code {exit_code}.")
     sys.exit(exit_code)
+
