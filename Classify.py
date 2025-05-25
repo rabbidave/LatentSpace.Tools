@@ -1,12 +1,13 @@
 #!/usr/bin/env python
 """
-Transformer-Based Classification and Reranking Service 
-w/ VLM-Powered RAG-Informed Policy Validation
+Enhanced Standard Transformer-Based Classification and Reranking Service 
+with VLM-Powered Markdown Processing and Complete Policy Validation
 
 This enhanced version includes:
-1. VLM-based Processing & RAG indexing
-2. Comprehensive Testing Framework
-3. Self-Installing & Self-Documenting
+1. VLM-based markdown processing using PleIAs/Pleias-RAG-1B GGUF model
+2. Complete policy validation logic implementation
+3. Preserved codebase indexing functionality
+4. Comprehensive testing framework
 """
 
 import os
@@ -1082,7 +1083,10 @@ class ModernBERTClassifier:
             
             return {
                 "prediction": prediction,
-                "probability_positive": float(probabilities),
+                # Assuming index 1 of the probabilities array corresponds to the "positive" or "valid" class.
+                # probabilities is typically a 2D array like [[prob_class_0, prob_class_1]] for a single input.
+                # We need to extract the probability for the positive class (e.g., index 1).
+                "probability_positive": float(probabilities[0][1]) if probabilities.shape == (1,2) else 0.0,
                 "confidence": confidence,
                 "details": f"Model: {self.model_id} | Input length: {len(input_text)} | Output length: {len(output_text)}"
             }
@@ -3297,4 +3301,3 @@ if __name__ == "__main__":
     
     logger.info(f"Script finished with exit code {exit_code}.")
     sys.exit(exit_code)
-
