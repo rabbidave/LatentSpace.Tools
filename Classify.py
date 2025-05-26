@@ -4,9 +4,8 @@ Enhanced Standard Transformer-Based Classification and Reranking Service
 with VLM-Powered Markdown Processing and Complete Policy Validation
 
 This enhanced version includes:
-1. VLM-based markdown processing using PleIAs/Pleias-RAG-1B GGUF model
-2. Complete policy validation logic implementation
-3. Preserved codebase indexing functionality
+1. VLM-based markdown processing
+2. Complete policy validation
 4. Comprehensive testing framework
 """
 
@@ -1077,16 +1076,42 @@ class ModernBERTClassifier:
             logits = outputs.logits
             probabilities = logits.softmax(dim=-1).detach().numpy()
             
-            # Assuming binary classification: 0=invalid, 1=valid
-            prediction = int(probabilities.argmax())
-            confidence = float(probabilities.max())
+            # Get the index of the predicted class
+            # Ensure we have a scalar value before conversion
+            pred_idx_val = probabilities.argmax()
+            if isinstance(pred_idx_val, np.ndarray):
+                if pred_idx_val.size != 1:
+                    pred_idx_val = pred_idx_val.reshape(-1)[0]  # Take first element if multi-element array
+                prediction = int(pred_idx_val.item())
+            else:
+                prediction = int(pred_idx_val)
+
+            # Get the confidence score (max probability)
+            conf_score_val = probabilities.max()
+            if isinstance(conf_score_val, np.ndarray):
+                if conf_score_val.size != 1:
+                    conf_score_val = conf_score_val.reshape(-1)[0]  # Take first element if multi-element array
+                confidence = float(conf_score_val.item())
+            else:
+                confidence = float(conf_score_val)
+            
+            prob_positive_value = 0.0
+            if probabilities.shape == (1, 2): # Standard binary classification
+                prob_positive_scalar = probabilities[0][1]
+                if isinstance(prob_positive_scalar, np.ndarray):
+                    prob_positive_value = float(prob_positive_scalar.item())
+                else:
+                    prob_positive_value = float(prob_positive_scalar)
+            elif probabilities.shape == (1, 1): # Single score output
+                prob_single_scalar = probabilities[0][0]
+                if isinstance(prob_single_scalar, np.ndarray):
+                    prob_positive_value = float(prob_single_scalar.item())
+                else:
+                    prob_positive_value = float(prob_single_scalar)
             
             return {
                 "prediction": prediction,
-                # Assuming index 1 of the probabilities array corresponds to the "positive" or "valid" class.
-                # probabilities is typically a 2D array like [[prob_class_0, prob_class_1]] for a single input.
-                # We need to extract the probability for the positive class (e.g., index 1).
-                "probability_positive": float(probabilities[0][1]) if probabilities.shape == (1,2) else 0.0,
+                "probability_positive": prob_positive_value,
                 "confidence": confidence,
                 "details": f"Model: {self.model_id} | Input length: {len(input_text)} | Output length: {len(output_text)}"
             }
@@ -1917,8 +1942,7 @@ class ClassificationAPI:
             logger.error(f"Failed to initialize ModernBERT classifier: {e_mb}", exc_info=True)
         
         try:
-            # model_id for ColBERT is illustrative, actual model loading would be more complex
-            self.colbert_reranker = ColBERTReranker(model_id="placeholder_colbert_model")
+            self.colbert_reranker = ColBERTReranker() # Use class default model ID
         except Exception as e_colbert:
             logger.error(f"Failed to initialize ColBERT reranker: {e_colbert}", exc_info=True)
 
