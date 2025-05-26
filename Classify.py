@@ -4,9 +4,10 @@ Enhanced Standard Transformer-Based Classification and Reranking Service
 with VLM-Powered Markdown Processing and Complete Policy Validation
 
 This enhanced version includes:
-1. VLM-based markdown processing
-2. Complete policy validation
-4. Comprehensive testing framework
+1. VLM-based Documentation Processing
+2. Complete Policy Validation
+3. Auto-Localization of Dependencies
+4. Comprehensive Testing Suite
 """
 
 import os
@@ -2886,23 +2887,23 @@ def test_vlm_processing(temp_test_dir: Path) -> Dict[str, Dict[str, Any]]:
     try:
         logger.info(f"Testing: {test_name}")
         mock_vlm_output_valid = '''Some preamble text...
-```json
-[
-  {{
-    "id": "test_chunk_1_valid",
-    "text": "This is a valid test chunk.",
-    "metadata": {{
-      "h1_section": "Test Section Valid", "is_code_block": false,
-      "chunk_type": "content", "topics": ["testing_valid"]
-    }}
-  }}
-]
+    ```json
+    [
+      {
+        "id": "test_chunk_1_valid",
+        "text": "This is a valid test chunk.",
+        "metadata": {
+          "h1_section": "Test Section Valid", "is_code_block": false,
+          "chunk_type": "content", "topics": ["testing_valid"]
+        }
+      }
+    ]
 ```
 Some postamble text...'''
         parsed_chunks = parse_vlm_output(mock_vlm_output_valid, "test_url_valid")
         assert len(parsed_chunks) == 1, f"Expected 1 chunk, got {len(parsed_chunks)}"
-        assert parsed_chunks["id"] == "test_chunk_1_valid", "Chunk ID mismatch."
-        assert parsed_chunks["metadata"]["source_url"] == "test_url_valid", "Source URL not added."
+        assert parsed_chunks[0]["id"] == "test_chunk_1_valid", "Chunk ID mismatch."
+        assert parsed_chunks[0]["metadata"]["source_url"] == "test_url_valid", "Source URL not added."
         results[test_name] = {"passed": True}
     except Exception as e:
         results[test_name] = {"passed": False, "error": str(e)}
@@ -3245,7 +3246,7 @@ class MyClass:
         
         ret_code_items = code_retriever.retrieve("method one docstring", top_k=1)
         assert len(ret_code_items) == 1, "Retrieval from code index failed for 'method one docstring'."
-        assert ret_code_items["metadata"]["name"] == "method_one", "Retrieved wrong code chunk for 'method one docstring'."
+        assert ret_code_items[0]["metadata"]["name"] == "method_one", "Retrieved wrong code chunk for 'method one docstring'."
         results[test_name] = {"passed": True}
     except Exception as e:
         results[test_name] = {"passed": False, "error": str(e)}
