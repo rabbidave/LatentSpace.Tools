@@ -3178,8 +3178,8 @@ def test_rag_functionality(temp_test_dir: Path) -> Dict[str, Dict[str, Any]]:
         # Test retrieval
         retrieved_items = loaded_retriever.retrieve("AI programming", top_k=1)
         assert len(retrieved_items) == 1, "Retrieval did not return 1 item for 'AI programming'."
-        assert retrieved_items["id"] == "rag_doc_2", "Incorrect document retrieved for 'AI programming'."
-        assert retrieved_items["metadata"].get("topic") == "Python", "Metadata not retrieved correctly."
+        assert retrieved_items[0]["id"] == "rag_doc_2", "Incorrect document retrieved for 'AI programming'."
+        assert retrieved_items[0]["metadata"].get("topic") == "Python", "Metadata not retrieved correctly."
         results[test_name] = {"passed": True}
     except Exception as e:
         results[test_name] = {"passed": False, "error": str(e)}
@@ -3208,7 +3208,7 @@ def test_rag_functionality(temp_test_dir: Path) -> Dict[str, Dict[str, Any]]:
         assert doc_retriever.load_index(), "Failed to load doc RAG index (fallback)."
         ret_docs = doc_retriever.retrieve("API validation", top_k=1)
         assert len(ret_docs) > 0, "No results from doc RAG index (fallback) for 'API validation'."
-        assert "API validation" in ret_docs["text"], "Retrieved doc text mismatch."
+        assert "API validation" in ret_docs[0]["text"], "Retrieved doc text mismatch."
         results[test_name] = {"passed": True}
     except Exception as e:
         results[test_name] = {"passed": False, "error": str(e)}
