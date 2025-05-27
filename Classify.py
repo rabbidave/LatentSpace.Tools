@@ -27,6 +27,8 @@ import re
 import ast
 import urllib.request
 import urllib.parse
+from huggingface_hub import hf_hub_download
+from huggingface_hub.utils import HfHubHTTPError
 from pathlib import Path
 from typing import Dict, List, Optional, Union, Any, Tuple, Set, TYPE_CHECKING
 
@@ -63,6 +65,7 @@ REQUIRED_PACKAGES = [
     "ranx>=0.3.10",
     "requests>=2.25.0",
     "llama-cpp-python",  # Added for VLM markdown processing
+    "huggingface-hub>=0.20.0", # For downloading models from the Hub
 ]
 
 # Global Variables
@@ -182,7 +185,12 @@ def ensure_venv():
     logger.debug(f"ensure_venv: Re-executing with args: {exec_args}") # Log the exact args for os.execv
 
     try:
-        os.execv(python_executable, exec_args)
+        # Preserve environment variables including HF_TOKEN and log them for debugging
+        current_env = os.environ.copy()
+        logger.debug(f"ensure_venv: Environment before execve - HF_TOKEN: {'SET' if 'HF_TOKEN' in current_env else 'NOT SET'}")
+        if 'HF_TOKEN' in current_env:
+            logger.debug(f"ensure_venv: HF_TOKEN value before execve: {current_env['HF_TOKEN'][:5]}...")
+        os.execve(python_executable, exec_args, current_env)
     except OSError as e:
         logger.error(f"os.execv failed: {e}", exc_info=True)
         sys.exit(1)
@@ -195,18 +203,37 @@ def ensure_venv():
 class MarkdownReformatterVLM:
     """VLM-powered markdown reformatter using GGUF models via llama-cpp-python."""
     
-    DEFAULT_MODEL_ID = "PleIAs/Pleias-RAG-1B"
-    
-    def __init__(self, model_path_or_id: str, **kwargs):
-        self.model_path_or_id = model_path_or_id
+    # Default for general use if no specific model/path is given in some contexts (not used by tests directly)
+    DEFAULT_HF_REPO_ID_FALLBACK = "PleIAs/Pleias-RAG-1B"
+    # Specific default GGUF file for the fallback repo (assuming one like this exists)
+    DEFAULT_GGUF_FILENAME_FALLBACK = "pleias-rag-1b.Q4_K_M.gguf"
+
+    # Default for testing, as per user request
+    DEFAULT_TEST_HF_REPO_ID = "bartowski/google_gemma-3-4b-it-qat-GGUF"
+    DEFAULT_TEST_GGUF_FILENAME = "google_gemma-3-4b-it-qat-IQ4_NL.gguf"
+
+    def __init__(self, model_path_or_repo_id: str, gguf_filename_in_repo: Optional[str] = None, **kwargs):
         self.model: Optional[llama_cpp.Llama] = None
         self.is_loaded = False
-        
+
+        self.model_load_path: Optional[str] = None # For existing local paths
+        self.hf_repo_id: Optional[str] = None
+        self.gguf_filename_to_download: Optional[str] = None
+
+        if os.path.exists(model_path_or_repo_id) and os.path.isfile(model_path_or_repo_id):
+            self.model_load_path = model_path_or_repo_id
+            logger.info(f"MarkdownReformatterVLM configured to use local model path: {self.model_load_path}")
+        else:
+            self.hf_repo_id = model_path_or_repo_id
+            self.gguf_filename_to_download = gguf_filename_in_repo or self.DEFAULT_GGUF_FILENAME_FALLBACK # Fallback if only repo_id given
+            # For the specific test case, DEFAULT_TEST_GGUF_FILENAME will be passed as gguf_filename_in_repo
+            logger.info(f"MarkdownReformatterVLM configured to use Hugging Face model: repo_id='{self.hf_repo_id}', filename='{self.gguf_filename_to_download}'.")
+
         # Model parameters
         self.n_ctx = kwargs.get('n_ctx', 4096)
         self.n_gpu_layers = kwargs.get('n_gpu_layers', 0)
         self.verbose = kwargs.get('verbose', False)
-        
+
     def load_model(self) -> bool:
         """Load the GGUF model."""
         if not LLAMA_CPP_AVAILABLE:
@@ -214,30 +241,48 @@ class MarkdownReformatterVLM:
             return False
             
         try:
-            logger.info(f"Loading VLM model: {self.model_path_or_id}")
+            model_path_to_load = self.model_load_path
+
+            if not model_path_to_load and self.hf_repo_id and self.gguf_filename_to_download:
+                logger.info(f"Attempting to download GGUF model '{self.gguf_filename_to_download}' from repo '{self.hf_repo_id}'...")
+                current_hf_token = os.environ.get("HF_TOKEN")
+                logger.debug(f"HF_TOKEN value passed to hf_hub_download: {'SET' if current_hf_token else 'NOT SET'}")
+                if current_hf_token:
+                    logger.debug(f"HF_TOKEN (first 5 chars for check): {current_hf_token[:5]}..." if len(current_hf_token) > 5 else "Token too short for prefix.")
+                try:
+                    model_path_to_load = hf_hub_download(
+                        repo_id=self.hf_repo_id,
+                        filename=self.gguf_filename_to_download,
+                        token=current_hf_token # Explicitly pass the fetched token
+                    )
+                    logger.info(f"Successfully downloaded model to: {model_path_to_load}")
+                except HfHubHTTPError as e_http:
+                    logger.error(f"HTTP error downloading model {self.hf_repo_id}/{self.gguf_filename_to_download}: {e_http}", exc_info=True)
+                    return False
+                except Exception as e_download: # Catch other potential download errors
+                    logger.error(f"Failed to download model {self.hf_repo_id}/{self.gguf_filename_to_download}: {e_download}", exc_info=True)
+                    return False
             
-            # Handle model path resolution
-            if os.path.exists(self.model_path_or_id):
-                model_path = self.model_path_or_id
-            else:
-                # For HuggingFace model IDs, user should provide local GGUF path
-                logger.error(f"Model path not found: {self.model_path_or_id}")
-                logger.info("Please provide a local path to a GGUF model file.")
+            if not model_path_to_load or not os.path.exists(model_path_to_load):
+                logger.error(f"Final model path for VLM not found or not resolved: {model_path_to_load if model_path_to_load else 'None'}")
+                if not self.model_load_path and self.hf_repo_id : # If it was an HF attempt
+                    logger.info(f"Ensure the Hugging Face repo '{self.hf_repo_id}' and filename '{self.gguf_filename_to_download}' are correct, and HF_TOKEN is valid if required.")
                 return False
-            
+
+            logger.info(f"Loading GGUF model from path: {model_path_to_load}")
             self.model = llama_cpp.Llama(
-                model_path=model_path,
+                model_path=str(model_path_to_load), # Ensure it's a string
                 n_ctx=self.n_ctx,
                 n_gpu_layers=self.n_gpu_layers,
                 verbose=self.verbose
             )
             
             self.is_loaded = True
-            logger.info(f"Successfully loaded VLM model from {model_path}")
+            logger.info(f"Successfully loaded VLM model from {model_path_to_load}")
             return True
             
         except Exception as e:
-            logger.error(f"Failed to load VLM model: {e}", exc_info=True)
+            logger.error(f"Error during VLM inference: {e}", exc_info=True)
             return False
     
     def reformat(self, markdown_text: str, prompt_template: str) -> str:
@@ -2706,6 +2751,9 @@ def main_cli():
 
     # Test command
     parser_test = subparsers.add_parser("test", help="Run comprehensive internal tests for the system.")
+    parser_test.epilog = ("For detailed instructions on localizing, executing, and "
+                          "troubleshooting the test suite, especially for IDE-based development or "
+                          "automated agents, please refer to the 'ide-agent.md' guide in the project documentation.")
     parser_test.add_argument("--test-type", choices=['all', 'vlm', 'policy', 'rag', 'codebase'], default='all', help="Specific category of tests to run.")
     parser_test.add_argument("--verbose", action="store_true", help="Enable verbose logging during tests.")
 
@@ -2851,23 +2899,26 @@ def test_vlm_processing(temp_test_dir: Path) -> Dict[str, Dict[str, Any]]:
     results: Dict[str, Dict[str, Any]] = {}
     
     # Test 1: VLM Model Loading (Conceptual Mock for this test structure)
-    test_name = "vlm_model_loading_conceptual"
+    test_name = "vlm_model_loading" # Renamed from _conceptual
     try:
-        logger.info(f"Testing: {test_name}")
-        # This tests the MarkdownReformatterVLM class structure, not actual loading here.
-        # Actual loading depends on LLAMA_CPP_AVAILABLE and a valid model path.
-        # We assume if LLAMA_CPP_AVAILABLE=False, it correctly skips loading.
-        # If True, it would try to load; for tests, we'd need a mock path or tiny model.
-        # Here, we just check if the class can be instantiated.
-        # A dummy path is used; load_model() should handle its absence gracefully.
-        formatter = MarkdownReformatterVLM("dummy_nonexistent_model.gguf")
-        can_load = formatter.load_model() # Expected to be False if dummy path
+        logger.info(f"Testing: {test_name} - This may download '{MarkdownReformatterVLM.DEFAULT_TEST_GGUF_FILENAME}' from '{MarkdownReformatterVLM.DEFAULT_TEST_HF_REPO_ID}' if not cached.")
+        formatter = MarkdownReformatterVLM(
+            model_path_or_repo_id=MarkdownReformatterVLM.DEFAULT_TEST_HF_REPO_ID,
+            gguf_filename_in_repo=MarkdownReformatterVLM.DEFAULT_TEST_GGUF_FILENAME
+        )
+        can_load = formatter.load_model()
         
         if LLAMA_CPP_AVAILABLE:
-             results[test_name] = {"passed": not can_load, "details": "load_model correctly returned False for dummy path."}
+            # If llama-cpp is available, we expect the download and load to succeed.
+            # This assertion relies on HF_TOKEN being set correctly by the user for the test environment.
+            results[test_name] = {
+                "passed": can_load,
+                "details": f"Attempted to download and load Gemma GGUF. Load success: {can_load}. Ensure HF_TOKEN is valid if this fails."
+            }
         else: # If llama-cpp not available, load_model also returns False
-            results[test_name] = {"passed": not can_load, "details": "load_model correctly returned False as llama-cpp is unavailable."}
-
+            results[test_name] = {
+                "passed": not can_load, "details": "load_model correctly returned False as llama-cpp is unavailable."
+            }
     except Exception as e:
         results[test_name] = {"passed": False, "error": str(e)}
     
