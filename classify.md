@@ -44,7 +44,7 @@ The following demonstrates a **strict PII detection policy** that focuses on ide
 
 ### Key Policy Components:
 
-- **`colbert_input_sensitivity`**: Enables sensitivity analysis using DistilBERT (legacy class name)
+- **`colbert_input_sensitivity`**: Enables sensitivity analysis using DistilBERT
 - **`disallowed_colbert_input_classes`**: Specifically blocks PII content
 - **`documentation_assistance`**: Provides contextual help when violations occur
 
@@ -607,6 +607,8 @@ python classify.py rag index \
 * **Python 3.8+**
 * **RAM**: 16–32GB+ for VLMs (especially VLM Markdown Processor). Placeholder models and CPU-only operation require less.
 * **GPU** CUDA-enabled GPU (optional) for `llama-cpp-python` with `n_gpu_layers > 0`
+
+Note: DistilBERT (e.g. transformers) used for MaxSim; legacy class names & endpoints to be cleaned up
 
 ---
 
