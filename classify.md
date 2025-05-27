@@ -5,9 +5,11 @@ This document describes `classify.py`, a **Data Classification and Monitoring Se
 
 It orchestrates fine-tuned transformers, GGUF-based vision-language models (VLMs), and smart retrieval pipelines to provide a governance layer for multimodal content including text, image, and video.
 
-## **'N-Validation(s)' @ N-Granularity**
+## **'N-JSON(s)' @ N-Granularity**
 
-Integrate seamlessly using a single `/service/validate` endpoint that accepts content and policy specs. The service handles classification, policy enforcement, and contextual assistance.
+Integrate seamlessly using a single `/service/validate` endpoint that accepts content and policy specs. 
+
+The service handles classification, policy enforcement, and contextual assistance.
 
 **Highlights:**
 
@@ -42,7 +44,7 @@ The following demonstrates a **strict PII detection policy** that focuses on ide
 
 ### Key Policy Components:
 
-- **`colbert_input_sensitivity`**: Enables sensitivity analysis using ColBERT
+- **`colbert_input_sensitivity`**: Enables sensitivity analysis using DistilBERT (legacy class name)
 - **`disallowed_colbert_input_classes`**: Specifically blocks PII content
 - **`documentation_assistance`**: Provides contextual help when violations occur
 
@@ -575,13 +577,13 @@ python classify.py rag index \
 
 **Why VLM Helps for RAG Indexing:**
 
-* **🎯 Semantic Chunking**: VLMs understand content and structure to create semantically coherent chunks. Related ideas stay grouped, improving retrieval context.
+* **🎯 Semantic Chunking**: VLMs understand content; related ideas stay grouped, improving retrieval context.
 
-* **🏗️ Structure Preservation**: VLMs identify and preserve document structure (headers, lists). This metadata enables targeted search/filtering.
+* **🏗️ Structure Preservation**: VLMs identify and preserve document metadata enabling targeted search/filtering.
 
 * **💻 Code Block Handling**: VLMs treat code blocks as complete units, preventing awkward splits. Metadata flags code-heavy chunks.
 
-* **🏷️ Contextual Metadata Extraction**: VLMs extract topics, keywords, audience, and difficulty level, enriching metadata for powerful queries.
+* **🏷️ Contextual Metadata **: VLMs extract topics, keywords, audience, and difficulty level, enriching metadata for powerful queries.
 
 * **🔄 Enhanced Fallback**: Python-based fallback processor respects headers and code blocks when VLM unavailable.
 
