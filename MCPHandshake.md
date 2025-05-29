@@ -1,223 +1,121 @@
-## Target-State Architecture for Zero-Standing Privileges
+# AI Security Architecture
 
-A secure integration pattern enabling AI assistants to interact with sensitive business systems through coordinated, transaction-specific authentication protocols with built-in defense-in-depth.
+## via AI Passports
 
-## Overview
+AI security is fundamentally about observability with context. We track inputs, outputs, and model behavior patterns, then compare against established baselines to detect anomalies — logged to a per-integration API with per-deploy specifics and end-to-end configuration details (Yay! SR11-7v2!! Go Governance!!).
 
-The MCP Handshake Architecture provides an enterprise-grade security framework for AI integrations, implementing a defense-in-depth strategy with clear separation of concerns. It uses a two-phase handshake mechanism ensuring transaction-specific authorization with zero standing privileges, aligning with modern zero trust principles and data classification requirements.
+![End-to-End Architecture](end-to-end.jpg)
 
-### Key Components and Terminology
+---
 
-- **AI Assistant** implements the **Local MCP Client** - initiates requests but cannot directly access sensitive APIs
-- **Confirmation Agent** implements the **Remote MCP Service** - acts as a secure gateway validating all operations
-- **State Store** - provides atomic token management (typically Redis, DynamoDB, or similar with TTL support)
-- **User Identity Provider** - external system for user authentication and session token issuance
-- **Target Enterprise APIs** - back-end systems containing sensitive data or operations
+## Core Components
 
-## Core Architecture Principles
+### 1. Input/Output Logging
+- Track prompts, responses, and processing patterns
+- Establish baselines of normal vs. abnormal behavior
+- Apply data classification (PICR) for appropriate handling
 
-### 1. Dual-Agent Authority with Coordinated Components
+### 2. Real-Time Monitoring
+- Compare current behavior against established patterns
+- Alert on deviations that exceed thresholds
+- Apply lightweight checks broadly, heavier verification selectively
 
-The architecture implements separation of powers through a dual-validation pattern:
+### 3. Verification & Testing
+- Validate models against known attack patterns
+- Implement continuous security testing
+- Maintain audit trails for compliance
 
-- **Local MCP Client (implemented by AI Assistant)**: Initiates transaction requests and manages client-side workflow, but cannot directly access sensitive systems.
+### 4. System Breadcrumb
 
-- **Remote MCP Service (implemented by Confirmation Agent)**: Acts as a secure gateway that independently validates operations, manages token lifecycle, and is the only component with access to sensitive API credentials. This separation ensures that even if the AI Assistant is compromised, it cannot directly access target systems.
+The **System Breadcrumb** is a SHA-256 hash of the initial `use_case_registry.json`, used as a shared secret for deployment identity verification and auditability. It provides immutable context anchoring for logs and requests.
 
-- **Secure State Store**: Tracks ephemeral token states and ensures atomic consumption, typically implemented using Redis, DynamoDB, or a similar system with TTL support and atomic operations to prevent race conditions during token validation.
+**Artifacts:**
+- `use_case_registry.json` – Source of truth for the AI Passport
+- `system_breadcrumb.txt` – Hash artifact derived from the above
+- `tool_invocation.log` – Operational log entries referencing the breadcrumb
 
-Each component maintains isolated security contexts connected through cryptographically verified handshakes, with initial trust bootstrapped through TLS, certificate validation, and secure secret management.
+<details>
+<summary><strong>🔐 Python: Generate System Breadcrumb</strong></summary>
 
-### 2. Ephemeral Action Authorization with Replay Protection
+```python
+# generate_breadcrumb.py
+import json, hashlib
 
-Every sensitive operation requires explicit, time-bound authorization with built-in replay protection:
-- **Phase 1: Request Authorization**: Authenticated user requests a specific operation with parameters
-- **Phase 2: Nonce Generation & Parameter Binding**: A unique nonce (ephemeral token) is generated and cryptographically bound to the parameter hash
-- **Phase 3: Atomic Execution & Token Consumption**: Operation proceeds only after validation succeeds, and the token is atomically consumed
+def generate_system_breadcrumb(json_path: str) -> str:
+    with open(json_path, 'r') as f:
+        data = json.load(f)
+    encoded = json.dumps(data, sort_keys=True).encode('utf-8')
+    breadcrumb = hashlib.sha256(encoded).hexdigest()
 
-This approach provides two-factor replay protection:
-1. The ephemeral token acts as a nonce (number used once) that is invalidated after use
-2. The parameter hash binds this nonce to the exact operation parameters
+    with open('system_breadcrumb.txt', 'w') as out:
+        out.write(breadcrumb)
 
-For example, if calling a function `transferFunds({fromAccount: "12345", toAccount: "67890", amount: 500})`, the `parameter_hash` would be `SHA256(JSON.stringify({fromAccount: "12345", toAccount: "67890", amount: 500}))`. This ensures that the exact same parameters must be provided in Phase 2, preventing an attacker from changing parameters (e.g., changing the amount or destination account) between authorization and execution.
+    return breadcrumb
 
-### 3. Tiered Access Control
-
-The architecture implements a tiered approach to API security based on data classification:
-
-1. **Public (Tier 1)**: 
-   - Basic input validation and sanitization
-   - Available with minimal authentication
-   - Lowest sensitivity level
-   - *Examples*: Public reference data, open documentation, non-personalized information
-
-2. **Internal (Tier 2)**:
-   - Public key verification for request authenticity
-   - Parameter sanitization and schema validation
-   - Medium-low sensitivity
-   - *Examples*: Internal reports, departmental dashboards, non-sensitive operations
-
-3. **Confidential (Tier 3)**:
-   - Comprehensive validation using multiple techniques based on context:
-     - Regex pattern validation for structured inputs
-     - Schema validation for complex objects
-     - Code analysis (AST or alternatives) for execution requests
-   - Parameter transformation or sanitization required
-   - Medium-high sensitivity
-   - *Examples*: Financial operations, PII access, business transactions
-
-4. **Restricted (Tier 4)**:
-   - Includes all lower-tier validations
-   - Secondary validation by independent system
-   - Highest sensitivity level
-   - May require time-delayed execution or human approval workflows
-   - *Examples*: Administrative actions, critical infrastructure changes, high-value transactions
-
-## Implementation Reference Architecture
-
-```
-┌─────────────────┐                   ┌─────────────────────────┐
-│                 │                   │                         │
-│   AI Assistant  │                   │ User Identity Provider  │
-│  (Primary Agent)│                   │      (Session Auth)     │
-│                 │                   │                         │
-└───────┬─────────┘                   └───────────┬─────────────┘
-        │                                         │ Session Token
-        │                                         │ (e.g., JWT)
-        │ 1. Auth Req (Tool + Params + Metadata)  ▼
-        ├─────────────────────────────────>┌─────────────────┐
-        │         (Session Token)          │                 │
-        │                                  │ Confirmation    │
-        │ 2. Ephemeral Tx Token <----------│ Agent + State   │
-        │                                  │ Store           │
-        │ 3. Execute Tool (Tool + Params)  │                 │
-        ├─────────────────────────────────>│                 │
-        │   (Session Token +               │                 │
-        │    Ephemeral Tx Token)           │                 │
-        │                                  │                 │
-        │ 4. Result + Proof <--------------│                 │
-        │                                  └───────┬─────────┘
-        │                                          │
-        │                                          │ Validated Call
-        │                                          ▼
-        │                            ┌─────────────────────────┐
-        │                            │                         │
-        │                            │    Secure VPC/Cloud     │
-        │                            │    Environment          │
-        │                            │  ┌───────────────────┐  │
-        │                            │  │                   │  │
-        │                            │  │ Enterprise APIs   │  │
-        │                            │  │ & Services        │  │
-        │                            │  │                   │  │
-        │                            │  └───────────────────┘  │
-        │                            │                         │
-        │                            └─────────────────────────┘
+# Example usage:
+# python generate_breadcrumb.py
 ```
 
-## Reference Implementation Schema
+</details>
 
-```json
-{
-  "schema": "MCP.Handshake.v1",
-  "transaction": {
-    "id": "uuid-for-this-specific-request",
-    "timestamp": "ISO-8601-timestamp",
-    "user": {
-      "id": "authenticated-user-id",
-      "roles": ["role1", "role2"]
-    }
-  },
-  "tool": {
-    "name": "target-operation-name",
-    "version": "1.0.0",
-    "sensitivity": "CONFIDENTIAL", // PUBLIC, INTERNAL, CONFIDENTIAL, RESTRICTED
-    "parameters_hash": "sha256-of-parameters-object",
-    "target_api": {
-      "name": "enterprise-api-identifier",
-      "operation": "specific-api-operation"
-    }
-  },
-  "authentication": {
-    "session_token": "jwt-or-other-identity-token",
-    "ephemeral_token": "single-use-transaction-bound-token",
-    "expiry": "ISO-8601-timestamp-short-lifespan",
-    "token_state": {
-      "consumed": false,
-      "consumption_timestamp": null
-    }
-  },
-  "validation": {
-    "status": "APPROVED", // APPROVED, DENIED, PENDING
-    "timestamp": "ISO-8601-timestamp",
-    "checks_performed": ["parameter_validation", "pattern_validation", "code_analysis"],
-    "tier_level": "CONFIDENTIAL",
-    "reason": "Optional explanation if DENIED"
-  },
-  "audit": {
-    "request_ip": "client-ip-address",
-    "client_id": "application-identifier",
-    "integration_id": "specific-integration-identifier",
-    "receipt": {
-      "transaction_proof": "cryptographic-signature-of-transaction-details", // Typically HMAC or digital signature of transaction data
-      "timestamp": "ISO-8601-timestamp"
-    }
-  },
-  "error_handling": {
-    "status_code": null, // HTTP status code if error occurred
-    "error_type": null,  // AUTH_ERROR, VALIDATION_ERROR, EXECUTION_ERROR, etc.
-    "message": null,     // Human-readable error message
-    "retry_allowed": true // Whether retry is permitted for this error
-  }
-}
-```
+---
 
-## Operational Lifecycle
+## Role-Based Implementation
 
-### Integration Setup Phase
-1. **Enterprise Team** (Provides infra, standards, and requirements):
-   - Defines data classification scheme and sensitivity tiers
-   - Establishes validation requirements per tier
-   - Publishes standards and requirements
+Each team has clear responsibilities:
 
-2. **IT/Ops Team**:
-   - Configures runtime environment
-   - Sets up monitoring and logging
-   - Deploys Remote MCP Service and State Store infrastructure
+- **Enterprise**: Set security standards, define classifications  
+- **IT/Ops**: Configure runtime environments, validation parameters  
+- **Application Teams**: Implement controls, monitor business metrics  
 
-3. **Application Team**:
-   - Implements Local MCP Client integration
-   - Configures field mappings and classifications
-   - Develops business-specific integration logic
+![Personas and Roles](personas.jpg)
 
-### Transaction Execution Flow
+---
 
-1. **Authentication & Authorization**:
-   - User authenticates using standard OAuth/JWT flows
-   - Local MCP Client collects operation request details
-   - Client determines sensitivity tier for the requested operation
+## 🧭 C4 Architecture Views
 
-2. **Handshake Phase 1: Request Authorization**:
-   - Local MCP Client sends request with tool name, parameters, tier metadata
-   - Remote MCP Service validates session token and user permissions
-   - Parameters are hashed to create a unique operation fingerprint
-   - Server generates transaction ID and ephemeral token with short expiry
-   - Token is cryptographically bound to the parameter hash
+| View       | Description              | Link                                       |
+|------------|--------------------------|--------------------------------------------|
+| Context    | High-level system context | ![Context](C4%20-%20Context.jpg)           |
+| Container  | Deployment components     | ![Container](C4%20-%20Container.png)       |
+| Component  | Key functional elements   | ![Component](C4%20-%20Component.png)       |
+| Code       | Implementation details    | ![Code](C4%20-%20Code.png)                 |
+| Personas   | User/stakeholder roles    | ![Personas](C4%20-%20Personas.png)         |
 
-3. **Handshake Phase 2: Execute Operation**:
-   - Local MCP Client immediately sends execution request with:
-     - Original parameters (will be re-hashed server-side for verification)
-     - Session token
-     - Ephemeral transaction token
-   - Remote MCP Service:
-     - Re-hashes parameters and verifies match with original hash
-     - Atomically consumes the token to prevent replay attacks
-     - Performs validation checks based on sensitivity tier:
-       - Tier 1-2: Basic input validation
-       - Tier 3: Pattern validation, AST validation
-       - Tier 4: Secondary confirmation agent validation
+---
 
-4. **Operation Execution & Response**:
-   - Target API operation proceeds only after all validations succeed
-   - Execution is logged with complete audit trail
-   - Results and cryptographic proof receipts returned to client
-   - State Store maintains record of consumed token
+## Implementation Resources
+
+- [API Schema Definition](schema.json)  
+- [Logging Implementation](LoggingAPI.py)  
+- [Validation Documentation](validation-docs.md)  
+- `use_case_registry.json` – Defines the deployment’s purpose and scope  
+- `system_breadcrumb.txt` – Canonical SHA-256 fingerprint  
+- `tool_invocation.log` – Signed and referenceable activity logs  
+
+---
+
+## Business Benefits
+
+- **Compliance**: Meet regulatory requirements with audit trails  
+- **Security**: Detect and mitigate novel AI-specific threats  
+- **Operational**: Faster incident response with clear accountability  
+
+---
+
+## Getting Started
+
+1. Define your data classification scheme using PICR  
+2. Create a use case registry entry (`use_case_registry.json`)  
+3. Generate your system breadcrumb  
+4. Attach breadcrumb ID to all tool invocation logs  
+5. Deploy monitoring, alerting, and validation checks  
+
+---
+
+## Additional Resources
+
+- [Original Architecture Overview](a16zSummary.png)  
+- [Detailed Architecture](a16zDetail.png)  
+- [Annotated Architecture](a16zDetailAnnotated.png)  
+- [LLMs and Observability (Video)](LLMs%20x%20Observability.mp4)
