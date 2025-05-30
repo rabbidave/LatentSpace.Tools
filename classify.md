@@ -565,7 +565,7 @@ python classify.py index-codebase \
 
 ## 📊 Data Formats
 
-### I/O Validation Format (for training ModernBERT - conceptual)
+### I/O Validation Format
 
 ```json
 {
@@ -575,7 +575,7 @@ python classify.py index-codebase \
 }
 ```
 
-### Sensitivity Classification Format (for training ColBERT - conceptual)
+### Sensitivity Classification Format
 
 ```json
 {"text": "SSN: 123-45-6789", "class_name": "Class 1: PII"}
