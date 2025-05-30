@@ -630,8 +630,8 @@ python classify.py test --test-type rag --verbose
     |      (using CLI)          |      |       Python Code Files)     |      |  SentenceTransformers HF)   |
     +---------------------------+      +------------------------------+      +-----------------------------+
                  |                                |
-                 | (1b. `index-docs`,            |
-                 |      `index-codebase`,        v
+                 | (1b. `index-docs`,             |
+                 |      `index-codebase`,         v
                  |      `rag index`)   +------------------------------+
                  |                      | RAG Index Build Process      |
                  |                      | (VLM/Fallback/AST Chunking,  |
@@ -663,8 +663,8 @@ python classify.py test --test-type rag --verbose
                                        |  |    (Applies rules from loaded Policy for current API Class) | |
                                        |  +-----------------------+------------------+-----------------+  |
                                        |              |           |                  |                    |
-                                       |  (Policy    |           | (Data for VLM)   | (Data for RAG)      |
-                                       |   Checks)   v           v                  v                     |
+                                       |  (Policy     |           | (Data for VLM)   | (Data for RAG)     |
+                                       |   Checks)    v           v                  v                    |
                                        |  +----------------+  +----------------+  +----------------+      |
                                        |  | BERT/ColBERT   |  | VLM for Items  |  | RAG Querier    |      |
                                        |  | Model Services |  | Model Service  |  | (Doc Assist)   |      |
