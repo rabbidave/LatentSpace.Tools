@@ -695,4 +695,4 @@ Key Data/Artifact Flows:
         --> Invokes BERT/ColBERT Model Services (using HF Models)
         --> Invokes VLM for Items Service (using GGUF Model)
         --> (If violations & configured) Invokes RAG Querier (using RAG Index) for Documentation Assistance
-     --> API Client Response
+        --> API Client Response
