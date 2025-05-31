@@ -5,7 +5,7 @@ This document describes `classify.py`, a **Data Classification and Monitoring Se
 
 It orchestrates fine-tuned transformers, GGUF-based vision-language models (VLMs) for documentation processing, and smart retrieval pipelines to provide a governance layer for multimodal content including text, image, and video.
 
-## ** 🔎 N-JSON(s) @ N-Granularity**
+## **🔎 N-JSON(s) @ N-Granularity**
 
 Integrate seamlessly using a single `/service/validate` endpoint that accepts content and policy specs.
 
