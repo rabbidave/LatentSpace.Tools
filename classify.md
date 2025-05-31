@@ -1,56 +1,23 @@
-
 # Data Classification & Monitoring Service
 ###### (Policy-Driven, VLM-Enhanced, Local-First)
 
 This document describes `classify.py`, a **Data Classification and Monitoring Service** that delivers plug-and-play policy-based validation for any application (read: JSON object).
 
-It orchestrates fine-tuned transformers, GGUF-based vision-language models (VLMs), and smart retrieval pipelines to provide a governance layer for multimodal content including text, image, and video.
+It orchestrates fine-tuned transformers, GGUF-based vision-language models (VLMs) for documentation processing, and smart retrieval pipelines to provide a governance layer for multimodal content including text, image, and video.
 
-## **'N-JSON(s)' @ N-Granularity**
+## **📊 N-JSON(s) @ N-Granularity**
 
-Integrate seamlessly using a single `/service/validate` endpoint that accepts content and policy specs. 
+Integrate seamlessly using a single `/service/validate` endpoint that accepts content and policy specs.
 
 The service handles classification, policy enforcement, and contextual assistance.
 
 **Highlights:**
 
-* **Drop-in Integration**: Single-Endpoint Validation
-* **Natively Multi-Modal**: via [llama-cpp-python](https://github.com/abetlen/llama-cpp-python) for GGUF models
-* **Policy-Driven**: Configurable via external JSON
-* **VLM-Enhanced Policy Generation**: Bootstrap policies from markdown requirements
-* **Context-Aware Help**: Self-Documenting RAG for policy violations
-
----
-
-
-### 🧠 1. VLM-Powered Policy Generation
-
-The service can utilize a Vision-Language Model (VLM) to interpret a markdown document describing service requirements, data handling obligations, or API guidelines, and then **generate a draft `ClassificationAPI` policy JSON object**. This kickstarts your policy configuration.
-
-```bash
-# Generate a policy JSON from your requirements markdown
-python classify.py generate-policy-from-markdown \
-    --markdown-file ./path/to/your/requirements.md \
-    --vlm-model-path "your-gguf-model-repo/model.gguf" \
-    --output-policy-file ./generated_policy.json \
-    --policy-name MyNewGeneratedPolicy
-```
-*(This generated policy can then be added to your main `policy_config.json`)*
-
-### 📚 2. VLM-Driven RAG Indexing for Documentation
-
-VLMs enable advanced processing of markdown documentation when building RAG indexes, enhancing the "Documentation Assistance" feature.
-
-*   **🎯 Semantic Chunking**: VLMs understand content; related ideas stay grouped, improving retrieval context.
-*   **🏗️ Structure Preservation**: VLMs identify and preserve document metadata enabling targeted search/filtering.
-*   **💻 Code Block Handling**: VLMs treat code blocks as complete units, preventing awkward splits. Metadata flags code-heavy chunks.
-*   **🏷️ Contextual Metadata**: VLMs can extract topics, keywords, and more, enriching metadata for powerful queries (future enhancements).
-*   **✂️ Secondary Chunking**: Large chunks (from VLM or fallback) get split with overlap to respect embedding model limits.
-
-**Benefits Over Traditional RAG Processing:**
-
-*   **🔍 Better Search Relevance**: Semantic chunks create better embeddings and more relevant retrieval for documentation assistance.
-*   **💡 Context-Aware Documentation Assistance**: More precise and relevant help for policy violations.
+*   **Drop-in Integration**: Single-Endpoint Validation
+*   **Natively Multi-Modal**: VLM support for advanced RAG processing, n-modalities, etc.
+*   **Policy-Driven**: Configurable via external JSON
+*   **VLM-Enhanced Policy Generation**: Bootstrap policies from markdown requirements (*Coming Soon!*)
+*   **Context-Aware Help**: Self-Documenting RAG for policy violations
 
 ---
 
@@ -92,6 +59,22 @@ The following demonstrates a **strict PII detection policy** that focuses on ide
 * `POST /rag/query` — Query a loaded RAG index (typically the global documentation index if configured).
 * `GET /status` — Check service and component health.
 
+---
+
+### 🧠 1. VLM-Driven RAG for 'Intelligent Exception Handling'
+
+VLMs enable advanced processing of markdown documentation when building RAG indexes, enhancing the "Documentation Assistance" feature.
+
+*   **🎯 Semantic Chunking**: VLMs understand content; related ideas stay grouped, improving retrieval context.
+*   **🏗️ Structure Preservation**: VLMs identify and preserve document metadata enabling targeted search/filtering.
+*   **💻 Code Block Handling**: VLMs split code blocks intelligently, preventing awkward splits; metadata flags code-heavy chunks.
+*   **🏷️ Contextual Metadata**: VLMs can extract topics, keywords, and more, enriching metadata for powerful queries.
+*   **✂️ Secondary Chunking**: Large chunks (from VLM or fallback) get split with overlap to respect embedding model limits.
+
+**Benefits Over Traditional RAG Processing:**
+
+*   **🔍 Better Search Relevance**: Semantic chunks create better embeddings and more relevant retrieval for documentation assistance.
+*   **💡 Context-Aware Documentation Assistance**: More precise and relevant help for policy violations.
 ---
 
 ## 🔗 Integration Examples
@@ -243,7 +226,7 @@ class DocumentValidator:
         }
         
         if metadata:
-            validation_payload['metadata_fields'] = metadata # Note: API expects 'metadata' not 'metadata_fields' at top level
+            validation_payload['custom_metadata_passed_by_client'] = metadata
         
         try:
             response = requests.post(
@@ -355,15 +338,16 @@ if __name__ == "__main__":
 
 ---
 
-### 3. Multimodal Moderation 
+### 3. Multimodal Moderation (*VLM for Item Processing - Coming Soon*)
 
-**Scenario**: Moderate user-generated content including text and images for policy compliance.
+**Scenario**: Moderate user-generated content including text and images for policy compliance. VLM-based analysis of image/video content is planned.
 
 <details>
 <summary><strong>📋 Click to expand Content Moderation example</strong></summary>
 
 ```bash
 # 🖼️ Example: Multipart form data with image upload
+# (Note: VLM processing of 'uploaded_image' is a planned feature)
 curl -X POST http://classify-service:8080/service/validate \
   -F 'json_payload={"api_class":"UserGeneratedContentPolicy","input_text":"Check out this cool image I found!","input_items":[{"id":"user_image_1","type":"image","filename_in_form":"uploaded_image"}]}' \
   -F 'uploaded_image=@./path/to/your/test_image.jpg'
@@ -378,6 +362,7 @@ import time # Ensure time is imported for request_id
 def moderate_user_content(text_content, image_file_path=None):
     """
     Moderate user-generated content for policy compliance.
+    (Note: VLM processing of image_file_path is a planned feature)
     """
     payload = {
         "api_class": "UserGeneratedContentPolicy",
@@ -423,7 +408,7 @@ def moderate_user_content(text_content, image_file_path=None):
 # 🎯 Example usage
 # text = "Hey everyone, here's my personal info: email john@example.com"
 # image_path = "./user_uploads/suspicious_image.jpg" # Make sure this path is valid for testing
-# moderation_result = moderate_user_content(text, image_path)
+# moderation_result = moderate_user_content(text, image_path) # VLM processing of image_path is conceptual for this example
 # if moderation_result['approved']:
 #     print("✅ Content approved for publication")
 # else:
@@ -433,11 +418,12 @@ def moderate_user_content(text_content, image_file_path=None):
 ```
 
 **🔧 Required Policy Configuration** (`UserGeneratedContentPolicy` in `policy_config.json`):
+*Note: The `item_processing_rules` section below describes planned VLM functionality.*
 
 ```json
 {
   "UserGeneratedContentPolicy": {
-    "description": "Moderates user-generated text and images for inappropriate content and PII.",
+    "description": "Moderates user-generated text and images for inappropriate content and PII. (VLM Image Analysis - Coming Soon)",
     "colbert_input_sensitivity": true,
     "disallowed_colbert_input_classes": ["Class 1: PII", "HateSpeechClass", "ViolentContentClass"],
     "item_processing_rules": [
@@ -445,7 +431,8 @@ def moderate_user_content(text_content, image_file_path=None):
         "item_type": "image",
         "vlm_processing": {
           "required": true,
-          "prompt": "Analyze this image for nudity, violence, hate symbols, or other policy-violating content. Describe any text present."
+          "prompt": "Analyze this image for nudity, violence, hate symbols, or other policy-violating content. Describe any text present.",
+          "status": "coming_soon"
         },
         "derived_text_checks": {
           "colbert_sensitivity": true,
@@ -470,10 +457,10 @@ def moderate_user_content(text_content, image_file_path=None):
 }
 ```
 
-**🔄 How it works:**
+**🔄 How it works (with planned VLM enhancements):**
 1. **Text Analysis**: User's text checked for PII, hate speech, violent content.
-2. **Image Processing**: VLM analyzes uploaded images for policy violations.
-3. **Multi-Modal Validation**: VLM description text also checked for violations.
+2. **Image Processing (Coming Soon)**: VLM will analyze uploaded images for policy violations.
+3. **Multi-Modal Validation (Coming Soon)**: VLM description text will also be checked for violations.
 4. **Keyword Filtering**: Blocked keywords provide additional safeguards.
 5. **Contextual Help**: Violations trigger community guideline suggestions from the RAG index.
 
@@ -522,23 +509,10 @@ python classify.py create-example \
     # --docs-vlm-model-path "/path/to/local/doc_processing_model.gguf" \
     # --processing-strategy vlm 
 ```
-*The `index_path` in your policy's `documentation_assistance` section should point to the RAG index created here (e.g., `./my_service_examples/my_docs_rag`).*
+*The `index_path` in your policy's `documentation_assistance` section should point to the RAG index created by this command. For example, if `output-dir` is `./my_service_examples` and `docs-rag-index-name` is `my_docs_rag`, the generated policy might contain `index_path: "my_docs_rag"`. This path is resolved by the server relative to its current working directory (e.g., if running the server from `./my_service_examples`, it would find `./my_docs_rag`). For robust deployment, consider using absolute paths or paths known to be correct relative to the server's runtime CWD.*
 
-### 3. Generate API Policy from Markdown (VLM-driven)
 
-Use a VLM to draft a new policy definition by analyzing a markdown document that outlines requirements or guidelines.
-
-```bash
-python classify.py generate-policy-from-markdown \
-    --markdown-file ./path/to/your/service_requirements.md \
-    --vlm-model-path "your-gguf-model-repo/policy_generation_model.gguf" \
-    # Optional: --gguf-filename "specific_file.gguf" (if vlm-model-path is repo_id)
-    --output-policy-file ./new_generated_policy.json \
-    --policy-name MyServicePolicyFromMarkdown
-```
-*The output JSON will contain `{"MyServicePolicyFromMarkdown": { ...generated policy... }}`. You can then integrate this into your main `policy_config.json`.*
-
-### 4. Create Custom RAG Index
+### 3. Create Custom RAG Index
 
 Build a RAG index from any JSONL corpus for use in `documentation_assistance` or general querying.
 
@@ -550,7 +524,7 @@ python classify.py rag index \
   --metadata-fields category topic_id # Optional: list of metadata fields in your JSONL
 ```
 
-### 5. Index Python Codebase for RAG
+### 4. Index Python Codebase for RAG
 
 Create a RAG index directly from a Python script to enable querying its structure (functions, classes).
 
@@ -587,7 +561,7 @@ python classify.py index-codebase \
 ## 💻 System Requirements
 
 * **Python 3.8+**
-* **RAM**: 16–32GB+ recommended for optimal performance with VLMs (especially for VLM Markdown Processor and Policy Generation). Placeholder models and CPU-only operation require less.
+* **RAM**: 16–32GB+ recommended for optimal performance with VLMs (especially for VLM Markdown Processor and planned VLM Policy Generation/Item Processing). Placeholder models and CPU-only operation require less.
 * **GPU**: CUDA-enabled GPU (optional but recommended) for hardware acceleration with `llama-cpp-python` (set `n_gpu_layers > 0`).
 
 ---
@@ -607,16 +581,17 @@ python classify.py test --test-type rag --verbose
 
  classify.py - High-Level Architecture
 
-    +---------------------------+      +------------------------------+      +-----------------------------+
-    |   Developer / Operator    |----->|   Raw Markdown (for Policy)  |<-----| VLM Model (GGUF for Policy) |
-    |      (using CLI)          |      +------------------------------+      +-----------------------------+
-    +---------------------------+                 |
-                 |                                |
-                 | (1a. `generate-policy-...`)   v
-                 |                      +------------------------------+
-                 |                      | VLM Policy Generation Tool   |
-                 |                      | (MarkdownReformatterVLM)     |
-                 |                      +------------------------------+
+    +---------------------------+      +-------------------------------------------------+      +---------------------------------------------------+
+    |   Developer / Operator    |----->|   Raw Markdown (for Policy)                     |<-----| VLM Model (GGUF for Policy)                       |
+    |      (using CLI)          |      |   (Coming Soon!)                                |      |            (Coming Soon!)                       |
+    +---------------------------+      +-------------------------------------------------+      +---------------------------------------------------+
+                 |
+                 |
+                 | (1a. `generate-policy-...` - Coming Soon!)
+                 |                      +-------------------------------------------------+
+                 |                      | VLM Policy Generation Tool                      |
+                 |                      | (MarkdownReformatterVLM - for Policy)|
+                 |                      +-------------------------------------------------+
                  |                                |
                  |                                v
                  |                      +------------------------------+
@@ -629,7 +604,7 @@ python classify.py test --test-type rag --verbose
     |   Developer / Operator    |----->| Raw Content (Docs Markdown,  |<-----| VLM/Embedding Models (GGUF, |
     |      (using CLI)          |      |       Python Code Files)     |      |  SentenceTransformers HF)   |
     +---------------------------+      +------------------------------+      +-----------------------------+
-                 |                                |
+                 |                                |                     (GGUF VLM for Docs Markdown Processing is used here)
                  | (1b. `index-docs`,             |
                  |      `index-codebase`,         v
                  |      `rag index`)   +------------------------------+
@@ -649,50 +624,52 @@ python classify.py test --test-type rag --verbose
     ---------------------------------- API SERVER RUNTIME -------------------------------------------
                                                        |
                                                        v
-    +---------------------------+      +------------------------------------------------------------------+
-    |      API Client           |<---->|                      Classification API Server                   |
-    | (e.g., Web App, Script)   |      |                  (Flask / Waitress + Custom Logic)               |
-    +---------------------------+      |                                                                  |
-                                       |  +-------------------------+  +--------------------------------+ |
-                                       |  | Policy Loader & Cache   |  | RAG Retriever Loader & Cache   | |
-                                       |  +-------------------------+  +--------------------------------+ |
-                                       |              |                               |                   |
-                                       |              v                               v                   |
-                                       |  +------------------------------------------------------------+  |
-                                       |  |                       Validation Engine                     | |
-                                       |  |    (Applies rules from loaded Policy for current API Class) | |
-                                       |  +-----------------------+------------------+-----------------+  |
-                                       |              |           |                  |                    |
-                                       |  (Policy     |           | (Data for VLM)   | (Data for RAG)     |
-                                       |   Checks)    v           v                  v                    |
-                                       |  +----------------+  +----------------+  +----------------+      |
-                                       |  | BERT/ColBERT   |  | VLM for Items  |  | RAG Querier    |      |
-                                       |  | Model Services |  | Model Service  |  | (Doc Assist)   |      |
-                                       |  +-------+--------+  +-------+--------+  +-------+--------+      |
-                                       |          | (HF Models)         | (GGUF Model)         | (Uses RAG Index)
-                                       |          v                     v                      v          |
-                                       |  +----------------+  +----------------+  +----------------+      |
-                                       |  | HuggingFace    |  | GGUF (llama.cpp|  | RAG Index      |      |
-                                       |  | Model Artifacts|  | based) Models  |  | Artifacts      |      |
-                                       |  +----------------+  +----------------+  +----------------+      |
-                                       +------------------------------------------------------------------+
+    +---------------------------+      +-------------------------------------------------------------------------------+
+    |      API Client           |<---->|                      Classification API Server                                |
+    | (e.g., Web App, Script)   |      |                  (Flask / Waitress + Custom Logic)                            |
+    +---------------------------+      |                                                                               |
+                                       |  +-------------------------+  +--------------------------------+              |
+                                       |  | Policy Loader & Cache   |  | RAG Retriever Loader & Cache   |              |
+                                       |  +-------------------------+  +--------------------------------+              |
+                                       |              |                               |                                |
+                                       |              v                               v                                |
+                                       |  +------------------------------------------------------------+               |
+                                       |  |                       Validation Engine                     |              |
+                                       |  |    (Applies rules from loaded Policy for current API Class) |              |
+                                       |  +-----------------------+------------------+-----------------+               |
+                                       |              |           |                  |                                 |
+                                       |  (Policy     |           | (Data for VLM)   | (Data for RAG)                  |
+                                       |   Checks)    v           v                  v                                 |
+                                       |  +----------------+  +-----------------------------+  +----------------+      |
+                                       |  | BERT/ColBERT   |  | VLM for Items               |  | RAG Querier    |      |
+                                       |  | Model Services |  | Model Service (Coming Soon!)|  | (Doc Assist)   |      |
+                                       |  +-------+--------+  +--------------+--------------+  +-------+--------+      |
+                                       |          | (HF Models)                | (Planned: GGUF/HF VLM)     | (Uses RAG Index)
+                                       |          v                            v                            v          |
+                                       |  +----------------+  +-----------------------------+  +----------------+      |
+                                       |  | HuggingFace    |  | VLM Models (Coming Soon!)   |  | RAG Index      |      |
+                                       |  | Model Artifacts|  | (e.g. GGUF / HF Pipeline)   |  | Artifacts      |      |
+                                       |  +----------------+  +-----------------------------+  +----------------+      |
+                                       +-------------------------------------------------------------------------------+
 
 Key Data/Artifact Flows:
 
 (1a) VLM Policy Generation:
      Raw Markdown (Policy Desc.) + VLM Model --> [VLM Policy Gen Tool] --> Generated Policy Config File
+     **(Note: This VLM-driven policy generation from markdown is a conceptual feature and is NOT currently implemented - Coming Soon!).**
 
 (1b) RAG Index Generation:
-     Raw Content (Docs/Code) + VLM/Embedding Models --> [RAG Index Build] --> RAG Index Artifacts
+     Raw Content (Docs/Code) + VLM (for docs)/Embedding Models --> [RAG Index Build] --> RAG Index Artifacts
+     (VLM for document processing via GGUF models is implemented.)
 
 (2) API Initialization:
-     Generated Policy Config File --> [API Server/Policy Loader]
+     Policy Config File --> [API Server/Policy Loader]
      RAG Index Artifacts --> [API Server/RAG Retriever Loader]
 
 (3) API Request Validation:
      API Client Request --> [API Server/Validation Engine]
         --> Applies rules from loaded Policy
         --> Invokes BERT/ColBERT Model Services (using HF Models)
-        --> Invokes VLM for Items Service (using GGUF Model)
+        --> Invokes VLM for Items Service (Conceptual for full GGUF support - **Coming Soon!** Current item processing relies on HF Transformers `pipeline` if a model is configured, but broader GGUF VLM integration for items is planned.)
         --> (If violations & configured) Invokes RAG Querier (using RAG Index) for Documentation Assistance
         --> API Client Response
