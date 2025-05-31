@@ -1,11 +1,11 @@
-# Data Classification & Monitoring Service
+# 📊 Data Classification & Monitoring Service
 ###### (Policy-Driven, VLM-Enhanced, Local-First)
 
 This document describes `classify.py`, a **Data Classification and Monitoring Service** that delivers plug-and-play policy-based validation for any application (read: JSON object).
 
 It orchestrates fine-tuned transformers, GGUF-based vision-language models (VLMs) for documentation processing, and smart retrieval pipelines to provide a governance layer for multimodal content including text, image, and video.
 
-## **📊 N-JSON(s) @ N-Granularity**
+## ** 🔎 N-JSON(s) @ N-Granularity**
 
 Integrate seamlessly using a single `/service/validate` endpoint that accepts content and policy specs.
 
@@ -61,7 +61,7 @@ The following demonstrates a **strict PII detection policy** that focuses on ide
 
 ---
 
-### 🧠 1. VLM-Driven RAG for 'Intelligent Exception Handling'
+### 🧠 VLM-Driven RAG for 'Intelligent Exception Handling'
 
 VLMs enable advanced processing of markdown documentation when building RAG indexes, enhancing the "Documentation Assistance" feature.
 
