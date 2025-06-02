@@ -27,7 +27,7 @@ AI security is fundamentally about observability with context. We track inputs, 
 
 ### 4. System Breadcrumb
 
-The **System Breadcrumb** is a SHA-256 hash of the initial `use_case_registry.json`, used as a shared secret for deployment identity verification and auditability. It provides immutable context anchoring for logs and requests.
+The **System Breadcrumb** is a SHA-256 (or contemporaneous equivalent) hash of the initial `use_case_registry.json`, used as a shared secret for deployment identity verification and auditability. It provides immutable context anchoring for logs and requests.
 
 **Artifacts:**
 - `use_case_registry.json` – Source of truth for the AI Passport
