@@ -158,7 +158,7 @@ Access is tiered based on data classification:
 ```ini
 ┌─────────────────┐    Standard MCP 2.1    ┌──────────────────┐
 │   AI Assistant  │◄──── Single Phase ─────┤ Standard MCP 2.1 │
-│ (Class 4-5 ops) │      Bearer Token       │   Authorization  │
+│ (Class 4-5 ops) │      Bearer Token      │   Authorization  │
 └─────────────────┘                        └──────────────────┘
 
 ```
@@ -173,7 +173,7 @@ Access is tiered based on data classification:
           │ Sensitive Operations (send_money, refund, etc.)
           ▼
 ┌─────────────────┐    2-Phase Flow        ┌──────────────────┐
-│ Enhanced Local  │◄─── Phase 1: Auth ────┤ Zero-Trust MCP   │
+│ Enhanced Local  │◄─── Phase 1: Auth  ────┤ Zero-Trust MCP   │
 │ MCP Client      │◄─── Phase 2: Execute ──┤ Extension Service│
 └─────────────────┘                        └────────┬─────────┘
                                                     │ Class 1-2 Only
