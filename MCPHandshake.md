@@ -1,12 +1,12 @@
-## Target-State Architecture for Zero-Standing Privileges
+### Target-State Architecture for Zero-Standing Privileges
 
 A secure integration pattern enabling AI assistants to interact with sensitive business systems through coordinated, transaction-specific authentication protocols with built-in defense-in-depth.
 
-## Overview
+#### Overview
 
 The MCP Handshake Architecture provides an enterprise-grade security framework for AI integrations, implementing a defense-in-depth strategy with clear separation of concerns. It uses a two-phase handshake mechanism ensuring transaction-specific authorization with zero standing privileges, aligning with modern zero trust principles and data classification requirements.
 
-### Key Components and Terminology
+#### Key Components and Terminology
 
 - **AI Assistant** implements the **Local MCP Client** - initiates requests but cannot directly access sensitive APIs
 - **Confirmation Agent** implements the **Remote MCP Service** - acts as a secure gateway validating all operations
@@ -14,68 +14,38 @@ The MCP Handshake Architecture provides an enterprise-grade security framework f
 - **User Identity Provider** - external system for user authentication and session token issuance
 - **Target Enterprise APIs** - back-end systems containing sensitive data or operations
 
-## Core Architecture Principles
+#### Core Architecture Principles
 
-### 1. Dual-Agent Authority with Coordinated Components
+##### 1. Dual-Agent Authority with Coordinated Components
 
 The architecture implements separation of powers through a dual-validation pattern:
 
 - **Local MCP Client (implemented by AI Assistant)**: Initiates transaction requests and manages client-side workflow, but cannot directly access sensitive systems.
+- **Remote MCP Service (implemented by Confirmation Agent)**: Acts as a secure gateway that independently validates operations, manages token lifecycle, and is the only component with access to sensitive API credentials.
+- **Secure State Store**: Tracks ephemeral token states and ensures atomic consumption.
+   Each component maintains isolated security contexts connected through cryptographically verified handshakes.
 
-- **Remote MCP Service (implemented by Confirmation Agent)**: Acts as a secure gateway that independently validates operations, manages token lifecycle, and is the only component with access to sensitive API credentials. This separation ensures that even if the AI Assistant is compromised, it cannot directly access target systems.
+##### 2. Ephemeral Action Authorization with Replay Protection
 
-- **Secure State Store**: Tracks ephemeral token states and ensures atomic consumption, typically implemented using Redis, DynamoDB, or a similar system with TTL support and atomic operations to prevent race conditions during token validation.
+Every sensitive operation requires explicit, time-bound authorization:
 
-Each component maintains isolated security contexts connected through cryptographically verified handshakes, with initial trust bootstrapped through TLS, certificate validation, and secure secret management.
+- **Phase 1: Request Authorization**: Authenticated user requests an operation.
+- **Phase 2: Nonce Generation & Parameter Binding**: A unique nonce (ephemeral token) is generated and cryptographically bound to the parameter hash.
+- **Phase 3: Atomic Execution & Token Consumption**: Operation proceeds after validation; token is atomically consumed.
+   This provides two-factor replay protection (ephemeral token + parameter hash binding).
 
-### 2. Ephemeral Action Authorization with Replay Protection
+##### 3. Tiered Access Control
 
-Every sensitive operation requires explicit, time-bound authorization with built-in replay protection:
-- **Phase 1: Request Authorization**: Authenticated user requests a specific operation with parameters
-- **Phase 2: Nonce Generation & Parameter Binding**: A unique nonce (ephemeral token) is generated and cryptographically bound to the parameter hash
-- **Phase 3: Atomic Execution & Token Consumption**: Operation proceeds only after validation succeeds, and the token is atomically consumed
+Access is tiered based on data classification:
 
-This approach provides two-factor replay protection:
-1. The ephemeral token acts as a nonce (number used once) that is invalidated after use
-2. The parameter hash binds this nonce to the exact operation parameters
+1. **Public (Tier 1)**: Basic validation, minimal auth (e.g., public reference data).
+2. **Internal (Tier 2)**: PKI verification, parameter sanitization (e.g., internal reports).
+3. **Confidential (Tier 3)**: Comprehensive validation (Regex, Schema, AST), parameter transformation (e.g., financial operations, PII access).
+4. **Restricted (Tier 4)**: All lower-tier validations + independent secondary validation, highest sensitivity (e.g., admin actions, critical changes).
 
-For example, if calling a function `transferFunds({fromAccount: "12345", toAccount: "67890", amount: 500})`, the `parameter_hash` would be `SHA256(JSON.stringify({fromAccount: "12345", toAccount: "67890", amount: 500}))`. This ensures that the exact same parameters must be provided in Phase 2, preventing an attacker from changing parameters (e.g., changing the amount or destination account) between authorization and execution.
+#### Implementation Reference Architecture
 
-### 3. Tiered Access Control
-
-The architecture implements a tiered approach to API security based on data classification:
-
-1. **Public (Tier 1)**: 
-   - Basic input validation and sanitization
-   - Available with minimal authentication
-   - Lowest sensitivity level
-   - *Examples*: Public reference data, open documentation, non-personalized information
-
-2. **Internal (Tier 2)**:
-   - Public key verification for request authenticity
-   - Parameter sanitization and schema validation
-   - Medium-low sensitivity
-   - *Examples*: Internal reports, departmental dashboards, non-sensitive operations
-
-3. **Confidential (Tier 3)**:
-   - Comprehensive validation using multiple techniques based on context:
-     - Regex pattern validation for structured inputs
-     - Schema validation for complex objects
-     - Code analysis (AST or alternatives) for execution requests
-   - Parameter transformation or sanitization required
-   - Medium-high sensitivity
-   - *Examples*: Financial operations, PII access, business transactions
-
-4. **Restricted (Tier 4)**:
-   - Includes all lower-tier validations
-   - Secondary validation by independent system
-   - Highest sensitivity level
-   - May require time-delayed execution or human approval workflows
-   - *Examples*: Administrative actions, critical infrastructure changes, high-value transactions
-
-## Implementation Reference Architecture
-
-```
+```ini
 ┌─────────────────┐                   ┌─────────────────────────┐
 │                 │                   │                         │
 │   AI Assistant  │                   │ User Identity Provider  │
@@ -112,9 +82,14 @@ The architecture implements a tiered approach to API security based on data clas
         │                            │  └───────────────────┘  │
         │                            │                         │
         │                            └─────────────────────────┘
+
 ```
 
-## Reference Implementation Schema
+---
+
+<!-- Page Break -->
+
+### Reference Implementation Schema (MCP.Handshake.v1)
 
 ```json
 {
@@ -122,102 +97,114 @@ The architecture implements a tiered approach to API security based on data clas
   "transaction": {
     "id": "uuid-for-this-specific-request",
     "timestamp": "ISO-8601-timestamp",
-    "user": {
-      "id": "authenticated-user-id",
-      "roles": ["role1", "role2"]
-    }
+    "user": { "id": "authenticated-user-id", "roles": ["role1", "role2"] }
   },
   "tool": {
-    "name": "target-operation-name",
-    "version": "1.0.0",
-    "sensitivity": "CONFIDENTIAL", // PUBLIC, INTERNAL, CONFIDENTIAL, RESTRICTED
-    "parameters_hash": "sha256-of-parameters-object",
-    "target_api": {
-      "name": "enterprise-api-identifier",
-      "operation": "specific-api-operation"
-    }
+    "name": "target-operation-name", "version": "1.0.0",
+    "sensitivity": "CONFIDENTIAL", "parameters_hash": "sha256-of-parameters-object",
+    "target_api": { "name": "enterprise-api-identifier", "operation": "specific-api-operation" }
   },
   "authentication": {
-    "session_token": "jwt-or-other-identity-token",
-    "ephemeral_token": "single-use-transaction-bound-token",
+    "session_token": "jwt-or-other-identity-token", "ephemeral_token": "single-use-transaction-bound-token",
     "expiry": "ISO-8601-timestamp-short-lifespan",
-    "token_state": {
-      "consumed": false,
-      "consumption_timestamp": null
-    }
+    "token_state": { "consumed": false, "consumption_timestamp": null }
   },
   "validation": {
-    "status": "APPROVED", // APPROVED, DENIED, PENDING
-    "timestamp": "ISO-8601-timestamp",
+    "status": "APPROVED", "timestamp": "ISO-8601-timestamp",
     "checks_performed": ["parameter_validation", "pattern_validation", "code_analysis"],
-    "tier_level": "CONFIDENTIAL",
-    "reason": "Optional explanation if DENIED"
+    "tier_level": "CONFIDENTIAL", "reason": "Optional explanation if DENIED"
   },
   "audit": {
-    "request_ip": "client-ip-address",
-    "client_id": "application-identifier",
+    "request_ip": "client-ip-address", "client_id": "application-identifier",
     "integration_id": "specific-integration-identifier",
-    "receipt": {
-      "transaction_proof": "cryptographic-signature-of-transaction-details", // Typically HMAC or digital signature of transaction data
-      "timestamp": "ISO-8601-timestamp"
-    }
+    "receipt": { "transaction_proof": "cryptographic-signature-of-transaction-details", "timestamp": "ISO-8601-timestamp" }
   },
   "error_handling": {
-    "status_code": null, // HTTP status code if error occurred
-    "error_type": null,  // AUTH_ERROR, VALIDATION_ERROR, EXECUTION_ERROR, etc.
-    "message": null,     // Human-readable error message
-    "retry_allowed": true // Whether retry is permitted for this error
+    "status_code": null, "error_type": null, "message": null, "retry_allowed": true
   }
 }
+
 ```
 
-## Operational Lifecycle
+### Operational Lifecycle
 
-### Integration Setup Phase
-1. **Enterprise Team** (Provides infra, standards, and requirements):
-   - Defines data classification scheme and sensitivity tiers
-   - Establishes validation requirements per tier
-   - Publishes standards and requirements
+**Integration Setup Phase:** Enterprise, IT/Ops, and Application teams collaborate to define classifications, configure environments, and implement integration logic.
+**Transaction Execution Flow:**
 
-2. **IT/Ops Team**:
-   - Configures runtime environment
-   - Sets up monitoring and logging
-   - Deploys Remote MCP Service and State Store infrastructure
+1. User authenticates; Local MCP Client collects request details.
+2. **Handshake Phase 1 (Request Authorization)**: Local Client sends request; Remote Service validates session, hashes parameters, generates ephemeral token bound to hash.
+3. **Handshake Phase 2 (Execute Operation)**: Local Client sends parameters and tokens; Remote Service re-verifies hash, atomically consumes token, performs tiered validation.
+4. Operation executes if all checks pass; results and proof returned.
 
-3. **Application Team**:
-   - Implements Local MCP Client integration
-   - Configures field mappings and classifications
-   - Develops business-specific integration logic
+---
 
-### Transaction Execution Flow
+#### Data Classification Mapping
 
-1. **Authentication & Authorization**:
-   - User authenticates using standard OAuth/JWT flows
-   - Local MCP Client collects operation request details
-   - Client determines sensitivity tier for the requested operation
+| Data Class | Description                     | Examples                                | Security Extensions Required      |
+|------------|---------------------------------|-----------------------------------------|-----------------------------------|
+| **Class 1: PII** | Most sensitive personal data      | SSN, payment methods, credentials       | per-integration specifics         |
+| **Class 2: Sensitive Personal Data** | Financial txns, personal details | Txn history, refunds, balance         | Transaction-bound tokens + add'l  |
+| **Class 3: Confidential Personal Data** | Business-sensitive operations   | Customer profiles, invoices, processing | Transaction-bound tokens + enhanced validation |
+| **Class 4: Internal Data** | Standard business operations    | Exchange rates, general account info  | Standard MCP 2.1 authorization    |
+| **Class 5: Public Data** | Non-sensitive operations        | Public API endpoints, documentation   | No additional authorization       |
 
-2. **Handshake Phase 1: Request Authorization**:
-   - Local MCP Client sends request with tool name, parameters, tier metadata
-   - Remote MCP Service validates session token and user permissions
-   - Parameters are hashed to create a unique operation fingerprint
-   - Server generates transaction ID and ephemeral token with short expiry
-   - Token is cryptographically bound to the parameter hash
+#### Required Custom Extensions
 
-3. **Handshake Phase 2: Execute Operation**:
-   - Local MCP Client immediately sends execution request with:
-     - Original parameters (will be re-hashed server-side for verification)
-     - Session token
-     - Ephemeral transaction token
-   - Remote MCP Service:
-     - Re-hashes parameters and verifies match with original hash
-     - Atomically consumes the token to prevent replay attacks
-     - Performs validation checks based on sensitivity tier:
-       - Tier 1-2: Basic input validation
-       - Tier 3: Pattern validation, AST validation
-       - Tier 4: Secondary confirmation agent validation
+1. **Transaction-Bound Ephemeral Tokens (Class 1-3)**: Cryptographically bind tokens to operation parameters (toolName, paramsHash, userId, dataClass, short expiry).
+2. **Atomic Token Consumption (Class 1-3)**: Prevent replay via one-time use (e.g., Redis `EVAL` for GET & DEL).
 
-4. **Operation Execution & Response**:
-   - Target API operation proceeds only after all validations succeed
-   - Execution is logged with complete audit trail
-   - Results and cryptographic proof receipts returned to client
-   - State Store maintains record of consumed token
+**Class 4-5 Operations (Internal/Public Data)**: Standard single-phase MCP 2.1 (bearer token).
+
+```ini
+┌─────────────────┐    Standard MCP 2.1    ┌──────────────────┐
+│   AI Assistant  │◄──── Single Phase ─────┤ Standard MCP 2.1 │
+│ (Class 4-5 ops) │      Bearer Token       │   Authorization  │
+└─────────────────┘                        └──────────────────┘
+
+```
+
+**Class 1-3 Operations (PII/Sensitive/Confidential)**: Two-phase zero-trust.
+
+```ini
+┌─────────────────┐                        ┌──────────────────┐
+│   AI Assistant  │                        │ Standard MCP 2.1 │
+│ (Class 1-3 ops) │◄─── Session Token ─────┤   Authorization  │
+└─────────┬───────┘                        └──────────────────┘
+          │ Sensitive Operations (send_money, refund, etc.)
+          ▼
+┌─────────────────┐    2-Phase Flow        ┌──────────────────┐
+│ Enhanced Local  │◄─── Phase 1: Auth ────┤ Zero-Trust MCP   │
+│ MCP Client      │◄─── Phase 2: Execute ──┤ Extension Service│
+└─────────────────┘                        └────────┬─────────┘
+                                                    │ Class 1-2 Only
+                                                    ▼
+                                         ┌──────────────────┐
+                                         │ Confirmation     │
+                                         │ Agent Validator  │
+                                         └──────────────────┘
+
+```
+
+#### Financial API Tool Classification Examples
+
+```typescript
+const TOOL_CLASSIFICATIONS = {
+  "create_payment_method": 1, "update_customer_payment": 1, // Class 1
+  "send_money": 2, "refund_transaction": 2,                 // Class 2
+  "create_invoice": 3, "process_payment": 3,                // Class 3
+  "list_transactions": 4, "get_account_balance": 4,         // Class 4
+  "get_exchange_rate": 5                                    // Class 5
+};
+
+```
+
+Class 4-5 operations use standard MCP 2.1. Class 1-3 layer zero-trust extensions, determined by `TOOL_CLASSIFICATIONS`.
+
+#### Implementation Priority
+
+1. Phase 1: Class 4-5 ops with standard MCP 2.1.
+2. Phase 2: Add transaction-bound tokens for Class 3 ops.
+3. Phase 3: Integrate dual-agent validation for Class 1-2 ops.
+4. Phase 4: Full zero-trust pipeline with comprehensive audit.
+
+---
