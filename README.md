@@ -91,7 +91,7 @@ Each team has clear responsibilities:
 
 - [API Schema Definition](schema.json)
 - [Logging Implementation](LoggingAPI.py)
-- [Validation Documentation](validation-docs.md)
+- [Tool Classification](MCPHandshake.md)
 - `use_case_registry.json` – Defines the deployment’s purpose and scope
 - `system_breadcrumb.txt` – Canonical SHA-256 fingerprint
 - `tool_invocation.log` – Signed and referenceable activity logs
