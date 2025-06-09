@@ -29,7 +29,7 @@ A pebble consists of three core components:
 
 * **`<action>`**: A description of the work that was just completed to produce this pebble.
 * **`<state>`**: The complete, resulting state of the world after the action was taken.
-* **`<proof>`**: A cryptographic hash (e.g., a signature using an AI Passport breadcrumb) that guarantees the authenticity and integrity of the `state`.
+* **`<proof>`**: A cryptographic hash (e.g., [AI Passport](https://github.com/rabbidave/LatentSpace.Tools/blob/main/AI_Passports.md) breadcrumb) that guarantees the authenticity and integrity of the `state`.
 
 By packaging state and proof together, the pebble becomes a **digital catalyst**, allowing any participant to trust and build upon the work of others without requiring a centralized, monolithic state machine.
 
