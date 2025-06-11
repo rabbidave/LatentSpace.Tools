@@ -25,8 +25,8 @@ While our contribution aims to foster open standards, patenting this PayPal-deve
 2.  **Enabling Open Standards & Ecosystem Growth:** Our intention is to make the patented technology available via open licensing terms (e.g., RAND or royalty-free) for adopted standards. This allows broad adoption by the ecosystem (e.g., Google for A2A communication), fostering a more secure overall AI landscape which benefits PayPal.
 3.  **Influence and Leadership:** Holding relevant IP strengthens PayPal's position as an innovator and our voice in the evolution of AI security standards.
 4.  **Strategic Asset:** Formalizes and protects our R&D investment, providing a recognized asset that can be valuable in partnerships (e.g., with Anthropic, Google).
-5.  **Distinction from Prior Art/Related Tools:** While building upon foundational concepts and potentially interacting with other tools (like data classification services), the MCP Handshake's *specific combination of architectural elements and operational mechanics for secure AI agent tool invocation* is novel. The "Classification CLI" you are familiar with, for example, determines data sensitivity; our handshake *uses* that sensitivity level to apply the correct security tier for an *action*. The handshake protocol itself is the distinct invention.
-
+5.  **Distinction from Prior Art/Related Tools:** While building upon foundational concepts and potentially interacting with other tools (like data classification services), the MCP Handshake's *specific combination of architectural elements and operational mechanics for secure AI agent tool invocation* is novel.
+   
 **Alignment with PayPal Goals:**
 
 This initiative directly supports PayPal's objectives for deploying AI that is secure, auditable, and trustworthy, enhancing our reputation and operational integrity.
