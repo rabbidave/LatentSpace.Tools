@@ -1,6 +1,5 @@
-
 import os
-os.environ["HF_TOKEN"] = "hf_<insert_token_here>"
+os.environ["HF_TOKEN"] = "hf_TokenHere"
 
 #!/usr/bin/env python
 """
@@ -146,121 +145,78 @@ def setup_signal_handling():
         signal.signal(signal.SIGTERM, signal_handler)
 
 def ensure_venv():
-    """Checks for venv, creates/installs if needed, and re-executes if not active."""
-    # USER_PROVIDED_TOKEN_CHECK_START
-    print(f"ensure_venv: Python sees HF_TOKEN: {os.environ.get('HF_TOKEN')}")
-    # USER_PROVIDED_TOKEN_CHECK_END
-    venv_path = os.path.abspath(VENV_DIR)
+    """
+    Checks for required packages and installs them into the user's site-packages if missing.
+    This method avoids creating a virtual environment, which can fail due to OS permissions.
+    """
+    import sys
+    import subprocess
+    import importlib.util
+
+    # A representative subset of packages to check for existence.
+    # Checking every single one is slow; if these exist, the others likely do too.
+    packages_to_check = {
+        "transformers": "transformers",
+        "PIL": "Pillow",
+        "cv2": "opencv-python",
+        "sentence_transformers": "sentence-transformers",
+        "timm": "timm",
+        "llama_cpp": "llama-cpp-python"
+    }
     
-    # Determine the expected Python executable path within the venv
-    if sys.platform == "win32":
-        expected_python_executable = os.path.join(venv_path, "Scripts", "python.exe")
-        pip_executable_in_venv = os.path.join(venv_path, "Scripts", "pip.exe")
-    else:
-        expected_python_executable = os.path.join(venv_path, "bin", "python")
-        pip_executable_in_venv = os.path.join(venv_path, "bin", "pip")
+    all_found = True
+    for module_name, package_name in packages_to_check.items():
+        spec = importlib.util.find_spec(module_name)
+        if spec is None:
+            logger.warning(f"Core dependency '{package_name}' not found. Triggering installation.")
+            all_found = False
+            break # No need to check further
 
-    # Normalize paths for reliable comparison
-    is_running_in_target_venv_executable = os.path.normcase(os.path.abspath(sys.executable)) == os.path.normcase(os.path.abspath(expected_python_executable))
-    
-    # Also check sys.prefix, as sys.executable might be a shim in some cases
-    is_sys_prefix_in_target_venv = os.path.normcase(sys.prefix).startswith(os.path.normcase(venv_path))
-
-    actually_in_target_venv = is_running_in_target_venv_executable or is_sys_prefix_in_target_venv
-    logger.debug(f"Venv check: sys.executable match: {is_running_in_target_venv_executable}, sys.prefix match: {is_sys_prefix_in_target_venv}. Effective in venv: {actually_in_target_venv}")
-
-
-    if actually_in_target_venv:
-        logger.info(f"Running with Python interpreter from '{VENV_DIR}'. Venv considered active.")
-        # Optional: Check if a core dependency is importable. If not, attempt reinstall ONCE without re-exec.
-        # This handles cases where the venv exists but might be corrupted.
-        try: # Quick check for a key dependency
-            import sentence_transformers
-            logger.debug("Key dependency (sentence_transformers) seems available in venv.")
-        except ImportError:
-            logger.warning("Key dependency (sentence_transformers) not importable despite being in venv. Attempting re-install of all packages...")
-            try:
-                subprocess.run([pip_executable_in_venv, "install", "--disable-pip-version-check"] + REQUIRED_PACKAGES, check=True, capture_output=True, text=True)
-                logger.info("Re-installation of packages in existing venv completed.")
-            except subprocess.CalledProcessError as e:
-                logger.error(f"Error during re-installation of packages in existing venv: {e.stderr}")
-                # Proceeding, but imports might fail later. Script will not loop on this.
+    if all_found:
+        logger.info("Core dependencies seem to be installed. Proceeding with execution.")
         return True
 
-    logger.info(f"Setting up virtual environment at '{venv_path}'...")
+    logger.info("Attempting to install all required packages into the user's site-packages (`--user`).")
     
-    if not os.path.isdir(venv_path):
-        try:
-            venv.create(venv_path, with_pip=True, system_site_packages=False)
-            logger.info("Virtual environment created successfully.")
-        except Exception as e:
-            logger.error(f"Error creating virtual environment: {e}", exc_info=True)
-            sys.exit(1)
-
-    if sys.platform == "win32":
-        python_executable = os.path.join(venv_path, "Scripts", "python.exe")
-        pip_executable = os.path.join(venv_path, "Scripts", "pip.exe")
-    else:
-        python_executable = os.path.join(venv_path, "bin", "python")
-        pip_executable = os.path.join(venv_path, "bin", "pip")
-
-    if not os.path.exists(python_executable) or not os.path.exists(pip_executable):
-        logger.error(f"Virtual environment setup failed. Executables not found.")
-        sys.exit(1)
-
+    install_command = [
+        sys.executable, "-m", "pip", "install", "--user", "--upgrade", "--disable-pip-version-check"
+    ] + REQUIRED_PACKAGES
+    
     try:
-        subprocess.run([pip_executable, "install", "--upgrade", "pip", "--disable-pip-version-check"],
-                      check=True, capture_output=True, text=True)
-        logger.info("Pip upgraded successfully.")
-    except subprocess.CalledProcessError as e:
-        logger.warning(f"Failed to upgrade pip: {e.stderr}")
+        # We use Popen and stream output to avoid the appearance of hanging
+        process = subprocess.Popen(install_command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding='utf-8')
+        
+        print("\n--- Installing Packages (this may take several minutes) ---")
+        while True:
+            output = process.stdout.readline()
+            if output == '' and process.poll() is not None:
+                break
+            if output:
+                print(output.strip())
+        print("--- Installation Process Finished ---\n")
 
-    current_packages_to_install = list(REQUIRED_PACKAGES)
-    
-    logger.info(f"Installing required packages: {', '.join(current_packages_to_install)}")
-    install_command = [pip_executable, "install", "--disable-pip-version-check"] + current_packages_to_install
-    try:
-        result = subprocess.run(install_command, check=True, capture_output=True, text=True)
-        logger.info("Required packages installed successfully.")
-    except subprocess.CalledProcessError as e:
-        logger.error(f"Error installing packages: {e.stderr}")
-        sys.exit(1)
+        rc = process.poll()
+        if rc != 0:
+            raise subprocess.CalledProcessError(rc, install_command)
 
-    logger.info(f"Restarting script using Python from '{venv_path}'...")
-    script_path = os.path.abspath(__file__)
-    
-    # Prepare arguments for re-execution with quoting for Windows
-    original_args = sys.argv[1:]
-    processed_args_for_exec = []
+        logger.info("Packages installed successfully into user space.")
+        logger.info("="*80)
+        logger.info("IMPORTANT: Please re-run the exact same command you just used.")
+        logger.info("The script needs to restart to use the newly installed packages.")
+        logger.info("="*80)
+        sys.exit(0) # Exit cleanly to force the user to re-run.
 
-    if sys.platform == "win32":
-        for arg in original_args:
-            # If argument contains a space and is not already "simply" quoted.
-            # This handles basic cases. Complex cases with internal quotes might need more.
-            if " " in arg and not (arg.startswith('"') and arg.endswith('"')):
-                processed_args_for_exec.append(f'"{arg}"')
-            else:
-                processed_args_for_exec.append(arg)
-    else:
-        # For non-Windows, pass arguments as they are.
-        processed_args_for_exec = original_args
-            
-    exec_args = [python_executable, script_path] + processed_args_for_exec
-    
-    logger.debug(f"ensure_venv: Re-executing with args: {exec_args}") # Log the exact args for os.execv
-
-    try:
-        # Preserve environment variables including HF_TOKEN and log them for debugging
-        current_env = os.environ.copy()
-        logger.debug(f"ensure_venv: Environment before execve - HF_TOKEN: {'SET' if 'HF_TOKEN' in current_env else 'NOT SET'}")
-        if 'HF_TOKEN' in current_env:
-            logger.debug(f"ensure_venv: HF_TOKEN value before execve: {current_env['HF_TOKEN'][:5]}...")
-        os.execve(python_executable, exec_args, current_env)
-    except OSError as e:
-        logger.error(f"os.execv failed: {e}", exc_info=True)
+    except (subprocess.CalledProcessError, OSError) as e:
+        logger.error(f"Failed to install packages into user space. Error: {e}")
+        logger.error("Please try running the pip install command manually in your terminal:")
+        # Provide a copy-pasteable command for the user
+        manual_cmd = " ".join(install_command)
+        print("\n--- Manual Install Command ---\n")
+        print(manual_cmd)
+        print("\n------------------------------\n")
         sys.exit(1)
     
-    return False # Should not be reached if os.execv is successful
+    return False # Should not be reached
 
 
 # --- VLM-Based Markdown Processing ---
@@ -477,12 +433,12 @@ def parse_vlm_output(vlm_output: str, source_url: str) -> List[Dict[str, Any]]:
         # Extract JSON from VLM output (handles ```json ... ``` or just [...] )
         json_str = None
         # Try to find JSON within a fenced code block first
-        json_match_fenced = re.search(r'```json\s*(\[.*?\])\s*```', vlm_output, re.DOTALL)
+        json_match_fenced = re.search(r'```json\s*(\[.*? \])\s*```', vlm_output, re.DOTALL)
         if json_match_fenced:
             json_str = json_match_fenced.group(1)
         else:
             # If not found, try to find a raw JSON array (more lenient)
-            json_match_raw = re.search(r'(\[.*?\])', vlm_output, re.DOTALL)
+            json_match_raw = re.search(r'(\[.*? \])', vlm_output, re.DOTALL)
             if json_match_raw:
                 json_str = json_match_raw.group(1)
         
@@ -762,15 +718,27 @@ class PerceptionLMClassifier:
 
         try:
             logger.info(f"Loading PerceptionLM model: {self.model_name} from {self.model_repo} to device {self.device}")
-            self.model = torch.hub.load(
-                repo_or_dir=self.model_repo,
-                model=self.model_name,
-                source='github',
-                skip_validation=True, # Skips checks that might fail in some envs
-                trust_repo=True      # Required for some custom models
-            )
-            self.model.eval()
-            self.model.to(self.device)
+            try:
+                self.model = torch.hub.load(
+                    repo_or_dir=self.model_repo,
+                    model=self.model_name,
+                    source='github',
+                    skip_validation=True,
+                    trust_repo=True
+                )
+            except FileNotFoundError:
+                logger.warning(f"torch.hub.load failed with FileNotFoundError. This can be a cache or extraction issue.")
+                logger.info(f"Attempting fallback: downloading '{self.model_repo}' directly via huggingface_hub and loading locally.")
+                
+                # Use hf_hub_download to get the path to a file, then find the repo root from there.
+                # snapshot_download is an alternative but this is also very robust.
+                config_path = hf_hub_download(repo_id=self.model_repo, filename="hubconf.py")
+                repo_local_dir = Path(config_path).parent
+
+                logger.info(f"Downloaded repo to {repo_local_dir}. Attempting local torch.hub.load...")
+                self.model = torch.hub.load(str(repo_local_dir), self.model_name, source='local', trust_repo=True)
+
+            self.model.eval().to(self.device)
 
             # Determine image size from the loaded model
             if hasattr(self.model, 'visual') and hasattr(self.model.visual, 'image_size'):
@@ -2753,10 +2721,10 @@ The Enhanced Classifier Service Tool is a comprehensive AI-powered classificatio
 The tool can use Vision-Language Models to intelligently process and chunk markdown documentation for RAG indexing:
 
 ```bash
-python your_script_name.py create-example \\
-    --auto-build-docs-rag \\
-    --docs-url ./sample_doc.md \\
-    --docs-vlm-model-path /path/to/your_model.gguf \\
+python your_script_name.py create-example \
+    --auto-build-docs-rag \
+    --docs-url ./sample_doc.md \
+    --docs-vlm-model-path /path/to/your_model.gguf \
     --processing-strategy vlm
 ```
 
@@ -2801,22 +2769,22 @@ Example Payload (JSON part of multipart):
 
 #### ModernBERT I/O Classification `/modernbert/classify`
 ```bash
-curl -X POST -H "Content-Type: application/json" \\
-     -d '{"input_text": "Is this good?", "output_text": "Yes, it is."}' \\
+curl -X POST -H "Content-Type: application/json" \
+     -d '{"input_text": "Is this good?", "output_text": "Yes, it is."}' \
      http://localhost:8080/modernbert/classify
 ```
 
 #### ColBERT Sensitivity Analysis `/colbert/classify_sensitivity`
 ```bash
-curl -X POST -H "Content-Type: application/json" \\
-     -d '{"text": "Analyze this for PII like SSN 123-45-6789."}' \\
+curl -X POST -H "Content-Type: application/json" \
+     -d '{"text": "Analyze this for PII like SSN 123-45-6789."}' \
      http://localhost:8080/colbert/classify_sensitivity
 ```
 
 #### Global RAG Query `/rag/query` (if global index configured)
 ```bash
-curl -X POST -H "Content-Type: application/json" \\
-     -d '{"query": "How to handle PII?", "top_k": 3}' \\
+curl -X POST -H "Content-Type: application/json" \
+     -d '{"query": "How to handle PII?", "top_k": 3}' \
      http://localhost:8080/rag/query
 ```
 
@@ -2867,17 +2835,17 @@ curl -X POST -H "Content-Type: application/json" \\
 
 ### Index Your Codebase
 ```bash
-python your_script_name.py index-codebase \\
-    --code-file-path ./your_script_name.py \\
-    --index-path ./my_code_index \\
+python your_script_name.py index-codebase \
+    --code-file-path ./your_script_name.py \
+    --index-path ./my_code_index \
     --code-chunk-strategy functions 
 ```
 
 ### Query Code Index
 ```bash
-python your_script_name.py rag retrieve \\
-    --index-path ./my_code_index \\
-    --query "how to parse python code" \\
+python your_script_name.py rag retrieve \
+    --index-path ./my_code_index \
+    --query "how to parse python code" \
     --top-k 3
 ```
 """
@@ -3828,28 +3796,28 @@ def test_codebase_indexing(temp_test_dir: Path) -> Dict[str, Dict[str, Any]]:
     """Test codebase indexing functionality."""
     results: Dict[str, Dict[str, Any]] = {}
     
-    sample_python_code = """
+    sample_python_code = '''
 import json
 
 def top_level_function(param1, param2):
-    \"\"\"This is a top-level function docstring.\"\"\"
+    \'\'\'This is a top-level function docstring.\'\'\'
     x = param1 + param2
     return x
 
 class MyClass:
-    \"\"\"Docstring for MyClass.\"\"\"
+    \'\'\'Docstring for MyClass.\'\'\'
     class_var = 100
 
     def __init__(self, name):
         self.name = name
 
     def method_one(self):
-        \"\"\"Method one docstring.\"\"\"
+        \'\'\'Method one docstring.\'\'\'
         return f"Hello from {self.name}"
 
     def _private_method(self): # Methods starting with _ are often included by AST walkers
-        pass 
-"""
+        pass
+'''
     code_file = temp_test_dir / "sample_test_code.py"
     code_file.write_text(sample_python_code)
 
@@ -3912,7 +3880,7 @@ class MyClass:
 
 # NEW_MODEL_LOGIC_TEST_DEFINITIONS_START
 def test_colbert_reranker_logic(temp_test_dir: Path) -> Dict[str, Dict[str, Any]]:
-    """Tests the ColBERTReranker's internal MaxSim logic using its loaded model."""
+    """Tests the ColBERTRerankers internal MaxSim logic using its loaded model."""
     results: Dict[str, Dict[str, Any]] = {}
     test_name = "colbert_reranker_direct_classification"
     try:
