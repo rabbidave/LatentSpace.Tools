@@ -1,3 +1,4 @@
+
 import os
 os.environ["HF_TOKEN"] = "hf_<insert_token_here>"
 
@@ -45,6 +46,21 @@ from typing import Dict, List, Optional, Union, Any, Tuple, Set, TYPE_CHECKING
 if TYPE_CHECKING:
     import torch
     from PIL import Image  # Add this import for type checking
+    import timm
+    from torchvision import transforms as tv_transforms
+    # Placeholders for global variables that will be populated after venv check
+    np = None
+    SentenceTransformer = None
+    Flask = None
+    request = None
+    jsonify = None
+    CORS = None
+    serve = None
+    # torch is already in TYPE_CHECKING
+    IMAGENET_DEFAULT_MEAN = None
+    IMAGENET_DEFAULT_STD = None
+    CLIPTokenizerFast = None
+
 
 # Configure basic logging first
 logging.basicConfig(
@@ -76,6 +92,7 @@ REQUIRED_PACKAGES = [
     "requests>=2.25.0",
     "llama-cpp-python",  # Added for VLM markdown processing
     "huggingface-hub>=0.20.0", # For downloading models from the Hub
+    "timm>=0.9.0", # For PerceptionLMClassifier
 ]
 
 # Global Variables
@@ -95,6 +112,23 @@ jsonify = None
 CORS = None
 serve = None
 torch = None
+Image = None
+timm = None
+tv_transforms = None
+IMAGENET_DEFAULT_MEAN = None
+IMAGENET_DEFAULT_STD = None
+CLIPTokenizerFast = None
+
+
+class NpEncoder(json.JSONEncoder):
+    def default(self, obj):
+        if isinstance(obj, np.integer):
+            return int(obj)
+        if isinstance(obj, np.floating):
+            return float(obj)
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+        return super(NpEncoder, self).default(obj)
 
 def setup_signal_handling():
     """Set up signal handling for graceful shutdown."""
@@ -342,8 +376,8 @@ class MarkdownReformatterVLM:
                 echo=False # Don't echo the prompt in the output
             )
             
-            if response and "choices" in response and response["choices"] and "text" in response["choices"]: # Corrected: response["choices"] is a list
-                output_text = response["choices"]["text"].strip() 
+            if response and "choices" in response and response["choices"] and "text" in response["choices"][0]: # Corrected: response["choices"] is a list
+                output_text = response["choices"][0]["text"].strip() 
                 logger.debug(f"VLM output length: {len(output_text)} characters")
                 return output_text
             else:
@@ -697,6 +731,137 @@ def fallback_markdown_processing(markdown_content: str, source_url: str, target_
     return all_chunks
 
 
+class PerceptionLMClassifier:
+    DEFAULT_MODEL_REPO = 'facebookresearch/perception_models'
+    DEFAULT_MODEL_NAME = 'pe_core_g14_448' 
+    # ... (rest of the correct class with setup(), _load_pil_image(), classify_image_with_captions())
+        
+    def __init__(self, model_repo: str = DEFAULT_MODEL_REPO, model_name: str = DEFAULT_MODEL_NAME, device: Optional[str] = None):
+        global torch
+        self.model_repo = model_repo
+        self.model_name = model_name
+        self.device = device if device else ("cuda" if torch.cuda.is_available() else "cpu") # Ensure torch is available
+        self.model = None
+        self.preprocess = None
+        self.tokenizer = None
+        self.is_setup = False
+        logger.info(f"PerceptionLMClassifier initialized for model: {self.model_name} from {self.model_repo}")
+
+    def setup(self):
+        global torch, timm, tv_transforms, IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD, CLIPTokenizerFast, Image # Access global vars
+        if not all([torch, timm, tv_transforms, Image]): # PIL.Image
+            logger.error("Torch, timm, torchvision.transforms, or PIL.Image not available globally. Cannot setup PerceptionLMClassifier.")
+            self.is_setup = False
+            return self
+        if IMAGENET_DEFAULT_MEAN is None or IMAGENET_DEFAULT_STD is None:
+             from timm.data.constants import IMAGENET_DEFAULT_MEAN as TIMM_MEAN, IMAGENET_DEFAULT_STD as TIMM_STD
+             IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD = TIMM_MEAN, TIMM_STD
+        if CLIPTokenizerFast is None:
+            from transformers import CLIPTokenizerFast as HF_CLIPTokenizerFast
+            CLIPTokenizerFast = HF_CLIPTokenizerFast
+
+        try:
+            logger.info(f"Loading PerceptionLM model: {self.model_name} from {self.model_repo} to device {self.device}")
+            self.model = torch.hub.load(
+                repo_or_dir=self.model_repo,
+                model=self.model_name,
+                source='github',
+                skip_validation=True, # Skips checks that might fail in some envs
+                trust_repo=True      # Required for some custom models
+            )
+            self.model.eval()
+            self.model.to(self.device)
+
+            # Determine image size from the loaded model
+            if hasattr(self.model, 'visual') and hasattr(self.model.visual, 'image_size'):
+                image_size_attr = self.model.visual.image_size
+                if isinstance(image_size_attr, (list, tuple)) and len(image_size_attr) > 0:
+                    image_size = image_size_attr[0] if isinstance(image_size_attr[0], int) else 224 # Use first int or default
+                elif isinstance(image_size_attr, int):
+                    image_size = image_size_attr
+                else: # Fallback if image_size is not directly usable
+                    logger.warning(f"Unexpected model.visual.image_size format: {image_size_attr}. Defaulting to 224.")
+                    image_size = 224
+            else:
+                logger.warning("Could not determine image_size from model.visual. Using default 224 preprocessing.")
+                image_size = 224
+            
+            self.preprocess = tv_transforms.Compose([
+                tv_transforms.Resize(image_size, interpolation=tv_transforms.InterpolationMode.BICUBIC),
+                tv_transforms.CenterCrop(image_size),
+                tv_transforms.ToTensor(),
+                tv_transforms.Normalize(IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD),
+            ])
+
+            if hasattr(self.model, 'hf_tokenizer'):
+                self.tokenizer = self.model.hf_tokenizer
+            else:
+                logger.warning(f"Model {self.model_name} does not have 'hf_tokenizer'. Attempting to use a fallback CLIP tokenizer.")
+                self.tokenizer = CLIPTokenizerFast.from_pretrained("openai/clip-vit-base-patch32", token=os.environ.get("HF_TOKEN"))
+            
+            self.is_setup = True
+            logger.info(f"PerceptionLM model '{self.model_name}' and preprocessor/tokenizer loaded successfully to device '{self.device}'.")
+
+        except ImportError as e_imp:
+            logger.error(f"Import error during PerceptionLM setup: {e_imp}. Ensure all dependencies like 'timm' are installed.", exc_info=True)
+            self.is_setup = False
+        except Exception as e:
+            logger.error(f"Error loading PerceptionLM model '{self.model_name}': {e}", exc_info=True)
+            self.is_setup = False
+        return self
+
+    def _load_pil_image(self, image_source: Union[str, Path, bytes, "Image.Image"]) -> "Image.Image": # type: ignore
+        global Image # Access global PIL.Image
+        from io import BytesIO
+
+        if isinstance(image_source, Image.Image): # type: ignore
+            return image_source.convert("RGB")
+        elif isinstance(image_source, (str, Path)):
+            return Image.open(image_source).convert("RGB") # type: ignore
+        elif isinstance(image_source, bytes):
+            return Image.open(BytesIO(image_source)).convert("RGB") # type: ignore
+        else:
+            raise ValueError(f"Unsupported image source type for PerceptionLM: {type(image_source)}")
+
+    def classify_image_with_captions(self, image_source: Union[str, Path, bytes, "Image.Image"], captions: List[str]) -> Dict[str, Any]: # type: ignore
+        if not self.is_setup: return {"error": "PerceptionLMClassifier not setup."}
+        if not all([self.model, self.preprocess, self.tokenizer, torch]): # type: ignore
+            return {"error": "Model, preprocess, tokenizer, or torch not available for PerceptionLM."}
+
+        try:
+            pil_image = self._load_pil_image(image_source)
+            image_input = self.preprocess(pil_image).unsqueeze(0).to(self.device) # type: ignore
+            
+            text_inputs = self.tokenizer(captions, padding=True, truncation=True, return_tensors="pt").to(self.device)
+
+            with torch.no_grad(): # type: ignore
+                image_features = self.model.encode_image(image_input) # type: ignore
+                text_features = self.model.encode_text(text_inputs["input_ids"], attention_mask=text_inputs["attention_mask"]) # type: ignore
+
+                image_features /= image_features.norm(dim=-1, keepdim=True) # type: ignore
+                text_features /= text_features.norm(dim=-1, keepdim=True) # type: ignore
+
+                similarity = (100.0 * image_features @ text_features.T) # type: ignore
+                text_probs = similarity.softmax(dim=-1) # type: ignore
+            
+            probabilities_np = text_probs.cpu().numpy()[0] # type: ignore
+            
+            best_caption_idx = probabilities_np.argmax()
+            best_caption = captions[best_caption_idx]
+            best_caption_prob = probabilities_np[best_caption_idx]
+
+            return {
+                "captions_input": captions,
+                "probabilities": probabilities_np.tolist(),
+                "classified_as": best_caption,
+                "confidence": float(best_caption_prob),
+                "best_caption_index": int(best_caption_idx),
+                "details": f"Classified using {self.model_repo}/{self.model_name}"
+            }
+        except Exception as e:
+            logger.error(f"Error during PerceptionLM classification: {e}", exc_info=True)
+            return {"error": str(e)}
+
 # --- Enhanced Documentation RAG Functions ---
 
 def fetch_documentation(docs_url_or_path_list: Union[str, List[str]]) -> str: # Corrected parameter name
@@ -981,7 +1146,7 @@ class RAGRetriever:
             "text_field": text_field,
             "metadata_fields": metadata_fields or [],
             "num_documents": len(parsed_documents),
-            "embedding_dimension": embeddings_array.shape if embeddings_array is not None and embeddings_array.ndim == 2 and embeddings_array.shape[0] > 0 else None, # Corrected to get dim
+            "embedding_dimension": embeddings_array.shape[1] if embeddings_array is not None and embeddings_array.ndim == 2 and embeddings_array.shape[0] > 0 else None, # Corrected to get dim
             "index_timestamp": time.time()
         }
         
@@ -1079,7 +1244,7 @@ class RAGRetriever:
                     "metadata": doc.get("metadata", {}),
                     "score": score
                 })
-            return results # Added missing return
+            return results
             
         except Exception as e:
             logger.error(f"Error during RAG retrieval: {e}", exc_info=True)
@@ -1189,17 +1354,17 @@ class ModernBERTClassifier:
             
             prob_positive_value = 0.0
             # CORRECTED_MODERNBERT_PROBABILITIES_HANDLING
-            if probabilities.ndim == 2 and probabilities.shape == 1:
-                if probabilities.shape == 2: # Standard binary classification (logits for class 0 and class 1)
-                    prob_positive_scalar = probabilities 
-                elif probabilities.shape == 1: # Single score output (often regression or already a probability)
-                    prob_positive_scalar = probabilities
-                elif probabilities.shape > 2: # Multi-class (more than 2 classes)
-                    logger.warning(f"ModernBERT: Multi-class output ({probabilities.shape} classes). 'probability_positive' taken from class 1 score if available, else 0.")
-                    prob_positive_scalar = probabilities if probabilities.shape > 1 else 0.0
-                else: # Should not happen if shape >= 1
+            if probabilities.ndim == 2 and probabilities.shape[1] > 1:
+                if probabilities.shape[1] == 2: # Standard binary classification (logits for class 0 and class 1)
+                    prob_positive_scalar = probabilities[0, 1] 
+                elif probabilities.shape[1] > 2: # Multi-class (more than 2 classes)
+                    logger.warning(f"ModernBERT: Multi-class output ({probabilities.shape[1]} classes). 'probability_positive' taken from class 1 score if available, else 0.")
+                    prob_positive_scalar = probabilities[0, 1]
+                else: # Should not happen if shape > 1
                     logger.warning(f"ModernBERT: Unexpected probabilities shape {probabilities.shape}. Setting 'probability_positive' to 0.0.")
                     prob_positive_scalar = 0.0
+            elif probabilities.ndim == 2 and probabilities.shape[1] == 1: # Single score output (often regression or already a probability)
+                    prob_positive_scalar = probabilities[0,0]
             else:
                 logger.warning(f"ModernBERT: Unexpected probabilities shape {probabilities.shape}. Cannot determine 'probability_positive'. Setting to 0.0.")
                 prob_positive_scalar = 0.0 # Fallback
@@ -1248,7 +1413,7 @@ class ColBERTReranker:
     
     def __init__(self, model_id: str = DEFAULT_MODEL_ID, reference_examples: Optional[Dict[str, List[str]]] = None):
         from transformers import AutoTokenizer, AutoModel
-        import torch
+        global torch
         
         logger.debug(f"ColBERTReranker.__init__: Attempting to load tokenizer for model_id='{model_id}'.")
         current_hf_token = os.environ.get("HF_TOKEN") # Use env token
@@ -1289,6 +1454,7 @@ class ColBERTReranker:
     
     def _get_text_embedding(self, text: str) -> "torch.Tensor":
         """Get token-level embeddings for a text."""
+        global torch
         inputs = self.tokenizer(
             text,
             return_tensors="pt",
@@ -1302,6 +1468,7 @@ class ColBERTReranker:
     
     def _maxsim_score(self, query_embed: "torch.Tensor", doc_embed: "torch.Tensor") -> float:
         """Compute MaxSim score between query and document embeddings."""
+        global torch
         similarities = torch.nn.functional.cosine_similarity(
             query_embed.unsqueeze(1),  # [Q_tokens, 1, EmbDim]
             doc_embed.unsqueeze(0),    # [1, D_tokens, EmbDim] 
@@ -1368,7 +1535,7 @@ class VisionLanguageProcessor:
     def setup(self):
         """Load the VLM model and processor."""
         from transformers import pipeline, AutoProcessor
-        import torch
+        global torch
         
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         current_hf_token = os.environ.get("HF_TOKEN") # Use env token
@@ -1421,12 +1588,12 @@ class VisionLanguageProcessor:
             # This part is model-specific and harder to generalize in a placeholder.
             # For a real implementation, one would add specific loading logic for chosen models.
             logger.warning("Pipeline loading failed. Manual VLM loading not implemented in this placeholder.")
-            raise # Re-raise to indicate setup failure
+            self.is_setup = False
         return self
     
     def _load_image(self, image_source: Union[str, bytes, Path, "Image.Image"]) -> "Image.Image": # Extended types
         """Load image from file path, URL, bytes, or PIL Image."""
-        from PIL import Image
+        global Image
         import requests
         from io import BytesIO
         
@@ -1447,11 +1614,12 @@ class VisionLanguageProcessor:
     
     def describe_image(self, image_source: Union[str, bytes, Path, "Image.Image"], prompt: Optional[str] = None) -> Dict[str, Any]:
         """Analyze an image using VLM with optional custom prompt."""
-        from PIL import Image # Keep for type hint if Image.Image not used directly
-        import torch
+        global Image, torch
         
         if not self.is_setup:
-            self.setup()
+            if not self.setup():
+                return {"error": "VLM setup failed", "description": "", "analysis": {}}
+
         if not self.model: # Check if model was loaded by setup
             raise RuntimeError("VLM model (pipeline) not available for image description.")
 
@@ -1467,7 +1635,7 @@ class VisionLanguageProcessor:
             # Image-to-text pipeline typically takes image and optional prompt kwargs
             # Example for LLaVA-like models often involves constructing a specific prompt format
             # For a generic pipeline, it might be simpler:
-            if self.model.tokenizer and hasattr(self.model.tokenizer, "chat_template") and self.model.tokenizer.chat_template:
+            if hasattr(self.model, 'tokenizer') and self.model.tokenizer and hasattr(self.model.tokenizer, "chat_template") and self.model.tokenizer.chat_template:
                  # More complex models might need specific chat templating
                  # This is a placeholder for such logic. LLaVA might need USER: <image>\n{prompt}\nASSISTANT:
                  # For simplicity, we'll try with the generic prompt first.
@@ -1479,8 +1647,8 @@ class VisionLanguageProcessor:
             
             description = ""
             # CORRECTED_VLP_OUTPUT_PARSING
-            if outputs and isinstance(outputs, list) and len(outputs) > 0 and isinstance(outputs, dict) and "generated_text" in outputs:
-                description = outputs["generated_text"]
+            if outputs and isinstance(outputs, list) and len(outputs) > 0 and isinstance(outputs[0], dict) and "generated_text" in outputs[0]:
+                description = outputs[0]["generated_text"]
                 # Sometimes the prompt itself is part of generated_text, needs stripping
                 if final_prompt in description:
                      description = description.split(final_prompt,1)[-1].strip() # Get text after prompt
@@ -1518,7 +1686,7 @@ class VisionLanguageProcessor:
                             frame_interval: int = 5) -> Dict[str, Any]:
         """Analyze video by sampling frames at given interval (seconds)."""
         import cv2
-        from PIL import Image
+        global Image
         import tempfile
         
         if not self.is_setup:
@@ -1610,13 +1778,120 @@ class VisionLanguageProcessor:
         
         if not unique_descriptions_texts: return "No valid descriptions found in analyzed frames."
         
-        return "Video content highlights: " + "; ".join(list(unique_descriptions_texts)[:5]) 
+        return "Video content highlights: " + "; ".join(list(unique_descriptions_texts)[:5])
+
+    def generate_n_captions(self, image_source: Union[str, bytes, Path, "Image.Image"], num_captions: int = 3, base_prompt: Optional[str] = None, policy_guidance: Optional[str] = None) -> Dict[str, Any]: # type: ignore
+        global torch, Image # Access global vars
+        if not self.is_setup: 
+            if not self.setup(): # Attempt setup if not done
+                 return {"error": f"VLM setup failed for {self.model_id}", "generated_captions": []}
+        if not self.model: return {"error": "VLM model not available for captions.", "generated_captions": []}
+        
+        try:
+            image = self._load_image(image_source) 
+            if image.mode == 'RGBA': image = image.convert('RGB')
+
+            generated_captions_list = []
+            final_prompts_used = []
+            
+            effective_base_prompt = base_prompt or "Describe this image in detail. Caption:"
+            prompt_prefix = f"Considering the policy: '{policy_guidance}', {effective_base_prompt}" if policy_guidance else effective_base_prompt
+
+            for i in range(num_captions):
+                current_prompt = f"{prompt_prefix} (Suggestion {i+1} of {num_captions})"
+                final_prompts_used.append(current_prompt)
+                gen_kwargs = {"max_new_tokens": 70, "temperature": 0.8, "top_p": 0.9, "do_sample": True}
+                outputs = self.model(image, prompt=current_prompt, generate_kwargs=gen_kwargs)
+                
+                caption_text = ""
+                # Handle variations in pipeline output structure
+                if outputs and isinstance(outputs, list) and len(outputs) > 0 and isinstance(outputs[0], dict) and "generated_text" in outputs[0]:
+                    raw_generated_text = outputs[0]["generated_text"]
+                elif outputs and isinstance(outputs, dict) and "generated_text" in outputs: # Some pipelines might return a dict directly
+                    raw_generated_text = outputs["generated_text"]
+                else:
+                    logger.warning(f"Unexpected VLM output structure for caption {i+1}: {str(outputs)[:200]}")
+                    raw_generated_text = str(outputs) if outputs else ""
+
+
+                if "ASSISTANT:" in raw_generated_text:
+                     caption_text = raw_generated_text.split("ASSISTANT:", 1)[-1].strip()
+                elif current_prompt in raw_generated_text: # Simple echo removal
+                     caption_text = raw_generated_text.replace(current_prompt, "", 1).strip()
+                else: # Fallback if specific patterns not found
+                     caption_text = raw_generated_text.strip()
+                generated_captions_list.append(caption_text if caption_text else f"Failed to generate caption {i+1}")
+            
+            unique_captions = list(dict.fromkeys(filter(None, generated_captions_list)))
+            final_captions = unique_captions[:num_captions]
+            while len(final_captions) < num_captions:
+                final_captions.append(f"Placeholder caption due to insufficient generation {len(final_captions)+1}")
+
+            return {
+                "generated_captions": final_captions,
+                "prompts_used": final_prompts_used,
+                "model": self.model_id if isinstance(self.model_id, str) else str(self.model_id),
+                "details": f"Attempted to generate {num_captions} captions."
+            }
+        except Exception as e:
+            logger.error(f"Error generating N captions with VLM: {e}", exc_info=True)
+            return {"generated_captions": [f"Error: {str(e)}"] * num_captions, "prompts_used": [], "error": str(e)}
+
+    def generate_violation_explanation(self, image_source: Union[str, bytes, Path, "Image.Image"], classification_result: Dict, policy_violation_reason: str, policy_description: str) -> Dict[str, Any]: # type: ignore
+        global torch, Image # Access global vars
+        if not self.is_setup:
+            if not self.setup():
+                 return {"error": f"VLM setup failed for {self.model_id}", "explanation": "Error: VLM setup failed."}
+        if not self.model: return {"error": "VLM model not available for explanation.", "explanation": "Error: VLM model unavailable."}
+
+        try:
+            image = self._load_image(image_source)
+            if image.mode == 'RGBA': image = image.convert('RGB')
+
+            prompt = (
+                f"Image Analysis Report:\n"
+                f"Policy Description: '{policy_description}'\n"
+                f"Violation Detected: '{policy_violation_reason}'\n"
+                f"Image was classified by another system as: '{classification_result.get('classified_as', 'N/A')}' with confidence: {classification_result.get('confidence', 0.0):.2f}.\n"
+                f"The following captions were considered by that system: {classification_result.get('captions_input', [])}\n\n"
+                f"Task: Based on the image and the provided analysis context, provide a concise explanation for why this image might violate the stated policy. Focus on connecting the image content (as you perceive it) to the policy violation reason and the classification given.\nExplanation:"
+            )
+            
+            gen_kwargs = {"max_new_tokens": 180, "temperature": 0.6} # Slightly less deterministic for explanation
+            outputs = self.model(image, prompt=prompt, generate_kwargs=gen_kwargs)
+            
+            explanation_text = ""
+            # Handle variations in pipeline output structure
+            if outputs and isinstance(outputs, list) and len(outputs) > 0 and isinstance(outputs[0], dict) and "generated_text" in outputs[0]:
+                raw_explanation = outputs[0]["generated_text"]
+            elif outputs and isinstance(outputs, dict) and "generated_text" in outputs:
+                raw_explanation = outputs["generated_text"]
+            else:
+                logger.warning(f"Unexpected VLM output for explanation: {str(outputs)[:200]}")
+                raw_explanation = str(outputs) if outputs else ""
+
+            if "Explanation:" in raw_explanation: explanation_text = raw_explanation.split("Explanation:", 1)[-1].strip()
+            elif "ASSISTANT:" in raw_explanation: explanation_text = raw_explanation.split("ASSISTANT:", 1)[-1].strip()
+            # Avoid stripping the whole prompt if it's complex and might have partial legitimate overlaps
+            # A more robust way would be to look for specific "ASSISTANT:" or similar tokens if the model uses them.
+            else: explanation_text = raw_explanation.strip()
+            
+            if not explanation_text: explanation_text = "Failed to generate a clear explanation for the violation."
+
+            return {
+                "explanation": explanation_text, "prompt_used_for_explanation": prompt,
+                "classification_input_for_explanation": classification_result,
+                "policy_violation_reason_for_explanation": policy_violation_reason,
+                "model": self.model_id if isinstance(self.model_id, str) else str(self.model_id),
+            }
+        except Exception as e:
+            logger.error(f"Error generating violation explanation with VLM: {e}", exc_info=True)
+            return {"explanation": f"Error generating explanation: {str(e)}", "error": str(e)}
 
     @classmethod
     def load(cls, model_dir: str, **kwargs):
         """Load a VLM from a local directory."""
-        return cls(model_id_or_dir=model_dir, **kwargs) 
-
+        return cls(model_id_or_dir=model_dir, **kwargs)
 
 # --- Enhanced Classification API with Complete Policy Logic ---
 
@@ -1643,6 +1918,7 @@ class ClassificationAPI:
         self.global_rag_retriever_index_path = global_rag_retriever_index_path
         self.documentation_rag_retriever: Optional[RAGRetriever] = None 
         
+        global Flask, CORS
         self.app = Flask(__name__)
         CORS(self.app) 
         self.request_count = 0
@@ -2066,8 +2342,10 @@ class ClassificationAPI:
             if policy_file.exists() and policy_file.is_file():
                 try:
                     with open(policy_file, 'r', encoding='utf-8') as f:
-                        self.api_policy_config = json.load(f)
-                    logger.info(f"Loaded API policy configuration from {self.policy_config_path} with {len(self.api_policy_config)} policies.")
+                        raw_config = json.load(f)
+                    # Normalize policy names to lowercase for case-insensitive lookup
+                    self.api_policy_config = {k.lower(): v for k, v in raw_config.items()}
+                    logger.info(f"Loaded API policy configuration from {self.policy_config_path} with {len(self.api_policy_config)} policies (normalized to lowercase).")
                 except json.JSONDecodeError as e_json:
                     logger.error(f"Failed to parse policy config JSON from {self.policy_config_path}: {e_json}", exc_info=True)
                 except Exception as e:
@@ -2140,14 +2418,16 @@ class ClassificationAPI:
                 "request_id": payload.get("request_id", f"req_{int(request_timestamp)}_{self.request_count}"),
                 "api_class_requested": api_class_name,
                 "timestamp_utc": request_timestamp,
-                "processing_details": {} 
+                "processing_details": {}
             }
             
-            active_policy_rules = self.api_policy_config.get(api_class_name)
+            # Normalize policy name to lowercase for case-insensitive matching
+            normalized_name = api_class_name.lower()
+            active_policy_rules = self.api_policy_config.get(normalized_name)
             if not active_policy_rules:
                 response_data["overall_status"] = "REJECT_INVALID_POLICY"
-                response_data["error_message"] = f"Policy definition for API class '{api_class_name}' not found or not loaded."
-                return jsonify(response_data), 400 
+                response_data["error_message"] = f"Policy definition for API class '{api_class_name}' (normalized to '{normalized_name}') not found or not loaded."
+                return jsonify(response_data), 400
             
             violation_reasons = self._handle_request_policy(payload, active_policy_rules, files, response_data["processing_details"])
             
@@ -2243,6 +2523,7 @@ class ClassificationAPI:
 
     def run(self, **kwargs):
         """Run the API server."""
+        global serve
         self.setup(**kwargs) 
         logger.info(f"Starting Enhanced Classification API server on http://{self.host}:{self.port}")
         logger.info(f"CORS enabled for all origins on this server.")
@@ -2641,7 +2922,7 @@ python your_script_name.py rag retrieve \\
         logger.info("Skipping documentation RAG index build as --auto-build-docs-rag was not specified.")
 
 
-    policy_docs_rag_path_str = (Path(docs_rag_index_name)).as_posix() # Relative to base_path
+    policy_docs_rag_path_str = (base_path / Path(docs_rag_index_name)).as_posix() # Relative to base_path
 
     enhanced_policy_config_content = {
         "SimpleValidation": {
@@ -2724,6 +3005,7 @@ def _initialize_and_run():
     """
     logger.debug("Global imports should be complete. Calling main_cli.")
     return main_cli()
+
 def main_cli():
     """Main CLI function that runs after dependencies are imported."""
     setup_signal_handling()
@@ -2825,6 +3107,17 @@ def main_cli():
     parser_finetune_io_validator.add_argument("--learning-rate", type=float, default=5e-5, help="Learning rate.")
     parser_finetune_io_validator.add_argument("--batch-size", type=int, default=8, help="Training batch size.")
     parser_finetune_io_validator.add_argument("--test-size", type=float, default=0.1, help="Proportion of data to use for evaluation.")
+    
+    parser_zeroshot = subparsers.add_parser("classify_image_zeroshot", help="Zero-shot image classification workflow with policy validation")
+    parser_zeroshot.add_argument("--image-path", type=str, required=True, help="Path to input image file")
+    parser_zeroshot.add_argument("--policy-config-path", type=str, required=True, help="Path to policy configuration JSON file")
+    parser_zeroshot.add_argument("--policy-class-name", type=str, required=True, help="Name of policy class to use from config")
+    parser_zeroshot.add_argument("--num-captions", type=int, default=3, help="Number of captions to generate per image")
+    parser_zeroshot.add_argument("--output-json-path", type=str, help="Optional path to save all workflow outputs as a JSON file")
+    # (Inside parser_zeroshot definition)
+    parser_zeroshot.add_argument("--caption-vlm-model-id", type=str, default=VisionLanguageProcessor.DEFAULT_MODEL_ID, help="HF Model ID for the VLM generating captions and explanations (e.g., 'llava-hf/llava-1.5-7b-hf').")
+    parser_zeroshot.add_argument("--perception-lm-repo", type=str, default=PerceptionLMClassifier.DEFAULT_MODEL_REPO, help="Repo for PerceptionLM model (e.g., 'facebookresearch/perception_models').")
+    parser_zeroshot.add_argument("--perception-lm-name", type=str, default=PerceptionLMClassifier.DEFAULT_MODEL_NAME, help="Name of PerceptionLM model (e.g., 'pe_core_g14_448').")
 
     args = parser.parse_args()
 
@@ -2870,7 +3163,7 @@ def main_cli():
                 logger.error(f"Failed to load RAG index from {args.index_path} for retrieval.")
                 return 1
             results = retriever.retrieve(args.query, top_k=args.top_k)
-            print(json.dumps(results, indent=2)) 
+            print(json.dumps(results, indent=2, cls=NpEncoder)) 
             return 0
 
     elif args.command == "serve":
@@ -2907,6 +3200,171 @@ def main_cli():
         except Exception as e:
             logger.error(f"Fine-tuning failed: {e}", exc_info=True)
             return 1
+    
+    elif args.command == "classify_image_zeroshot":
+        logger.info("Starting zero-shot image classification workflow...")
+        all_step_outputs = {"workflow_parameters": vars(args)}
+        current_exit_code = 1 # Default to error
+
+        try:
+            # 0. Load Policy Configuration
+            policy_config_rules = {}
+            try:
+                with open(args.policy_config_path, 'r', encoding='utf-8') as f:
+                    loaded_policies = json.load(f)
+                
+                normalized_policy_class_name = args.policy_class_name.lower()
+                found_policy_key = None
+                for key_in_config in loaded_policies: # Iterate through keys in the loaded_policies dict
+                    if key_in_config.lower() == normalized_policy_class_name:
+                        found_policy_key = key_in_config
+                        break
+                
+                if not found_policy_key:
+                    logger.error(f"Policy class '{args.policy_class_name}' not found in '{args.policy_config_path}'. Available: {list(loaded_policies.keys())}")
+                    return 1 # Exit if policy not found
+                policy_config_rules = loaded_policies[found_policy_key]
+                all_step_outputs["policy_definition_used"] = {found_policy_key: policy_config_rules}
+                logger.info(f"Successfully loaded policy '{found_policy_key}': {policy_config_rules.get('description', 'No description provided.')}")
+            except FileNotFoundError:
+                logger.error(f"Policy config file not found: {args.policy_config_path}")
+                return 1
+            except json.JSONDecodeError as e_json:
+                logger.error(f"Error decoding policy JSON from '{args.policy_config_path}': {e_json}")
+                return 1
+            except Exception as e_policy:
+                logger.error(f"Failed to load policy config '{args.policy_config_path}': {e_policy}", exc_info=True)
+                return 1
+
+            # Initialize Models
+            logger.info(f"Initializing Caption VLM: {args.caption_vlm_model_id}")
+            caption_vlm_instance = VisionLanguageProcessor(model_id_or_dir=args.caption_vlm_model_id)
+            caption_vlm_instance.setup()
+            if not caption_vlm_instance.is_setup:
+                logger.error(f"Failed to setup Caption VLM '{args.caption_vlm_model_id}'. Aborting workflow.")
+                return 1
+            
+            logger.info(f"Initializing PerceptionLM: {args.perception_lm_repo}/{args.perception_lm_name}")
+            perception_classifier_instance = PerceptionLMClassifier(model_repo=args.perception_lm_repo, model_name=args.perception_lm_name)
+            perception_classifier_instance.setup()
+            if not perception_classifier_instance.is_setup:
+                logger.error(f"Failed to setup PerceptionLM '{args.perception_lm_name}'. Aborting workflow.")
+                return 1
+
+            # Step 1: Generate N Captions with VisionLanguageProcessor
+            logger.info(f"\n--- Step 1: Generating {args.num_captions} captions for '{args.image_path}' ---")
+            caption_policy_guidance = policy_config_rules.get("caption_generation_policy_guidance", "Generate diverse, descriptive captions.")
+            caption_base_prompt = policy_config_rules.get("caption_generation_base_prompt")
+
+            step1_output_data = caption_vlm_instance.generate_n_captions(
+                image_source=args.image_path,
+                num_captions=args.num_captions,
+                base_prompt=caption_base_prompt,
+                policy_guidance=caption_policy_guidance
+            )
+            all_step_outputs["step_1_caption_generation"] = step1_output_data
+            print("\nStep 1 Output (Caption Generation):")
+            print(json.dumps(step1_output_data, indent=2, cls=NpEncoder))
+
+            if "error" in step1_output_data or not step1_output_data.get("generated_captions"):
+                logger.error("Critical error in Step 1 (Caption Generation) or no captions generated. Aborting workflow.")
+                if args.output_json_path:
+                    with open(args.output_json_path, 'w', encoding='utf-8') as f_out: json.dump(all_step_outputs, f_out, indent=2, cls=NpEncoder)
+                return 1
+            
+            generated_captions_for_step2 = [cap for cap in step1_output_data["generated_captions"] if cap and cap.strip() and "Failed to generate" not in cap and "Placeholder caption" not in cap]
+            if not generated_captions_for_step2:
+                logger.error("No valid, non-empty captions were generated in Step 1. Aborting.")
+                if args.output_json_path:
+                    with open(args.output_json_path, 'w', encoding='utf-8') as f_out: json.dump(all_step_outputs, f_out, indent=2, cls=NpEncoder)
+                return 1
+
+            # Step 2: PerceptionLM Classification against generated captions
+            logger.info(f"\n--- Step 2: Classifying image against {len(generated_captions_for_step2)} generated captions using PerceptionLM ---")
+            step2_output_data = perception_classifier_instance.classify_image_with_captions(
+                image_source=args.image_path,
+                captions=generated_captions_for_step2
+            )
+            all_step_outputs["step_2_perception_lm_classification"] = step2_output_data
+            print("\nStep 2 Output (PerceptionLM Classification):")
+            print(json.dumps(step2_output_data, indent=2, cls=NpEncoder))
+
+            if "error" in step2_output_data or "classified_as" not in step2_output_data:
+                logger.error("Critical error in Step 2 (PerceptionLM Classification). Aborting workflow.")
+                if args.output_json_path:
+                    with open(args.output_json_path, 'w', encoding='utf-8') as f_out: json.dump(all_step_outputs, f_out, indent=2, cls=NpEncoder)
+                return 1
+
+            # Step 3: Policy Violation Check & Explanation Generation
+            logger.info("\n--- Step 3: Checking for Policy Violations and Generating Explanation (if any) ---")
+            policy_violation_actual_reason = "No violation detected based on defined policy rules."
+            is_policy_violation = False
+            
+            zero_shot_rules = policy_config_rules.get("zero_shot_violation_rules", [])
+            classified_text_from_step2_lower = step2_output_data.get("classified_as", "").lower() # For case-insensitive matching
+            classification_confidence = step2_output_data.get("confidence", 0.0)
+
+            for rule in zero_shot_rules:
+                condition_met = False
+                rule_if_classified_as = rule.get("if_classified_as", "").lower()
+                rule_if_classified_as_contains = rule.get("if_classified_as_contains", "").lower()
+
+                if rule_if_classified_as and classified_text_from_step2_lower == rule_if_classified_as:
+                    condition_met = True
+                elif rule_if_classified_as_contains and rule_if_classified_as_contains in classified_text_from_step2_lower:
+                    condition_met = True
+                
+                if condition_met and "if_confidence_above" in rule and classification_confidence < rule["if_confidence_above"]:
+                    condition_met = False
+                if condition_met and "if_confidence_below" in rule and classification_confidence >= rule["if_confidence_below"]:
+                    condition_met = False
+
+                if condition_met:
+                    policy_violation_actual_reason = rule.get("reason", "Policy violation based on classification.")
+                    is_policy_violation = True
+                    break
+            
+            all_step_outputs["policy_violation_assessment"] = {
+                "is_violation_detected": is_policy_violation,
+                "violation_reason": policy_violation_actual_reason,
+                "triggering_classification_text": step2_output_data.get("classified_as"), # Report original case
+                "classification_confidence": classification_confidence
+            }
+            print("\nPolicy Violation Assessment:")
+            print(json.dumps(all_step_outputs["policy_violation_assessment"], indent=2, cls=NpEncoder))
+
+            if is_policy_violation:
+                logger.info(f"Policy Violation Detected: {policy_violation_actual_reason}. Generating explanation...")
+                step3_output_data = caption_vlm_instance.generate_violation_explanation(
+                    image_source=args.image_path,
+                    classification_result=step2_output_data, # Pass full S2 result for context
+                    policy_violation_reason=policy_violation_actual_reason,
+                    policy_description=policy_config_rules.get("description", "No policy description provided.")
+                )
+                all_step_outputs["step_3_violation_explanation"] = step3_output_data
+                print("\nStep 3 Output (Violation Explanation):")
+                print(json.dumps(step3_output_data, indent=2, cls=NpEncoder))
+            else:
+                logger.info("No policy violation detected by rules. Skipping explanation generation.")
+                all_step_outputs["step_3_violation_explanation"] = {"message": "No violation detected, explanation not generated."}
+            
+            current_exit_code = 0 # Success for this command
+        
+        except FileNotFoundError as e_fnf:
+            logger.error(f"File not found error in classify_image_zeroshot workflow: {e_fnf}", exc_info=False) # No need for full exc_info for FileNotFoundError usually
+            all_step_outputs["workflow_error"] = str(e_fnf)
+        except Exception as e_workflow:
+            logger.error(f"Zero-shot classification workflow failed: {e_workflow}", exc_info=True)
+            all_step_outputs["workflow_error"] = str(e_workflow)
+        finally:
+            if args.output_json_path:
+                try:
+                    with open(args.output_json_path, 'w', encoding='utf-8') as f_out:
+                        json.dump(all_step_outputs, f_out, indent=2, cls=NpEncoder)
+                    logger.info(f"Zero-shot classification workflow outputs saved to: {args.output_json_path}")
+                except Exception as e_save:
+                    logger.error(f"Failed to save complete output JSON to '{args.output_json_path}': {e_save}", exc_info=True)
+        return current_exit_code
 
     else:
         parser.print_help()
@@ -3505,51 +3963,62 @@ if __name__ == "__main__":
         logger.info("Virtual environment confirmed. Loading core dependencies globally...")
         try:
             import numpy
-            np = numpy
+            np = numpy 
 
-            from tqdm import tqdm
-            import ranx
-            from packaging import version 
+            from PIL import Image as PIL_Image 
+            Image = PIL_Image
 
-            from sentence_transformers import SentenceTransformer as GlobalSentenceTransformer, util as st_util
+            import timm as global_timm
+            timm = global_timm
+
+            from torchvision import transforms as global_tv_transforms
+            tv_transforms = global_tv_transforms
+            
+            try: # Attempt to import these from timm, provide fallbacks if not found
+                from timm.data.constants import IMAGENET_DEFAULT_MEAN as TIMM_MEAN, IMAGENET_DEFAULT_STD as TIMM_STD
+                IMAGENET_DEFAULT_MEAN = TIMM_MEAN
+                IMAGENET_DEFAULT_STD = TIMM_STD
+            except ImportError:
+                logger.warning("Could not import IMAGENET_DEFAULT_MEAN/STD from timm.data.constants. Using standard ImageNet values.")
+                IMAGENET_DEFAULT_MEAN = (0.485, 0.456, 0.406)
+                IMAGENET_DEFAULT_STD = (0.229, 0.224, 0.225)
+
+            try:
+                from transformers import CLIPTokenizerFast as HF_CLIPTokenizerFast
+                CLIPTokenizerFast = HF_CLIPTokenizerFast
+            except ImportError:
+                 logger.warning("Could not import CLIPTokenizerFast. PerceptionLM model might require it if it doesn't have an hf_tokenizer attribute.")
+                 CLIPTokenizerFast = None # Explicitly None if not found
+            
+            from sentence_transformers import SentenceTransformer as GlobalSentenceTransformer
             SentenceTransformer = GlobalSentenceTransformer 
 
             from flask import Flask as GlobalFlask, request as GlobalRequest, jsonify as GlobalJsonify
-            from flask_cors import CORS as GlobalCORS
-            from waitress import serve as GlobalServe
-            Flask = GlobalFlask
-            request = GlobalRequest
-            jsonify = GlobalJsonify
-            CORS = GlobalCORS
-            serve = GlobalServe
+            Flask, request, jsonify = GlobalFlask, GlobalRequest, GlobalJsonify
+            from flask_cors import CORS as GlobalCORS; CORS = GlobalCORS
+            from waitress import serve as GlobalServe; serve = GlobalServe
             
-            logger.info("Successfully imported core non-ML/LLM dependencies globally.")
+            try: import llama_cpp; LLAMA_CPP_AVAILABLE = True; logger.info("llama-cpp-python available.")
+            except ImportError: 
+                LLAMA_CPP_AVAILABLE = False
+                logger.warning("llama-cpp-python not available. VLM (GGUF) features limited.")
 
-            try:
-                import llama_cpp
-                LLAMA_CPP_AVAILABLE = True 
-                logger.info("llama-cpp-python is available globally for VLM processing.")
-            except ImportError:
-                logger.warning("llama-cpp-python not available globally. VLM processing features will be limited.")
-
-            import torch as global_torch 
-            torch = global_torch
-            import transformers 
+            import torch as global_torch; torch = global_torch 
+            import transformers
             
-            logger.info("Successfully imported core ML/LLM dependencies (PyTorch, Transformers) globally.")
-
-            exit_code = _initialize_and_run()
-        except SystemExit as e: 
+            logger.info("Successfully imported all core dependencies globally.")
+            exit_code = _initialize_and_run() # This should now call the single, corrected main_cli
+        except SystemExit as e:
             exit_code = e.code if isinstance(e.code, int) else 1
         except KeyboardInterrupt:
             logger.info("Process interrupted by user (KeyboardInterrupt). Exiting.")
-            exit_code = 130 
+            exit_code = 130
         except ImportError as e_import:
             logger.critical(f"A required dependency could not be imported globally even after venv setup: {e_import}", exc_info=True)
             exit_code = 1
         except Exception as e_main:
             logger.critical(f"An unhandled exception occurred in _initialize_and_run: {e_main}", exc_info=True)
-            exit_code = 1 
+            exit_code = 1
     else:
         logger.error("Failed to activate or confirm virtual environment. Exiting.")
         exit_code = 1
@@ -3559,4 +4028,3 @@ if __name__ == "__main__":
     print(f"__main__: Python sees HF_TOKEN: {os.environ.get('HF_TOKEN')}")
     # USER_PROVIDED_TOKEN_CHECK_END
     sys.exit(exit_code)
-
