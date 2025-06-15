@@ -86,11 +86,15 @@ graph TD
 
 ### Key Features
 
-*   **Drop-in Integration**: A single `/service/validate` endpoint handles all validation logic.
-*   **Policy-Driven**: Configure complex validation rules via external JSON files. No code changes needed to update policies.
-*   **Natively Multi-Modal**: VLM support enables deep analysis of images, with video and other modalities planned.
-*   **Zero-Trust VLM Handshake**: Prevent persistence of sensitive data (e.g., PII in a driver's license).
-*   **Context-Aware Help**: Relevant documentation snippets when a policy violation occurs, powered by RAG.
+* **Drop-in Integration**: A single `/service/validate` endpoint handles all validation logic.
+
+* **Policy-Driven**: Configure complex validation rules via external JSON files. No code changes needed to update policies.
+
+* **Natively Multi-Modal**: VLM support enables deep analysis of images, with video and other modalities planned.
+
+* **Zero-Trust VLM Handshake**: Multi-step protocol for multimodal data; prevents persistence of sensitive data (e.g., PII via ID)
+
+* **Context-Aware Help**: Provides developers with relevant documentation snippets when a policy violation occurs, powered by RAG.
 
 ---
 
