@@ -3,7 +3,7 @@
 
 This document describes classify.py, a *Data Classification and Monitoring Service* that delivers plug-and-play policy-based validation for any application (read: JSON object).
 
-It orchestrates fine-tuned transformers, vision-language models (VLMs) for documentation processing, zero-shot image classification, and RAG-informed Exceptions provide a governance layer for multimodal content including text, image, video, etc 'as an endpoint'.
+It orchestrates fine-tuned transformers, vision-language models (VLMs) for documentation processing, zero-shot image classification, and 'RAG-Informed Exceptions' provide a drop-in governance layer for multimodal content including text, image, video, etc as an endpoint.
 
 ## *🔎 N-JSON(s) @ N-Granularity*
 
