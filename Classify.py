@@ -1,5 +1,6 @@
+
 import os
-os.environ["HF_TOKEN"] = "hf_TokenHere"
+os.environ["HF_TOKEN"] = "hf_tokenhere"
 
 #!/usr/bin/env python
 """
@@ -2964,21 +2965,175 @@ python your_script_name.py rag retrieve \
     logger.info(f"Enhanced example files created successfully in {base_path}")
 
 
-# --- Main CLI Function ---
+# --- Main CLI and Workflow Logic ---
 
-def _initialize_and_run():
-    """
-    Runs main_cli. Assumes all necessary global imports have been made
-    in the `if __name__ == "__main__":` block after venv setup.
-    """
-    logger.debug("Global imports should be complete. Calling main_cli.")
-    return main_cli()
+def _run_zeroshot_workflow(args: argparse.Namespace) -> int:
+    """Helper function to contain the logic for the zero-shot workflow."""
+    logger.info("Starting zero-shot image classification workflow...")
+    all_step_outputs = {"workflow_parameters": vars(args)}
+    current_exit_code = 1  # Default to error
+
+    try:
+        # 0. Load Policy Configuration
+        policy_config_rules = {}
+        try:
+            with open(args.policy_config_path, 'r', encoding='utf-8') as f:
+                loaded_policies = json.load(f)
+            
+            normalized_policy_class_name = args.policy_class_name.lower()
+            found_policy_key = None
+            for key_in_config in loaded_policies:
+                if key_in_config.lower() == normalized_policy_class_name:
+                    found_policy_key = key_in_config
+                    break
+            
+            if not found_policy_key:
+                logger.error(f"Policy class '{args.policy_class_name}' not found in '{args.policy_config_path}'. Available: {list(loaded_policies.keys())}")
+                return 1
+            policy_config_rules = loaded_policies[found_policy_key]
+            all_step_outputs["policy_definition_used"] = {found_policy_key: policy_config_rules}
+            logger.info(f"Successfully loaded policy '{found_policy_key}': {policy_config_rules.get('description', 'No description provided.')}")
+        except FileNotFoundError:
+            logger.error(f"Policy config file not found: {args.policy_config_path}")
+            return 1
+        except json.JSONDecodeError as e_json:
+            logger.error(f"Error decoding policy JSON from '{args.policy_config_path}': {e_json}")
+            return 1
+        except Exception as e_policy:
+            logger.error(f"Failed to load policy config '{args.policy_config_path}': {e_policy}", exc_info=True)
+            return 1
+
+        # Initialize Models
+        logger.info(f"Initializing Caption VLM: {args.caption_vlm_model_id}")
+        caption_vlm_instance = VisionLanguageProcessor(model_id_or_dir=args.caption_vlm_model_id)
+        caption_vlm_instance.setup()
+        if not caption_vlm_instance.is_setup:
+            logger.error(f"Failed to setup Caption VLM '{args.caption_vlm_model_id}'. Aborting workflow.")
+            return 1
+        
+        logger.info(f"Initializing PerceptionLM: {args.perception_lm_repo}/{args.perception_lm_name}")
+        perception_classifier_instance = PerceptionLMClassifier(model_repo=args.perception_lm_repo, model_name=args.perception_lm_name)
+        perception_classifier_instance.setup()
+        if not perception_classifier_instance.is_setup:
+            logger.error(f"Failed to setup PerceptionLM '{args.perception_lm_name}'. Aborting workflow.")
+            return 1
+
+        # Step 1: Generate N Captions with VisionLanguageProcessor
+        logger.info(f"\n--- Step 1: Generating {args.num_captions} captions for '{args.image_path}' ---")
+        caption_policy_guidance = policy_config_rules.get("caption_generation_policy_guidance", "Generate diverse, descriptive captions.")
+        caption_base_prompt = policy_config_rules.get("caption_generation_base_prompt")
+        
+        step1_output_data = caption_vlm_instance.generate_n_captions(
+            image_source=args.image_path,
+            num_captions=args.num_captions,
+            base_prompt=caption_base_prompt,
+            policy_guidance=caption_policy_guidance
+        )
+        all_step_outputs["step_1_caption_generation"] = step1_output_data
+        print("\nStep 1 Output (Caption Generation):")
+        print(json.dumps(step1_output_data, indent=2, cls=NpEncoder))
+
+        if "error" in step1_output_data or not step1_output_data.get("generated_captions"):
+            logger.error("Critical error in Step 1 (Caption Generation) or no captions generated. Aborting workflow.")
+            current_exit_code = 1
+            return current_exit_code
+        
+        generated_captions_for_step2 = [cap for cap in step1_output_data["generated_captions"] if cap and cap.strip() and "Failed to generate" not in cap and "Placeholder caption" not in cap]
+        if not generated_captions_for_step2:
+            logger.error("No valid, non-empty captions were generated in Step 1. Aborting.")
+            current_exit_code = 1
+            return current_exit_code
+
+        # Step 2: PerceptionLM Classification against generated captions
+        logger.info(f"\n--- Step 2: Classifying image against {len(generated_captions_for_step2)} generated captions using PerceptionLM ---")
+        step2_output_data = perception_classifier_instance.classify_image_with_captions(
+            image_source=args.image_path,
+            captions=generated_captions_for_step2
+        )
+        all_step_outputs["step_2_perception_lm_classification"] = step2_output_data
+        print("\nStep 2 Output (PerceptionLM Classification):")
+        print(json.dumps(step2_output_data, indent=2, cls=NpEncoder))
+
+        if "error" in step2_output_data or "classified_as" not in step2_output_data:
+            logger.error("Critical error in Step 2 (PerceptionLM Classification). Aborting workflow.")
+            current_exit_code = 1
+            return current_exit_code
+
+        # Step 3: Policy Violation Check & Explanation Generation
+        logger.info("\n--- Step 3: Checking for Policy Violations and Generating Explanation (if any) ---")
+        policy_violation_actual_reason = "No violation detected based on defined policy rules."
+        is_policy_violation = False
+        
+        zero_shot_rules = policy_config_rules.get("zero_shot_violation_rules", [])
+        classified_text_from_step2_lower = step2_output_data.get("classified_as", "").lower()
+        classification_confidence = step2_output_data.get("confidence", 0.0)
+
+        for rule in zero_shot_rules:
+            condition_met = False
+            rule_if_classified_as = rule.get("if_classified_as", "").lower()
+            rule_if_classified_as_contains = rule.get("if_classified_as_contains", "").lower()
+
+            if rule_if_classified_as and classified_text_from_step2_lower == rule_if_classified_as:
+                condition_met = True
+            elif rule_if_classified_as_contains and rule_if_classified_as_contains in classified_text_from_step2_lower:
+                condition_met = True
+            
+            if condition_met and "if_confidence_above" in rule and classification_confidence < rule["if_confidence_above"]:
+                condition_met = False
+            if condition_met and "if_confidence_below" in rule and classification_confidence >= rule["if_confidence_below"]:
+                condition_met = False
+
+            if condition_met:
+                policy_violation_actual_reason = rule.get("reason", "Policy violation based on classification.")
+                is_policy_violation = True
+                break
+        
+        all_step_outputs["policy_violation_assessment"] = {
+            "is_violation_detected": is_policy_violation,
+            "violation_reason": policy_violation_actual_reason,
+            "triggering_classification_text": step2_output_data.get("classified_as"),
+            "classification_confidence": classification_confidence
+        }
+        print("\nPolicy Violation Assessment:")
+        print(json.dumps(all_step_outputs["policy_violation_assessment"], indent=2, cls=NpEncoder))
+
+        if is_policy_violation:
+            logger.info(f"Policy Violation Detected: {policy_violation_actual_reason}. Generating explanation...")
+            step3_output_data = caption_vlm_instance.generate_violation_explanation(
+                image_source=args.image_path,
+                classification_result=step2_output_data,
+                policy_violation_reason=policy_violation_actual_reason,
+                policy_description=policy_config_rules.get("description", "No policy description provided.")
+            )
+            all_step_outputs["step_3_violation_explanation"] = step3_output_data
+            print("\nStep 3 Output (Violation Explanation):")
+            print(json.dumps(step3_output_data, indent=2, cls=NpEncoder))
+        else:
+            logger.info("No policy violation detected by rules. Skipping explanation generation.")
+            all_step_outputs["step_3_violation_explanation"] = {"message": "No violation detected, explanation not generated."}
+        
+        current_exit_code = 0 # Success for this command
+    
+    except FileNotFoundError as e_fnf:
+        logger.error(f"File not found error in zero-shot workflow: {e_fnf}", exc_info=False)
+        all_step_outputs["workflow_error"] = str(e_fnf)
+    except Exception as e_workflow:
+        logger.error(f"Zero-shot classification workflow failed: {e_workflow}", exc_info=True)
+        all_step_outputs["workflow_error"] = str(e_workflow)
+    finally:
+        if args.output_json_path:
+            try:
+                with open(args.output_json_path, 'w', encoding='utf-8') as f_out:
+                    json.dump(all_step_outputs, f_out, indent=2, cls=NpEncoder)
+                logger.info(f"Zero-shot classification workflow outputs saved to: {args.output_json_path}")
+            except Exception as e_save:
+                logger.error(f"Failed to save complete output JSON to '{args.output_json_path}': {e_save}", exc_info=True)
+    
+    return current_exit_code
 
 def main_cli():
     """Main CLI function that runs after dependencies are imported."""
     setup_signal_handling()
-    
-    logger.info(f"DEBUG: main_cli received sys.argv: {sys.argv}")
     
     parser = argparse.ArgumentParser(
         description="Enhanced Transformer-based Classification Service with VLM Processing",
@@ -3021,7 +3176,7 @@ def main_cli():
     parser_create_example.add_argument(
         "--docs-vlm-model-path",
         type=str,
-        help="Path to local GGUF model file OR HuggingFace Repo ID for VLM-based documentation processing." # Updated help
+        help="Path to local GGUF model file OR HuggingFace Repo ID for VLM-based documentation processing."
     )
     parser_create_example.add_argument(
         "--processing-strategy",
@@ -3054,14 +3209,13 @@ def main_cli():
     parser_serve.add_argument("--host", type=str, default="0.0.0.0", help="Host address for the API server.")
     parser_serve.add_argument("--port", type=int, default=8080, help="Port for the API server.")
     parser_serve.add_argument("--global-rag-retriever-index-path", type=str, default=None, help="Path to a global RAG index for the /rag/query endpoint and potentially default documentation assistance if not specified in policy.")
-    parser_serve.add_argument("--vlm-model-path", type=str, help="Path to VLM GGUF model OR HF Repo ID for item processing in API policies (e.g., LLaVA). Placeholder if not provided.") # Updated help
+    parser_serve.add_argument("--vlm-model-path", type=str, help="Path to VLM GGUF model OR HF Repo ID for item processing in API policies (e.g., LLaVA). Placeholder if not provided.")
 
     parser_test = subparsers.add_parser("test", help="Run comprehensive internal tests for the system.")
     parser_test.epilog = ("For detailed instructions on localizing, executing, and "
                           "troubleshooting the test suite, especially for IDE-based development or "
                           "automated agents, please refer to the 'ide-agent.md' guide in the project documentation.")
-    # MODIFIED_LINE_CHOICES
-    parser_test.add_argument("--test-type", choices=['all', 'vlm', 'policy', 'rag', 'codebase', 'model_logic'], default='all', help="Specific category of tests to run.")
+    parser_test.add_argument("--test-type", choices=['all', 'vlm', 'policy', 'rag', 'codebase', 'model_logic', 'workflow'], default='all', help="Specific category of tests to run.")
     parser_test.add_argument("--verbose", action="store_true", help="Enable verbose logging during tests.")
 
     parser_finetune_io_validator = subparsers.add_parser(
@@ -3082,7 +3236,6 @@ def main_cli():
     parser_zeroshot.add_argument("--policy-class-name", type=str, required=True, help="Name of policy class to use from config")
     parser_zeroshot.add_argument("--num-captions", type=int, default=3, help="Number of captions to generate per image")
     parser_zeroshot.add_argument("--output-json-path", type=str, help="Optional path to save all workflow outputs as a JSON file")
-    # (Inside parser_zeroshot definition)
     parser_zeroshot.add_argument("--caption-vlm-model-id", type=str, default=VisionLanguageProcessor.DEFAULT_MODEL_ID, help="HF Model ID for the VLM generating captions and explanations (e.g., 'llava-hf/llava-1.5-7b-hf').")
     parser_zeroshot.add_argument("--perception-lm-repo", type=str, default=PerceptionLMClassifier.DEFAULT_MODEL_REPO, help="Repo for PerceptionLM model (e.g., 'facebookresearch/perception_models').")
     parser_zeroshot.add_argument("--perception-lm-name", type=str, default=PerceptionLMClassifier.DEFAULT_MODEL_NAME, help="Name of PerceptionLM model (e.g., 'pe_core_g14_448').")
@@ -3103,7 +3256,7 @@ def main_cli():
     elif args.command == "create-example":
         create_example_files(
             base_path=Path(args.output_dir),
-            docs_url=args.docs_url, # args.docs_url is now None or a list of strings
+            docs_url=args.docs_url,
             auto_build_docs_rag=args.auto_build_docs_rag,
             docs_rag_index_name=args.docs_rag_index_name,
             chunk_size=args.chunk_size,
@@ -3151,195 +3304,31 @@ def main_cli():
         return 0 if passed == total and total > 0 else 1 
 
     elif args.command == "finetune-io-validator":
-        try:
-            # This function would need to be defined, it's a placeholder for now.
-            # metrics = _finetune_io_validator_model(
-            #     data_path=args.data_path,
-            #     base_model_id=args.base_model_id,
-            #     output_model_dir=args.output_model_dir,
-            #     num_train_epochs=args.num_train_epochs,
-            #     learning_rate=args.learning_rate,
-            #     batch_size=args.batch_size,
-            #     test_size=args.test_size,
-            # )
-            logger.info(f"Fine-tuning requested. Placeholder: Fine-tuning logic needs to be implemented in _finetune_io_validator_model.")
-            # logger.info(f"Fine-tuning completed. Metrics: {metrics}") # If it were implemented
-            return 0 # Placeholder return
-        except Exception as e:
-            logger.error(f"Fine-tuning failed: {e}", exc_info=True)
-            return 1
+        logger.info(f"Fine-tuning requested. Placeholder: This feature requires a full implementation in a separate function.")
+        logger.info("The logic would involve loading data, tokenizing, setting up a Trainer, and running model.train().")
+        return 1
     
     elif args.command == "classify_image_zeroshot":
-        logger.info("Starting zero-shot image classification workflow...")
-        all_step_outputs = {"workflow_parameters": vars(args)}
-        current_exit_code = 1 # Default to error
-
-        try:
-            # 0. Load Policy Configuration
-            policy_config_rules = {}
-            try:
-                with open(args.policy_config_path, 'r', encoding='utf-8') as f:
-                    loaded_policies = json.load(f)
-                
-                normalized_policy_class_name = args.policy_class_name.lower()
-                found_policy_key = None
-                for key_in_config in loaded_policies: # Iterate through keys in the loaded_policies dict
-                    if key_in_config.lower() == normalized_policy_class_name:
-                        found_policy_key = key_in_config
-                        break
-                
-                if not found_policy_key:
-                    logger.error(f"Policy class '{args.policy_class_name}' not found in '{args.policy_config_path}'. Available: {list(loaded_policies.keys())}")
-                    return 1 # Exit if policy not found
-                policy_config_rules = loaded_policies[found_policy_key]
-                all_step_outputs["policy_definition_used"] = {found_policy_key: policy_config_rules}
-                logger.info(f"Successfully loaded policy '{found_policy_key}': {policy_config_rules.get('description', 'No description provided.')}")
-            except FileNotFoundError:
-                logger.error(f"Policy config file not found: {args.policy_config_path}")
-                return 1
-            except json.JSONDecodeError as e_json:
-                logger.error(f"Error decoding policy JSON from '{args.policy_config_path}': {e_json}")
-                return 1
-            except Exception as e_policy:
-                logger.error(f"Failed to load policy config '{args.policy_config_path}': {e_policy}", exc_info=True)
-                return 1
-
-            # Initialize Models
-            logger.info(f"Initializing Caption VLM: {args.caption_vlm_model_id}")
-            caption_vlm_instance = VisionLanguageProcessor(model_id_or_dir=args.caption_vlm_model_id)
-            caption_vlm_instance.setup()
-            if not caption_vlm_instance.is_setup:
-                logger.error(f"Failed to setup Caption VLM '{args.caption_vlm_model_id}'. Aborting workflow.")
-                return 1
-            
-            logger.info(f"Initializing PerceptionLM: {args.perception_lm_repo}/{args.perception_lm_name}")
-            perception_classifier_instance = PerceptionLMClassifier(model_repo=args.perception_lm_repo, model_name=args.perception_lm_name)
-            perception_classifier_instance.setup()
-            if not perception_classifier_instance.is_setup:
-                logger.error(f"Failed to setup PerceptionLM '{args.perception_lm_name}'. Aborting workflow.")
-                return 1
-
-            # Step 1: Generate N Captions with VisionLanguageProcessor
-            logger.info(f"\n--- Step 1: Generating {args.num_captions} captions for '{args.image_path}' ---")
-            caption_policy_guidance = policy_config_rules.get("caption_generation_policy_guidance", "Generate diverse, descriptive captions.")
-            caption_base_prompt = policy_config_rules.get("caption_generation_base_prompt")
-
-            step1_output_data = caption_vlm_instance.generate_n_captions(
-                image_source=args.image_path,
-                num_captions=args.num_captions,
-                base_prompt=caption_base_prompt,
-                policy_guidance=caption_policy_guidance
-            )
-            all_step_outputs["step_1_caption_generation"] = step1_output_data
-            print("\nStep 1 Output (Caption Generation):")
-            print(json.dumps(step1_output_data, indent=2, cls=NpEncoder))
-
-            if "error" in step1_output_data or not step1_output_data.get("generated_captions"):
-                logger.error("Critical error in Step 1 (Caption Generation) or no captions generated. Aborting workflow.")
-                if args.output_json_path:
-                    with open(args.output_json_path, 'w', encoding='utf-8') as f_out: json.dump(all_step_outputs, f_out, indent=2, cls=NpEncoder)
-                return 1
-            
-            generated_captions_for_step2 = [cap for cap in step1_output_data["generated_captions"] if cap and cap.strip() and "Failed to generate" not in cap and "Placeholder caption" not in cap]
-            if not generated_captions_for_step2:
-                logger.error("No valid, non-empty captions were generated in Step 1. Aborting.")
-                if args.output_json_path:
-                    with open(args.output_json_path, 'w', encoding='utf-8') as f_out: json.dump(all_step_outputs, f_out, indent=2, cls=NpEncoder)
-                return 1
-
-            # Step 2: PerceptionLM Classification against generated captions
-            logger.info(f"\n--- Step 2: Classifying image against {len(generated_captions_for_step2)} generated captions using PerceptionLM ---")
-            step2_output_data = perception_classifier_instance.classify_image_with_captions(
-                image_source=args.image_path,
-                captions=generated_captions_for_step2
-            )
-            all_step_outputs["step_2_perception_lm_classification"] = step2_output_data
-            print("\nStep 2 Output (PerceptionLM Classification):")
-            print(json.dumps(step2_output_data, indent=2, cls=NpEncoder))
-
-            if "error" in step2_output_data or "classified_as" not in step2_output_data:
-                logger.error("Critical error in Step 2 (PerceptionLM Classification). Aborting workflow.")
-                if args.output_json_path:
-                    with open(args.output_json_path, 'w', encoding='utf-8') as f_out: json.dump(all_step_outputs, f_out, indent=2, cls=NpEncoder)
-                return 1
-
-            # Step 3: Policy Violation Check & Explanation Generation
-            logger.info("\n--- Step 3: Checking for Policy Violations and Generating Explanation (if any) ---")
-            policy_violation_actual_reason = "No violation detected based on defined policy rules."
-            is_policy_violation = False
-            
-            zero_shot_rules = policy_config_rules.get("zero_shot_violation_rules", [])
-            classified_text_from_step2_lower = step2_output_data.get("classified_as", "").lower() # For case-insensitive matching
-            classification_confidence = step2_output_data.get("confidence", 0.0)
-
-            for rule in zero_shot_rules:
-                condition_met = False
-                rule_if_classified_as = rule.get("if_classified_as", "").lower()
-                rule_if_classified_as_contains = rule.get("if_classified_as_contains", "").lower()
-
-                if rule_if_classified_as and classified_text_from_step2_lower == rule_if_classified_as:
-                    condition_met = True
-                elif rule_if_classified_as_contains and rule_if_classified_as_contains in classified_text_from_step2_lower:
-                    condition_met = True
-                
-                if condition_met and "if_confidence_above" in rule and classification_confidence < rule["if_confidence_above"]:
-                    condition_met = False
-                if condition_met and "if_confidence_below" in rule and classification_confidence >= rule["if_confidence_below"]:
-                    condition_met = False
-
-                if condition_met:
-                    policy_violation_actual_reason = rule.get("reason", "Policy violation based on classification.")
-                    is_policy_violation = True
-                    break
-            
-            all_step_outputs["policy_violation_assessment"] = {
-                "is_violation_detected": is_policy_violation,
-                "violation_reason": policy_violation_actual_reason,
-                "triggering_classification_text": step2_output_data.get("classified_as"), # Report original case
-                "classification_confidence": classification_confidence
-            }
-            print("\nPolicy Violation Assessment:")
-            print(json.dumps(all_step_outputs["policy_violation_assessment"], indent=2, cls=NpEncoder))
-
-            if is_policy_violation:
-                logger.info(f"Policy Violation Detected: {policy_violation_actual_reason}. Generating explanation...")
-                step3_output_data = caption_vlm_instance.generate_violation_explanation(
-                    image_source=args.image_path,
-                    classification_result=step2_output_data, # Pass full S2 result for context
-                    policy_violation_reason=policy_violation_actual_reason,
-                    policy_description=policy_config_rules.get("description", "No policy description provided.")
-                )
-                all_step_outputs["step_3_violation_explanation"] = step3_output_data
-                print("\nStep 3 Output (Violation Explanation):")
-                print(json.dumps(step3_output_data, indent=2, cls=NpEncoder))
-            else:
-                logger.info("No policy violation detected by rules. Skipping explanation generation.")
-                all_step_outputs["step_3_violation_explanation"] = {"message": "No violation detected, explanation not generated."}
-            
-            current_exit_code = 0 # Success for this command
-        
-        except FileNotFoundError as e_fnf:
-            logger.error(f"File not found error in classify_image_zeroshot workflow: {e_fnf}", exc_info=False) # No need for full exc_info for FileNotFoundError usually
-            all_step_outputs["workflow_error"] = str(e_fnf)
-        except Exception as e_workflow:
-            logger.error(f"Zero-shot classification workflow failed: {e_workflow}", exc_info=True)
-            all_step_outputs["workflow_error"] = str(e_workflow)
-        finally:
-            if args.output_json_path:
-                try:
-                    with open(args.output_json_path, 'w', encoding='utf-8') as f_out:
-                        json.dump(all_step_outputs, f_out, indent=2, cls=NpEncoder)
-                    logger.info(f"Zero-shot classification workflow outputs saved to: {args.output_json_path}")
-                except Exception as e_save:
-                    logger.error(f"Failed to save complete output JSON to '{args.output_json_path}': {e_save}", exc_info=True)
-        return current_exit_code
+        return _run_zeroshot_workflow(args)
 
     else:
         parser.print_help()
         return 1
-    return 0 
 
 # --- Comprehensive Testing Framework ---
+
+def create_minimal_png(file_path: Path, size: Tuple[int, int], color: Tuple[int, int, int]):
+    """Creates a minimal, single-color PNG file for testing."""
+    global Image
+    if Image is None:
+        try:
+            from PIL import Image as PIL_Image
+            Image = PIL_Image
+        except ImportError:
+            logger.error("Pillow is not installed, cannot create test image.")
+            return
+    img = Image.new('RGB', size, color=color)
+    img.save(file_path, 'PNG')
 
 def run_comprehensive_tests(test_type: str = "all", verbose: bool = False) -> Tuple[int, int]:
     """Run comprehensive tests for the enhanced system. Returns (passed_tests, total_tests)."""
@@ -3360,8 +3349,7 @@ def run_comprehensive_tests(test_type: str = "all", verbose: bool = False) -> Tu
         if test_type in ["all", "vlm"]:
             test_results_summary["VLM Processing"] = test_vlm_processing(temp_dir_path)
         
-        # CORRECTED_POLICY_VALIDATION_CALL
-        if test_type in ["all", "policy"] and "Policy Validation" not in test_results_summary : # Prevent double call if 'all' and 'policy' are both somehow active
+        if test_type in ["all", "policy"]:
             test_results_summary["Policy Validation"] = test_policy_validation(temp_dir_path)
         
         if test_type in ["all", "rag"]:
@@ -3370,13 +3358,14 @@ def run_comprehensive_tests(test_type: str = "all", verbose: bool = False) -> Tu
         if test_type in ["all", "codebase"]:
             test_results_summary["Codebase Indexing"] = test_codebase_indexing(temp_dir_path)
         
-        # MODIFIED_SECTION_MODEL_LOGIC_TESTS_CALL (Corrected Structure)
         if test_type in ["all", "model_logic"]: 
-            # The individual test functions return a dict {test_name: result}, so spread them.
             model_logic_results = {}
             model_logic_results.update(test_colbert_reranker_logic(temp_dir_path))
             model_logic_results.update(test_modernbert_classifier_default_inference(temp_dir_path))
             test_results_summary["Model Logic Tests"] = model_logic_results
+        
+        if test_type in ["all", "workflow"]:
+            test_results_summary["Zero-Shot Workflow"] = test_zeroshot_vlm_handshake_workflow(temp_dir_path)
             
     print("\n" + "="*60)
     print("COMPREHENSIVE TEST RESULTS SUMMARY")
@@ -3386,8 +3375,7 @@ def run_comprehensive_tests(test_type: str = "all", verbose: bool = False) -> Tu
     total_tests_passed = 0
     
     for category, tests_in_category in test_results_summary.items():
-        # CORRECTED_TEST_CATEGORY_PRINTING (remove extra "TESTS")
-        print(f"\n{category.upper()}:") # Removed extra "TESTS"
+        print(f"\n{category.upper()}:")
         cat_total = len(tests_in_category)
         cat_passed = 0
         for test_name, result_details in tests_in_category.items():
@@ -3437,7 +3425,7 @@ def test_vlm_processing(temp_test_dir: Path) -> Dict[str, Dict[str, Any]]:
                 "passed": not can_load, "details": "load_model correctly returned False as llama-cpp is unavailable."
             }
     except Exception as e:
-        results[test_name] = {"passed": False, "error": str(e), "details": "Ensure HF_TOKEN is valid and model accessible."} # Added details
+        results[test_name] = {"passed": False, "error": str(e), "details": "Ensure HF_TOKEN is valid and model accessible."}
     
     test_name = "prompt_template_creation"
     try:
@@ -3610,9 +3598,6 @@ def test_policy_validation(temp_test_dir: Path) -> Dict[str, Dict[str, Any]]:
             violations = api_for_test._handle_legacy_policy_validation(payload, policy_rules, response_data_store)
         
         assert len(violations) == 1, f"Expected 1 ModernBERT violation, got {len(violations)}: {violations}"
-        # CORRECTED_LEGACY_POLICY_MODERNBERT_FAIL_ASSERTION
-        if not any("ModernBERT I/O validation failed" in v for v in violations):
-            print(f"Actual violation messages: {violations}")  # Temporary for debugging
         assert any("ModernBERT I/O validation failed" in v for v in violations), "Violation message mismatch for ModernBERT fail."
         results[test_name] = {"passed": True}
     except Exception as e:
@@ -3632,7 +3617,6 @@ def test_policy_validation(temp_test_dir: Path) -> Dict[str, Dict[str, Any]]:
             api_for_test.colbert_reranker = mock.Mock(spec=ColBERTReranker)
             temp_colbert_mock_assigned = True
 
-        # api_for_test.colbert_reranker is now either the real one (if it loaded and not None) or a Mock
         with mock.patch.object(api_for_test.colbert_reranker, 'classify_text') as mock_colbert_classify:
             mock_colbert_classify.return_value = {
                 "predicted_class": "Class 1: PII", "confidence": 0.9, "class_scores": {"Class 1: PII": 0.9}
@@ -3641,7 +3625,7 @@ def test_policy_validation(temp_test_dir: Path) -> Dict[str, Dict[str, Any]]:
         
         if temp_colbert_mock_assigned:
             api_for_test.colbert_reranker = original_colbert_reranker
-        assert len(violations_pii) > 0, f"Expected PII violation, got {len(violations_pii)}. Violations: {violations_pii}. ColBERT mock called: {mock_colbert_classify.called if hasattr(mock_colbert_classify, 'called') else 'Mock not effective'}"
+        assert len(violations_pii) > 0, f"Expected PII violation, got {len(violations_pii)}. Violations: {violations_pii}."
         assert any("Input text classified as disallowed sensitivity" in v for v in violations_pii), "PII violation message mismatch."
         results[test_name] = {"passed": True}
     except Exception as e:
@@ -3677,11 +3661,20 @@ def test_policy_validation(temp_test_dir: Path) -> Dict[str, Dict[str, Any]]:
             logger.info("Test forcing VLP setup for policy test.")
             api_for_test.vision_language_processor = VisionLanguageProcessor().setup()
 
-        with mock.patch.object(api_for_test.vision_language_processor, 'describe_image') as mock_describe:
+        # We must mock the ColBERT reranker as well for the derived_text_checks
+        with mock.patch.object(api_for_test.vision_language_processor, 'describe_image') as mock_describe, \
+             mock.patch.object(api_for_test.colbert_reranker, 'classify_text') as mock_colbert:
+
             mock_describe.return_value = {
                 "description": "Mocked VLM: Benign image content",
                 "analysis": {"contains_text_guess": False, "word_count": 5}
             }
+            mock_colbert.return_value = {
+                "predicted_class": "Class 4: Public",  # Benign class
+                "confidence": 0.9,
+                "class_scores": {"Class 4: Public": 0.9}
+            }
+
             violations_mm = api_for_test._handle_multimodal_policy_validation(payload_mm, policy_rules_mm, mock_files, response_data_store_mm)
         
         assert "item_processing_results" in response_data_store_mm, "Item processing results missing."
@@ -3761,7 +3754,7 @@ def test_rag_functionality(temp_test_dir: Path) -> Dict[str, Dict[str, Any]]:
         assert "topic" in retrieved_items[0]["metadata"], "Missing metadata field in retrieved item."
         results[test_name] = {"passed": True}
     except Exception as e:
-        results[test_name] = {"passed": False, "error": str(e), "details":"Check SentenceTransformer loading and HF Token for all-MiniLM-L6-v2"} # Added details
+        results[test_name] = {"passed": False, "error": str(e), "details":"Check SentenceTransformer loading and HF Token for all-MiniLM-L6-v2"}
 
     test_name = "documentation_rag_build_fallback"
     try:
@@ -3788,7 +3781,7 @@ def test_rag_functionality(temp_test_dir: Path) -> Dict[str, Dict[str, Any]]:
         assert "API validation" in ret_docs[0]["text"], f"Retrieved doc text mismatch. Got: {ret_docs[0]['text'] if ret_docs else 'N/A'}"
         results[test_name] = {"passed": True}
     except Exception as e:
-        results[test_name] = {"passed": False, "error": str(e), "details":"Check SentenceTransformer loading for RAG."} # Added details
+        results[test_name] = {"passed": False, "error": str(e), "details":"Check SentenceTransformer loading for RAG."}
         
     return results
 
@@ -3800,19 +3793,19 @@ def test_codebase_indexing(temp_test_dir: Path) -> Dict[str, Dict[str, Any]]:
 import json
 
 def top_level_function(param1, param2):
-    \'\'\'This is a top-level function docstring.\'\'\'
+    """This is a top-level function docstring."""
     x = param1 + param2
     return x
 
 class MyClass:
-    \'\'\'Docstring for MyClass.\'\'\'
+    """Docstring for MyClass."""
     class_var = 100
 
     def __init__(self, name):
         self.name = name
 
     def method_one(self):
-        \'\'\'Method one docstring.\'\'\'
+        """Method one docstring."""
         return f"Hello from {self.name}"
 
     def _private_method(self): # Methods starting with _ are often included by AST walkers
@@ -3874,11 +3867,10 @@ class MyClass:
         assert ret_code_items[0]["metadata"]["name"] == "method_one", f"Retrieved wrong code chunk. Got: {ret_code_items[0]['metadata']['name']}"
         results[test_name] = {"passed": True}
     except Exception as e:
-        results[test_name] = {"passed": False, "error": str(e), "details": "Check SentenceTransformer loading and RAG logic."} # Added details
+        results[test_name] = {"passed": False, "error": str(e), "details": "Check SentenceTransformer loading and RAG logic."}
         
     return results
 
-# NEW_MODEL_LOGIC_TEST_DEFINITIONS_START
 def test_colbert_reranker_logic(temp_test_dir: Path) -> Dict[str, Dict[str, Any]]:
     """Tests the ColBERTRerankers internal MaxSim logic using its loaded model."""
     results: Dict[str, Dict[str, Any]] = {}
@@ -3918,13 +3910,116 @@ def test_modernbert_classifier_default_inference(temp_test_dir: Path) -> Dict[st
     except Exception as e:
         results[test_name] = {"passed": False, "error": str(e), "details": "Ensure ModernBERTClassifier can load its default model and HF Hub access is working."}
     return {test_name: results.get(test_name, {"passed": False, "error": "Initialization failed before assertions."})}
-# NEW_MODEL_LOGIC_TEST_DEFINITIONS_END
 
+@mock.patch(f'{__name__}.PerceptionLMClassifier')
+@mock.patch(f'{__name__}.VisionLanguageProcessor')
+def test_zeroshot_vlm_handshake_workflow(temp_test_dir: Path, mock_vlp_class: mock.MagicMock, mock_plm_class: mock.MagicMock) -> Dict[str, Dict[str, Any]]:
+    """Tests the `classify_image_zeroshot` workflow logic with mocked model outputs."""
+    results: Dict[str, Dict[str, Any]] = {}
+    
+    # --- Setup common test resources ---
+    policy_config = {
+        "SecretImagePolicy": {
+            "description": "Block images classified as containing secret content",
+            "caption_generation_policy_guidance": "Describe if this is secret.",
+            "zero_shot_violation_rules": [{
+                "if_classified_as_contains": "secret",
+                "reason": "Image was classified as containing secret content."
+            }]
+        }
+    }
+    policy_path = temp_test_dir / "test_policy_workflow.json"
+    with open(policy_path, 'w') as f: json.dump(policy_config, f)
+    
+    image_path = temp_test_dir / "dummy_image.png"
+    create_minimal_png(image_path, (10, 10), (128, 128, 128))
+
+    # Get mock instances
+    mock_vlp_instance = mock_vlp_class.return_value
+    mock_plm_instance = mock_plm_class.return_value
+
+    # --- Test Case 1: Workflow Pass (no violation) ---
+    test_name_pass = "zeroshot_workflow_pass_case"
+    try:
+        logger.info(f"Testing: {test_name_pass}")
+        # Configure mocks for the PASS case
+        mock_vlp_instance.is_setup = True
+        mock_vlp_instance.generate_n_captions.return_value = {"generated_captions": ["a friendly pink square", "a benign image"]}
+        
+        mock_plm_instance.is_setup = True
+        mock_plm_instance.classify_image_with_captions.return_value = {"classified_as": "a benign image", "confidence": 0.9, "captions_input": ["a friendly pink square", "a benign image"]}
+        
+        args_pass = argparse.Namespace(
+            image_path=str(image_path),
+            policy_config_path=str(policy_path),
+            policy_class_name="SecretImagePolicy",
+            num_captions=2,
+            output_json_path=str(temp_test_dir / "results_pass.json"),
+            caption_vlm_model_id="mock/vlm",
+            perception_lm_repo="mock/plm_repo",
+            perception_lm_name="mock/plm_name"
+        )
+        exit_code = _run_zeroshot_workflow(args_pass)
+        assert exit_code == 0, f"Expected exit code 0, got {exit_code}"
+        
+        with open(args_pass.output_json_path, 'r') as f: output = json.load(f)
+        assert output["policy_violation_assessment"]["is_violation_detected"] is False, "Violation was incorrectly detected in pass case."
+        mock_vlp_instance.generate_violation_explanation.assert_not_called()
+        results[test_name_pass] = {"passed": True}
+    except Exception as e:
+        results[test_name_pass] = {"passed": False, "error": str(e), "details": "Check pass case logic."}
+    
+    # Reset mocks and reconfigure for the next test case
+    mock_vlp_instance.reset_mock()
+    mock_plm_instance.reset_mock()
+
+    # --- Test Case 2: Workflow Fail (violation detected) ---
+    test_name_fail = "zeroshot_workflow_fail_case"
+    try:
+        logger.info(f"Testing: {test_name_fail}")
+        # Configure mocks for the FAIL case
+        mock_vlp_instance.is_setup = True
+        mock_vlp_instance.generate_n_captions.return_value = {"generated_captions": ["a top secret black square", "classified document"]}
+        mock_vlp_instance.generate_violation_explanation.return_value = {"explanation": "Mocked explanation: The image was classified as secret."}
+
+        mock_plm_instance.is_setup = True
+        mock_plm_instance.classify_image_with_captions.return_value = {"classified_as": "a top secret black square", "confidence": 0.95, "captions_input": ["a top secret black square", "classified document"]}
+
+        args_fail = argparse.Namespace(
+            image_path=str(image_path),
+            policy_config_path=str(policy_path),
+            policy_class_name="SecretImagePolicy",
+            num_captions=2,
+            output_json_path=str(temp_test_dir / "results_fail.json"),
+            caption_vlm_model_id="mock/vlm",
+            perception_lm_repo="mock/plm_repo",
+            perception_lm_name="mock/plm_name"
+        )
+        exit_code = _run_zeroshot_workflow(args_fail)
+        assert exit_code == 0, f"Expected exit code 0 even on violation, got {exit_code}"
+
+        with open(args_fail.output_json_path, 'r') as f: output = json.load(f)
+        assert output["policy_violation_assessment"]["is_violation_detected"] is True, "Violation was not detected in fail case."
+        assert "secret" in output["policy_violation_assessment"]["violation_reason"], "Violation reason mismatch."
+        mock_vlp_instance.generate_violation_explanation.assert_called_once()
+        assert "explanation" in output["step_3_violation_explanation"], "Explanation missing from output."
+        results[test_name_fail] = {"passed": True}
+    except Exception as e:
+        results[test_name_fail] = {"passed": False, "error": str(e), "details": "Check fail case logic."}
+
+    return results
+
+def _initialize_and_run():
+    """
+    Runs main_cli. Assumes all necessary global imports have been made
+    in the `if __name__ == "__main__":` block after venv setup.
+    """
+    logger.debug("Global imports should be complete. Calling main_cli.")
+    return main_cli()
 
 if __name__ == "__main__":
     logger.info(f"Script Start/Restart: HF_TOKEN from env: {os.environ.get('HF_TOKEN')}")
     is_venv_ok = ensure_venv()
-    logger.info(f"Global Scope: HF_TOKEN from env before _initialize_and_run: {os.environ.get('HF_TOKEN')}")
     exit_code = 1 
 
     if is_venv_ok:
@@ -3942,7 +4037,7 @@ if __name__ == "__main__":
             from torchvision import transforms as global_tv_transforms
             tv_transforms = global_tv_transforms
             
-            try: # Attempt to import these from timm, provide fallbacks if not found
+            try:
                 from timm.data.constants import IMAGENET_DEFAULT_MEAN as TIMM_MEAN, IMAGENET_DEFAULT_STD as TIMM_STD
                 IMAGENET_DEFAULT_MEAN = TIMM_MEAN
                 IMAGENET_DEFAULT_STD = TIMM_STD
@@ -3956,7 +4051,7 @@ if __name__ == "__main__":
                 CLIPTokenizerFast = HF_CLIPTokenizerFast
             except ImportError:
                  logger.warning("Could not import CLIPTokenizerFast. PerceptionLM model might require it if it doesn't have an hf_tokenizer attribute.")
-                 CLIPTokenizerFast = None # Explicitly None if not found
+                 CLIPTokenizerFast = None
             
             from sentence_transformers import SentenceTransformer as GlobalSentenceTransformer
             SentenceTransformer = GlobalSentenceTransformer 
@@ -3966,7 +4061,10 @@ if __name__ == "__main__":
             from flask_cors import CORS as GlobalCORS; CORS = GlobalCORS
             from waitress import serve as GlobalServe; serve = GlobalServe
             
-            try: import llama_cpp; LLAMA_CPP_AVAILABLE = True; logger.info("llama-cpp-python available.")
+            try: 
+                import llama_cpp
+                LLAMA_CPP_AVAILABLE = True
+                logger.info("llama-cpp-python available.")
             except ImportError: 
                 LLAMA_CPP_AVAILABLE = False
                 logger.warning("llama-cpp-python not available. VLM (GGUF) features limited.")
@@ -3975,7 +4073,7 @@ if __name__ == "__main__":
             import transformers
             
             logger.info("Successfully imported all core dependencies globally.")
-            exit_code = _initialize_and_run() # This should now call the single, corrected main_cli
+            exit_code = _initialize_and_run()
         except SystemExit as e:
             exit_code = e.code if isinstance(e.code, int) else 1
         except KeyboardInterrupt:
@@ -3992,7 +4090,4 @@ if __name__ == "__main__":
         exit_code = 1
     
     logger.info(f"Script finished with exit code {exit_code}.")
-    # USER_PROVIDED_TOKEN_CHECK_START
-    print(f"__main__: Python sees HF_TOKEN: {os.environ.get('HF_TOKEN')}")
-    # USER_PROVIDED_TOKEN_CHECK_END
     sys.exit(exit_code)
