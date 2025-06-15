@@ -1,33 +1,34 @@
 # 📊 Data Classification & Monitoring Service
 ###### (Policy-Driven, VLM-Enhanced, Local-First)
 
-This document describes `classify.py`, a **Data Classification and Monitoring Service** that delivers plug-and-play policy-based validation for any application (read: JSON object).
+This document describes classify.py, a *Data Classification and Monitoring Service* that delivers plug-and-play policy-based validation for any application (read: JSON object).
 
-It orchestrates fine-tuned transformers, GGUF-based vision-language models (VLMs) for documentation processing, and smart retrieval pipelines to provide a governance layer for multimodal content including text, image, and video.
+It orchestrates fine-tuned transformers, vision-language models (VLMs) for documentation processing, zero-shot image classification, and RAG-informed Exceptions provide a governance layer for multimodal content including text, image, video, etc 'as an endpoint'.
 
-## **🔎 N-JSON(s) @ N-Granularity**
+## *🔎 N-JSON(s) @ N-Granularity*
 
-Integrate seamlessly using a single `/service/validate` endpoint that accepts content and policy specs.
+Integrate seamlessly using a single /service/validate endpoint that accepts content and policy specs. The service also provides a powerful CLI for offline workflows.
 
 The service handles classification, policy enforcement, and contextual assistance.
 
-**Highlights:**
+*Highlights:*
 
-*   **Drop-in Integration**: Single-Endpoint Validation
-*   **Natively Multi-Modal**: VLM support for advanced RAG processing, n-modalities, etc.
-*   **Policy-Driven**: Configurable via external JSON
-*   **VLM-Enhanced Policy Generation**: Bootstrap policies from markdown requirements (*Coming Soon!*)
-*   **Context-Aware Help**: Self-Documenting RAG for policy violations
+*   *Drop-in Integration*: Single-Endpoint Validation
+*   *Natively Multi-Modal*: VLM support for advanced RAG processing, n-modalities, etc.
+*   *Zero-Shot VLM Screening*: Prevent persistence of sensitive images (e.g., PII) before they are stored.
+*   *Policy-Driven*: Configurable via external JSON across fielded & free-text data.
+*   *VLM-Enhanced Policy Generation: Bootstrap policies from markdown requirements (*Coming Soon!)
+*   *Context-Aware Help*: Self-Documenting RAG for policy violations
 
 ---
 
-## 🛡️ PII Policy Example
+## 🛡 PII Policy Example
 
-> See `enhanced_policy_config.json` (created by `create-example`) for more schema details and options.
+> See enhanced_policy_config.json (created by create-example) for more schema details and options.
 
-The following demonstrates a **strict PII detection policy** that focuses on identifying and rejecting personally identifiable information in input text:
+The following demonstrates a *strict PII detection policy* that focuses on identifying and rejecting personally identifiable information in input text:
 
-```json
+json
 {
   "StrictPIIPolicy": {
     "description": "Focuses on identifying and rejecting PII in input text.",
@@ -41,23 +42,23 @@ The following demonstrates a **strict PII detection policy** that focuses on ide
     }
   }
 }
-```
+
 
 ### Key Policy Components:
 
-- **`colbert_input_sensitivity`**: Enables sensitivity analysis.
-- **`disallowed_colbert_input_classes`**: Specifically blocks PII content.
-- **`documentation_assistance`**: Provides contextual help when violations occur, using the RAG index specified in `index_path`.
+- **colbert_input_sensitivity**: Enables sensitivity analysis.
+- **disallowed_colbert_input_classes**: Specifically blocks PII content.
+- **documentation_assistance**: Provides contextual help when violations occur, using the RAG index specified in index_path.
 
 ---
 
 ## 🔌 API Endpoints
 
-* `POST /service/validate` — **Main policy-driven validation endpoint.**
-* `POST /modernbert/classify` — Direct access to I/O Validator model.
-* `POST /colbert/classify_sensitivity` — Direct access to Sensitivity Classifier model.
-* `POST /rag/query` — Query a loaded RAG index (typically the global documentation index if configured).
-* `GET /status` — Check service and component health.
+* POST /service/validate — *Main policy-driven validation endpoint.*
+* POST /modernbert/classify — Direct access to I/O Validator model.
+* POST /colbert/classify_sensitivity — Direct access to Sensitivity Classifier model.
+* POST /rag/query — Query a loaded RAG index (typically the global documentation index if configured).
+* GET /status — Check service and component health.
 
 ---
 
@@ -65,28 +66,28 @@ The following demonstrates a **strict PII detection policy** that focuses on ide
 
 VLMs enable advanced processing of markdown documentation when building RAG indexes, enhancing the "Documentation Assistance" feature.
 
-*   **🎯 Semantic Chunking**: VLMs understand content; related ideas stay grouped, improving retrieval context.
-*   **🏗️ Structure Preservation**: VLMs identify and preserve document metadata enabling targeted search/filtering.
-*   **💻 Code Block Handling**: VLMs split code blocks intelligently, preventing awkward splits; metadata flags code-heavy chunks.
-*   **🏷️ Contextual Metadata**: VLMs can extract topics, keywords, and more, enriching metadata for powerful queries.
-*   **✂️ Secondary Chunking**: Large chunks (from VLM or fallback) get split with overlap to respect embedding model limits.
+*   *🎯 Semantic Chunking*: VLMs understand content; related ideas stay grouped, improving retrieval context.
+*   *🏗 Structure Preservation*: VLMs identify and preserve document metadata enabling targeted search/filtering.
+*   *💻 Code Block Handling*: VLMs split code blocks intelligently, preventing awkward splits; metadata flags code-heavy chunks.
+*   *🏷 Contextual Metadata*: VLMs can extract topics, keywords, and more, enriching metadata for powerful queries.
+*   *✂ Secondary Chunking*: Large chunks (from VLM or fallback) get split with overlap to respect embedding model limits.
 
-**Benefits Over Traditional RAG Processing:**
+*Benefits Over Traditional RAG Processing:*
 
-*   **🔍 Better Search Relevance**: Semantic chunks create better embeddings and more relevant retrieval for documentation assistance.
-*   **💡 Context-Aware Documentation Assistance**: More precise and relevant help for policy violations.
+*   *🔍 Better Search Relevance*: Semantic chunks create better embeddings and more relevant retrieval for documentation assistance.
+*   *💡 Context-Aware Documentation Assistance*: More precise and relevant help for policy violations.
 ---
 
 ## 🔗 Integration Examples
 
 ### 1. API Gateway Integration
 
-**Scenario**: Pre-validate AI responses before returning them to users to prevent data leaks.
+*Scenario*: Pre-validate AI responses before returning them to users to prevent data leaks.
 
 <details>
 <summary><strong>📋 Click to expand API Gateway example</strong></summary>
 
-```javascript
+javascript
 // Pre-check user request and AI-generated response
 async function validateAIResponse(userQuery, aiResponse) {
     const validationPayload = {
@@ -159,11 +160,11 @@ if (!validationResult.success) {
     // ✅ Safe to return the AI response
     console.log('Approved response:', validationResult.response);
 }
-```
 
-**🔧 Required Policy Configuration** (`UserInputHandlingPolicy` in `policy_config.json`):
 
-```json
+*🔧 Required Policy Configuration* (UserInputHandlingPolicy in policy_config.json):
+
+json
 {
   "UserInputHandlingPolicy": {
     "description": "Validates AI responses against user inputs for sensitivity and appropriateness.",
@@ -179,15 +180,15 @@ if (!validationResult.success) {
     }
   }
 }
-```
 
-**🔄 How it works:**
-1. **Intercept**: API Gateway captures user query and AI's intended response.
-2. **Validate**: Send both to `/service/validate` with appropriate `api_class`.
-3. **I/O Check**: `ModernBERTClassifier` verifies output coherence with input.
-4. **Sensitivity Scan**: `ColBERTReranker` checks for PII/confidential data leakage.
-5. **Policy Enforcement**: If output contains "Confidential" class content → `REJECT_POLICY_VIOLATION`.
-6. **Guidance**: `documentation_suggestions` provide remediation steps from the specified RAG index.
+
+*🔄 How it works:*
+1. *Intercept*: API Gateway captures user query and AI's intended response.
+2. *Validate*: Send both to /service/validate with appropriate api_class.
+3. *I/O Check*: ModernBERTClassifier verifies output coherence with input.
+4. *Sensitivity Scan*: ColBERTReranker checks for PII/confidential data leakage.
+5. *Policy Enforcement*: If output contains "Confidential" class content → REJECT_POLICY_VIOLATION.
+6. *Guidance*: documentation_suggestions provide remediation steps from the specified RAG index.
 
 </details>
 
@@ -195,12 +196,12 @@ if (!validationResult.success) {
 
 ### 2. Data Pipeline Integration
 
-**Scenario**: Validate documents during processing to ensure compliance throughout the data pipeline.
+*Scenario*: Validate documents during processing to ensure compliance throughout the data pipeline.
 
 <details>
 <summary><strong>📋 Click to expand ETL Pipeline example</strong></summary>
 
-```python
+python
 # ETL pipeline for processing documents, with classification monitoring
 import requests
 import uuid
@@ -301,11 +302,11 @@ if __name__ == "__main__":
     # valid_docs, quarantined = process_financial_documents(test_docs)
     # print(f"✅ Processed: {len(valid_docs)}, 🚫 Quarantined: {len(quarantined)}")
     # print(f"Quarantined details: {quarantined}") 
-```
 
-**🔧 Required Policy Configuration** (`Pipeline_Ingestion_IntegrityPolicy` in `policy_config.json`):
 
-```json
+*🔧 Required Policy Configuration* (Pipeline_Ingestion_IntegrityPolicy in policy_config.json):
+
+json
 {
   "Pipeline_Ingestion_IntegrityPolicy": {
     "description": "Ensures data ingested into the pipeline meets PII and content standards.",
@@ -325,35 +326,37 @@ if __name__ == "__main__":
     }
   }
 }
-```
 
-**🔄 How it works:**
-1. **Stage-Based Validation**: Different pipeline stages use different `api_class` policies.
-2. **Content Analysis**: `input_text` contains the document/record being processed.
-3. **Multi-Layer Checks**: Policies verify PII, formatting, size limits, etc.
-4. **Compliance Tracking**: Violations trigger logging, quarantine, or alerts.
-5. **Guided Remediation**: `documentation_suggestions` help data stewards fix issues.
+
+*🔄 How it works:*
+1. *Stage-Based Validation*: Different pipeline stages use different api_class policies.
+2. *Content Analysis*: input_text contains the document/record being processed.
+3. *Multi-Layer Checks*: Policies verify PII, formatting, size limits, etc.
+4. *Compliance Tracking*: Violations trigger logging, quarantine, or alerts.
+5. *Guided Remediation*: documentation_suggestions help data stewards fix issues.
 
 </details>
 
 ---
 
-### 3. Multimodal Moderation (*VLM for Item Processing - Coming Soon*)
+### 3. Multimodal Moderation (VLM for Item Processing - Coming Soon)
 
-**Scenario**: Moderate user-generated content including text and images for policy compliance. VLM-based analysis of image/video content is planned.
+*Scenario*: Moderate user-generated content including text and images for policy compliance.
+
+*Note: While the real-time, API-based VLM processing described below is a planned feature, a powerful **CLI-based zero-shot image classification workflow is now available*. See the "Zero-Shot VLM Classification" example for details on how to pre-screen images to prevent persistence of sensitive data.
 
 <details>
 <summary><strong>📋 Click to expand Content Moderation example</strong></summary>
 
-```bash
-# 🖼️ Example: Multipart form data with image upload
+bash
+# 🖼 Example: Multipart form data with image upload
 # (Note: VLM processing of 'uploaded_image' is a planned feature)
 curl -X POST http://classify-service:8080/service/validate \
   -F 'json_payload={"api_class":"UserGeneratedContentPolicy","input_text":"Check out this cool image I found!","input_items":[{"id":"user_image_1","type":"image","filename_in_form":"uploaded_image"}]}' \
   -F 'uploaded_image=@./path/to/your/test_image.jpg'
-```
 
-```python
+
+python
 # 🐍 Python example for content moderation
 import requests
 import json # Ensure json is imported for payload
@@ -415,12 +418,12 @@ def moderate_user_content(text_content, image_file_path=None):
 #     print(f"❌ Content blocked: {moderation_result['violations']}")
 #     if 'suggestions' in moderation_result and moderation_result['suggestions'].get('suggestions'):
 #         print(f"💡 Guidelines: {moderation_result['suggestions']['suggestions']}")
-```
 
-**🔧 Required Policy Configuration** (`UserGeneratedContentPolicy` in `policy_config.json`):
-*Note: The `item_processing_rules` section below describes planned VLM functionality.*
 
-```json
+*🔧 Required Policy Configuration* (UserGeneratedContentPolicy in policy_config.json):
+*Note: The item_processing_rules section below describes planned VLM functionality.*
+
+json
 {
   "UserGeneratedContentPolicy": {
     "description": "Moderates user-generated text and images for inappropriate content and PII. (VLM Image Analysis - Coming Soon)",
@@ -455,14 +458,84 @@ def moderate_user_content(text_content, image_file_path=None):
     }
   }
 }
-```
 
-**🔄 How it works (with planned VLM enhancements):**
-1. **Text Analysis**: User's text checked for PII, hate speech, violent content.
-2. **Image Processing (Coming Soon)**: VLM will analyze uploaded images for policy violations.
-3. **Multi-Modal Validation (Coming Soon)**: VLM description text will also be checked for violations.
-4. **Keyword Filtering**: Blocked keywords provide additional safeguards.
-5. **Contextual Help**: Violations trigger community guideline suggestions from the RAG index.
+
+*🔄 How it works (with planned VLM enhancements):*
+1. *Text Analysis*: User's text checked for PII, hate speech, violent content.
+2. *Image Processing (Coming Soon)*: VLM will analyze uploaded images for policy violations.
+3. *Multi-Modal Validation (Coming Soon)*: VLM description text will also be checked for violations.
+4. *Keyword Filtering*: Blocked keywords provide additional safeguards.
+5. *Contextual Help*: Violations trigger community guideline suggestions from the RAG index.
+
+</details>
+
+---
+
+### 4. Zero-Shot VLM Classification for Pre-Screening
+
+*Scenario: Pre-screen user-uploaded images to identify and reject documents that impose legal or compliance obligations (e.g., government IDs, PII-laden forms) *before they are persisted to storage. This prevents the data from ever being "at rest" in your system, significantly reducing compliance risk.
+
+<details>
+<summary><strong>📋 Click to expand Zero-Shot VLM Classification example</strong></summary>
+
+*🔄 How it works:*
+1.  *Dynamic Captioning*: A VLM (e.g., LLaVA) analyzes the image and generates several descriptive captions based on policy guidance (e.g., "Describe any text, forms, or ID cards in this image").
+2.  *Zero-Shot Classification*: A second model (e.g., Perception-LM/CLIP) determines which of the generated captions is the most accurate description of the image.
+3.  *Policy Evaluation*: The system checks the winning caption's text against a list of forbidden keywords or patterns defined in the policy (e.g., if_classified_as_contains: "driver's license").
+4.  *Pre-emptive Rejection*: If a match is found, the workflow flags the image as a violation. The calling application can then reject the upload, preventing the sensitive data from being saved.
+5.  *AI-Generated Explanations*: For rejected images, the VLM can generate a clear, context-aware explanation for the user (e.g., "This image was rejected because it appears to be a government-issued ID, which we are not permitted to store.").
+
+*▶ CLI Command Example:*
+
+This feature is run via the classify_image_zeroshot CLI command.
+
+bash
+# Run the zero-shot classification workflow on a potentially sensitive image
+python classify.py classify_image_zeroshot \
+  --image-path ./user_uploads/drivers_license.jpg \
+  --policy-config-path ./policies/image_screening_policy.json \
+  --policy-class-name ID_Document_Screening_Policy \
+  --output-json-path ./screening_result.json
+
+# After running, inspect the output JSON to make an application-level decision
+# For example, a simple check in a script:
+# result_json = json.load(open('./screening_result.json'))
+# if result_json.get('policy_violation_assessment', {}).get('is_violation_detected'):
+#     print("REJECT: Image contains sensitive content.")
+#     print("Reason:", result_json.get('step_3_violation_explanation', {}).get('explanation'))
+# else:
+#     print("ACCEPT: Image passed screening.")
+
+
+*🔧 Required Policy Configuration* (ID_Document_Screening_Policy):
+
+json
+{
+  "ID_Document_Screening_Policy": {
+    "description": "Prevents persistence of images containing legally sensitive documents like government IDs.",
+    "caption_generation_policy_guidance": "Carefully describe any official documents, forms, ID cards, licenses, or passports visible in the image. Note any text that looks like personal information.",
+    "zero_shot_violation_rules": [
+      {
+        "if_classified_as_contains": "driver's license",
+        "reason": "The image appears to contain a driver's license."
+      },
+      {
+        "if_classified_as_contains": "passport",
+        "reason": "The image appears to contain a passport."
+      },
+      {
+        "if_classified_as_contains": "social security card",
+        "reason": "The image appears to contain a social security card."
+      },
+      {
+        "if_classified_as_contains": "personal information",
+        "if_confidence_above": 0.85,
+        "reason": "The image is highly likely to contain sensitive personal information."
+      }
+    ]
+  }
+}
+
 
 </details>
 
@@ -471,17 +544,17 @@ def moderate_user_content(text_content, image_file_path=None):
 ## 🚀 Setup & Tooling Commands
 
 On first run, the script will:
-* Create a virtual environment (`.venv_classifier_service_tool`).
+* Create a virtual environment (.venv_classifier_service_tool).
 * Install all required dependencies (Transformers, Flask, llama-cpp-python, etc.).
 * Re-launch itself using the Python interpreter from the virtual environment.
 
-```bash
+bash
 python classify.py --help
-```
+
 
 ### 1. Start API Server
 
-```bash
+bash
 # 🔑 Ensure HF_TOKEN is set in your environment if models need downloading
 # PowerShell: $env:HF_TOKEN="your_hf_token_here"
 # Bash: export HF_TOKEN="your_hf_token_here"
@@ -490,13 +563,13 @@ python classify.py serve \
     --policy-config-path ./path/to/your/policy_config.json \
     --port 8080 \
     --global-rag-retriever-index-path ./tool_examples/tool_documentation # Optional: for /rag/query
-```
+
 
 ### 2. Create Example Files & Documentation RAG Index
 
-This command generates sample documentation, a policy configuration (`enhanced_policy_config.json`), and can automatically build a RAG index from specified documentation sources. This RAG index can then be referenced in your policies for `documentation_assistance`.
+This command generates sample documentation, a policy configuration (enhanced_policy_config.json), and can automatically build a RAG index from specified documentation sources. This RAG index can then be referenced in your policies for documentation_assistance.
 
-```bash
+bash
 # 📚 This will create sample files and build a RAG index from the specified docs
 # Ensure HF_TOKEN is set if the embedding model isn't cached
 
@@ -508,32 +581,54 @@ python classify.py create-example \
     # Optional: For VLM-based chunking of documentation
     # --docs-vlm-model-path "/path/to/local/doc_processing_model.gguf" \
     # --processing-strategy vlm 
-```
-*The `index_path` in your policy's `documentation_assistance` section should point to the RAG index created by this command. For example, if `output-dir` is `./my_service_examples` and `docs-rag-index-name` is `my_docs_rag`, the generated policy might contain `index_path: "my_docs_rag"`. This path is resolved by the server relative to its current working directory (e.g., if running the server from `./my_service_examples`, it would find `./my_docs_rag`). For robust deployment, consider using absolute paths or paths known to be correct relative to the server's runtime CWD.*
+
+*The index_path in your policy's documentation_assistance section should point to the RAG index created by this command. For example, if output-dir is ./my_service_examples and docs-rag-index-name is my_docs_rag, the generated policy might contain index_path: "my_docs_rag". This path is resolved by the server relative to its current working directory (e.g., if running the server from ./my_service_examples, it would find ./my_docs_rag). For robust deployment, consider using absolute paths or paths known to be correct relative to the server's runtime CWD.*
 
 
 ### 3. Create Custom RAG Index
 
-Build a RAG index from any JSONL corpus for use in `documentation_assistance` or general querying.
+Build a RAG index from any JSONL corpus for use in documentation_assistance or general querying.
 
-```bash
+bash
 python classify.py rag index \
   --corpus-path ./path/to/my_corpus.jsonl \
   --index-path ./my_custom_rag_index \
   --embedding-model-id all-mpnet-base-v2 \
   --metadata-fields category topic_id # Optional: list of metadata fields in your JSONL
-```
+
 
 ### 4. Index Python Codebase for RAG
 
 Create a RAG index directly from a Python script to enable querying its structure (functions, classes).
 
-```bash
+bash
 python classify.py index-codebase \
     --code-file-path ./classify.py \
     --index-path ./codebase_index_for_classify_py \
     --code-chunk-strategy functions
-```
+
+
+### 5. Zero-Shot VLM Image Classification (CLI Workflow)
+
+Run a multi-step, policy-driven workflow to classify an image without pre-trained labels. This is ideal for pre-screening uploads to prevent persistence of data that imposes legal or compliance obligations (e.g., government IDs).
+
+bash
+# ⚖ Example: Screen an image for sensitive documents before saving it
+python classify.py classify_image_zeroshot \
+    --image-path /path/to/user_uploaded_image.png \
+    --policy-config-path ./config/image_screening_policies.json \
+    --policy-class-name Government_ID_Policy \
+    --num-captions 5 \
+    --output-json-path ./classification_output.json
+
+This command will:
+1. Generate num-captions descriptions for the image using a VLM.
+2. Classify the image against those descriptions to find the best fit.
+3. Check the result against rules in your policy-class-name.
+4. If a violation occurs, it can generate a VLM-powered explanation.
+5. Save the detailed results to output-json-path.
+
+The calling application can then inspect classification_output.json to decide whether to REJECT or ACCEPT the image.
 
 ---
 
@@ -541,43 +636,43 @@ python classify.py index-codebase \
 
 ### I/O Validation Format
 
-```json
+json
 {
   "input": "Question: Capital of France?",
   "output_good_sample": "Paris",
   "output_bad_sample": "London"
 }
-```
+
 
 ### Sensitivity Classification Format
 
-```json
+json
 {"text": "SSN: 123-45-6789", "class_name": "Class 1: PII"}
 {"text": "Public company earnings report", "class_name": "Class 4: Public"}
-```
+
 
 ---
 
 ## 💻 System Requirements
 
-* **Python 3.8+**
-* **RAM**: 16–32GB+ recommended for optimal performance with VLMs (especially for VLM Markdown Processor and planned VLM Policy Generation/Item Processing). Placeholder models and CPU-only operation require less.
-* **GPU**: CUDA-enabled GPU (optional but recommended) for hardware acceleration with `llama-cpp-python` (set `n_gpu_layers > 0`).
+* *Python 3.8+*
+* *RAM*: 16–32GB+ recommended for optimal performance with VLMs (especially for VLM Markdown Processor and planned VLM Policy Generation/Item Processing). Placeholder models and CPU-only operation require less.
+* *GPU*: CUDA-enabled GPU (optional but recommended) for hardware acceleration with llama-cpp-python (set n_gpu_layers > 0).
 
 ---
 
 ## 🧪 Testing
 
-```bash
+bash
 # Run all test categories with verbose output
 python classify.py test --test-type all --verbose
 
 # Run a specific test category (e.g., RAG functionality)
 python classify.py test --test-type rag --verbose
-```
+
 ---
-## 🏙️ Architecture
-```
+## 🏙 Architecture
+
 
  classify.py - High-Level Architecture
 
@@ -673,3 +768,11 @@ Key Data/Artifact Flows:
         --> Invokes VLM for Items Service (Conceptual for full GGUF support - **Coming Soon!** Current item processing relies on HF Transformers `pipeline` if a model is configured, but broader GGUF VLM integration for items is planned.)
         --> (If violations & configured) Invokes RAG Querier (using RAG Index) for Documentation Assistance
         --> API Client Response
+
+(4) Zero-Shot Image Classification Workflow (CLI):
+     Image + Policy Config --> [classify_image_zeroshot command]
+        --> Invokes Caption VLM (e.g., LLaVA) to generate candidate labels.
+        --> Invokes Perception VLM (e.g., CLIP) to classify image against candidates.
+        --> Applies policy rules to classification result.
+        --> (If violation) Invokes Caption VLM again to explain the violation.
+        --> Outputs structured JSON result for application-level decision.
