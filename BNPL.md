@@ -1,31 +1,14 @@
 # BNPL for Blockchain via ELT Architecture
 
-#### A Distributed Execution Hub for Multi-Chain Stablecoin Settlement
+## A Distributed Execution Hub for Multi-Chain Stablecoin Settlement
 
----
+### 1. Introduction: "BNPL for Blockchain"
 
-## 1. Introduction: "BNPL for Blockchain"
+The core concept is to provide a "Buy Now, Pay Later" model for blockchain transactions. This is achieved through a **push-down mechanism**, where transaction execution is moved off-chain to a dedicated execution engine. At its core, the system performs a type of **stateful arbitrage**, capitalizing on the temporal and cross-chain differences between immediate off-chain confirmation and eventual on-chain settlement.
 
-The core concept is to provide a **"Buy Now, Pay Later" model for blockchain transactions**. This means users receive immediate confirmation of their payment ("Confirm Now"), while the final, authoritative settlement on the main blockchain happens in the background ("Settle Later").
+This model addresses the primary user friction point of on-chain payments—latency—without compromising security. It is achieved via a modern ELT (Extract, Load, Transform) architecture.
 
-This model addresses the primary user friction point of on-chain payments—latency—without compromising security. It is achieved by implementing a modern **ELT (Extract, Load, Transform)** architecture for transaction processing.
-
-### The ELT Architecture
-
-Legacy blockchains use an inefficient **ETL** model where every node must **T**ransform (execute) a transaction before it is **L**oaded to the chain. We reverse this.
-
-| Legacy Model (ETL) | **SCALe Model (ELT)** |
-| :--- | :--- |
-| **E**xtract a transaction. | **E**xtract a batch of transactions. |
-| **T**ransform (execute) it on every node. | **L**oad the raw, compressed data to the L1 chain. |
-| **L**oad the result into a block. | **T**ransform via a single, on-chain ZK-Proof verification. |
-
-Under this model, the Layer 1 blockchain functions as a secure data availability layer, not a distributed computer.
-
-## 2. System Architecture
-
-The **SCALe Hub** is an off-chain execution engine that bundles transactions, generates a proof of their validity, and posts the data to the appropriate L1 for settlement.
-
+### 2. System Architecture
 ```ascii
 ==============================================================================
                               THE SCALe HUB
@@ -59,32 +42,29 @@ The **SCALe Hub** is an off-chain execution engine that bundles transactions, ge
   |       ^       (USDC/USDT)            (USDC)          |                  |
   |       |                                              |                  |
   |       +----------------------------------------------+                  |
-  |          (3. VERIFY ZK-Proof on-chain - The "T" in ELT)                 |
+  |     (3. L1 Contract Verifies ZK-Proof - The "T" in ELT)                 |
   +-------------------------------------------------------------------------+
 ```
+The SCALe Hub is an off-chain execution engine that bundles transactions, generates a validity proof, and posts the data to the appropriate L1 for settlement.
 
-## 3. Core Features & Differentiators
+### 3. Core Features & Differentiators
 
-*   **Multi-Chain Settlement:** The hub is blockchain-agnostic. By abstracting execution from settlement, PYUSD can become an aggregator, accepting stablecoins from any supported L1.
-*   **Crypto-Agility via Modular Verification:** The ZK-proof verifier is a swappable on-chain contract. This allows for upgrades to new cryptographic standards (e.g., quantum-resistant algorithms) without a network hard fork.
-*   **Verifiable Transaction Integrity:** The ZK-proof cryptographically attests that all transactions in a batch were valid and correctly processed, making the system's state fully auditable.
-*   **End-to-End Rust Implementation:** The off-chain engine (sequencer, prover, client) will be built entirely in Rust for memory safety and high performance, mitigating common bug classes by design.
+*   **Multi-Chain Settlement:** Abstracts execution from settlement; PYUSD can aggregate stablecoins from any L1.
+*   **Crypto-Agility via Modular Verification:** Verifier contract is swappable for future-proofing (e.g. quantum-ready).
+*   **Verifiable Transaction Integrity:** ZK-proof guarantees correctness and auditability.
+*   **End-to-End Rust Implementation:** Sequencer, prover, and client in Rust for safety and speed.
 
-## 4. Enforced Transaction Guarantees
+### 4. Enforced Transaction Guarantees
 
-The SCALe architecture provides mathematical guarantees for core transaction properties.
+| Property         | Definition                               | Implementation                            |
+| :--------------- | :--------------------------------------- | :---------------------------------------- |
+| **Non-Repudiable** | A user cannot deny authorizing a tx      | ZK-proof attests to valid batch signatures |
+| **Non-Replayable** | A tx cannot be submitted a second time   | Nonce system enforces correct sequencing  |
+| **Idempotent**     | Duplicate requests have no effect      | Duplicate nonces are rejected as already used |
 
-| Property | Definition | Implementation |
-| :--- | :--- | :--- |
-| **Non-Repudiable** | A user cannot deny authorizing a transaction. | Every transaction is signed. The ZK-proof attests that all signatures in the batch were validly checked. |
-| **Non-Replayable** | A transaction cannot be submitted a second time. | Every account uses a `nonce` (transaction counter). The ZK-proof enforces correct nonce sequencing. |
-| **Idempotent** | Submitting the same request multiple times has no additional effect. | The nonce system inherently prevents duplicate submissions, which are rejected as having an invalid (already used) nonce. |
+### 5. Strategic Value
 
-## 5. Strategic Value
-
-1.  **Build a Technical Moat:** The architecture offers a distinct performance and flexibility advantage over competing payment systems
-2.  **Improve User Experience:** The "Confirm Now, Settle Later" model removes latency from the user's perspective.
-3.  **De-Risk Future Infrastructure:** Crypto-agility prepares the platform for future cryptographic threats and standards.
-4.  **Expand Market Access:** The ability to settle on any major L1 opens up new ecosystems and user bases.
-
-Bonus: Externalize your rules engine (read: JSON-lookup) to ensure each transaction is [classified and bound by a policy configuration](https://github.com/rabbidave/LatentSpace.Tools/blob/main/classify.md#-data-classification--monitoring-service)
+*   Build a **Technical Moat** with performance + flexibility.
+*   Improve **User Experience** with "Confirm Now, Settle Later".
+*   De-risk infrastructure via **Crypto-Agility**.
+*   **Expand Market Access** to any major L1.
