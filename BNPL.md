@@ -8,6 +8,17 @@ The core concept is to provide a "Buy Now, Pay Later" model for blockchain trans
 
 This model addresses the primary user friction point of on-chain payments—latency—without compromising security. It is achieved via a modern ELT (Extract, Load, Transform) architecture.
 
+### The ELT Architecture
+
+Legacy blockchains use an inefficient **ETL** model where every node must **T**ransform (execute) a transaction before it is **L**oaded to the chain. We reverse this.
+
+
+| Legacy Model (ETL) | **SCALe - Stablecoin Agnostic Ledger (ELT)** |
+| :--- | :--- |
+| **E**xtract a transaction. | **E**xtract a batch of transactions. |
+| **T**ransform (execute) it on every node. | **L**oad the raw, compressed data to the L1 chain. |
+| **L**oad the result into a block. | **T**ransform via a single, on-chain ZK-Proof verification. |
+
 ### 2. System Architecture
 ```ascii
 ==============================================================================
